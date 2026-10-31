@@ -7,7 +7,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>VivaceGraph GUI</title>
-  <link rel="stylesheet" href="/css/gui.css">
+  <!-- Asset and API URLs are RELATIVE so the app also works mounted
+       under a host listener's prefix (GH #384). -->
+  <link rel="stylesheet" href="css/gui.css">
 </head>
 <body>
   <div class="app">
@@ -157,7 +159,7 @@
        loaded before the module entry; explorer.js reads
        window.cytoscape (the one window-global exception; see
        vendor/VENDOR.md). -->
-  <script src="/vendor/cytoscape.min.js"></script>
-  <script type="module" src="/js/main.js"></script>
+  <script src="vendor/cytoscape.min.js"></script>
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>

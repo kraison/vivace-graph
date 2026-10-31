@@ -30,7 +30,13 @@ wiring is the next step; the benchmark exercises the tree directly).
   per-byte loop.
 - **Write path is correctness-first:** insert/remove **read-modify-write the whole
   page** (a page is bounded, so this is O(1) in n). Splits propagate up; a root
-  split grows height. This RMW is the reason insert/remove are slow warm (see
+  split grows height. A split point is chosen by accumulated bytes, not entry
+  count, so a page of small entries still takes large ones (GH #404).
+  `update-in-skip-list` holds the write lock across its remove and add, so a
+  reader never sees the key absent in between; a cursor crosses leaves by
+  re-seeking past the last key it emitted, never by the sibling link copied
+  with its page, which a merge may have freed and an allocation reused
+  (GH #319). A crossing therefore costs a root-to-leaf descent. This RMW is the reason insert/remove are slow warm (see
   results) — it is the obvious first optimization, not a fundamental cost.
 - **Lazy delete:** a removed key's cell is dropped from its leaf, **no merge or
   rebalance**. Correct — separators are only lower bounds, so every leaf stays
@@ -158,7 +164,7 @@ decodes (rare). Result at 500k (ratio = skip-list ÷ b+tree, >1 = B+ tree wins):
 | remove µs/op | ~35 | **6.4** | **2.48×** |
 
 Reads/locality/space are unchanged (point-lookup 4.9×, range-scan 6.2×, cold
-pages 8–109× fewer, 2.3× smaller). **The B+ tree now wins on every operation.**
+pages 8–109× fewer, 2.3× smaller). **The B+ tree now wins every read axis**; writes stay slower, see "Where it stands" under Verdict.
 Verified: the smoke + a randomized 200k/300k-op churn test vs a reference model
 (point/count/full-scan/range), and the `view-suite` still 56/56 on both backends.
 
@@ -181,6 +187,16 @@ scan) and still works after refill — 0 failures at 200k + 300k ops on tiny (25
 and realistic (4 KB) pages; `view-suite` still 56/56 on both backends.
 
 ## Verdict
+
+**Where it stands (2026-10-30).** The B+ tree wins point lookup, range scan
+and space, and loses on insert (0.10–0.13× in the table above) and remove
+(0.29× at 10k above; about 5× slower at 100k in a 2026-07-29 run). It also
+loses through the spatial index, whose many short per-cell prefix scans pay
+cursor setup each time, so prefer `:skip-list` for spatial-heavy graphs. The
+concurrency audit items (GH #319) closed in 2026-10 with a direct test suite
+(`tests/bplus-tree-tests.lisp`); the backend stays opt-in because of the
+write cost, not for correctness. Re-measure before publishing new figures.
+
 
 The B+ tree **wins on the axes that motivated the experiment** — cold-cache
 locality, range-scan locality, and space — and, with a lean in-page search, is

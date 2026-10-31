@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.1"
+  :version "4.1.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -116,6 +116,7 @@
                (:file "edge" :depends-on ("vertex"))
                (:file "gc" :depends-on ("edge" "vertex" "views"))
                (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
+               (:file "tx-overlay" :depends-on ("transactions")) ; GH #408
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
                ;; Shadow generations (GH #170): quiesce/copy/reopen a store
@@ -132,11 +133,15 @@
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
-                      ("schema" "edge" "vertex" "views" "transactions"))
+                      ("schema" "edge" "vertex" "views" "transactions"
+                       "tx-overlay"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; Counting index (GH #361): its own registry and graph
+               ;; slot, parallel to DEF-INDEX's.
+               (:file "count-index" :depends-on ("index"))
                ;; Declarative value constraints (GH #149).  After INDEX for
                ;; %SPEC-IDENTITY; no index of its own to build.
                (:file "value-constraint" :depends-on ("index"))
@@ -146,6 +151,10 @@
                ;; Domain and range (GH #156): the other endpoint, through
                ;; the commit view.
                (:file "domain-range" :depends-on ("value-constraint"))
+               ;; GH #301: validate without committing; needs every
+               ;; family's collectors loaded.
+               (:file "evaluator" :depends-on ("cardinality"
+                                               "domain-range"))
                ;; Disjointness over vertex types (GH #157, 4a): a schema
                ;; lint, hooked into %INSTALL-NODE-TYPE.
                (:file "disjointness" :depends-on ("schema" "index"))
@@ -168,7 +177,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.1"
+  :version "4.1.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -180,6 +189,70 @@
                ;; the master/slave packet primitives in transaction-streaming.
                (:file "peer-streaming")))
 
+;; The web-free query subsystem (GH #322): the JSON pattern DSL and,
+;; from Task 2 on, the free-text Prolog guard.  Depends on core only so
+;; a consumer that wants a bounded query tool never loads a web stack.
+(defsystem graph-db/query
+  :name "VivaceGraph guarded query"
+  :description "The JSON pattern DSL and the free-text Prolog guard,
+web-free.  docs/guarded-query.md; GH #322."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.1.0"
+  :depends-on (:graph-db/core)
+  :pathname "query/"
+  :serial t
+  :components ((:file "package")
+               (:file "dsl")
+               (:file "guard"))
+  :in-order-to ((test-op (test-op :graph-db/query-test))))
+
+(defsystem graph-db/query-test
+  :name "VivaceGraph guarded-query test suite"
+  :description "FiveAM tests driving GRAPH-DB.QUERY:RUN-GUARDED-PROLOG
+directly, web-free (GH #322)."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.1.0"
+  :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
+  :pathname "tests/query/"
+  :serial t
+  :components ((:file "package") (:file "suite") (:file "guard-tests"))
+  :perform (test-op (op c)
+             (unless (uiop:symbol-call :graph-db/query-test
+                                       :run-query-tests)
+               (error "graph-db query tests failed."))))
+
+;; Rules as versioned producers (GH #304): S1 makes claims Prolog facts.
+(defsystem graph-db/rules
+  :name "VivaceGraph rules"
+  :description "Claims as Prolog facts, and rules as versioned producers.
+docs/rules.md; GH #304."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.1.0"
+  :depends-on (:graph-db/spacetime :graph-db/query)
+  :pathname "rules/"
+  :serial t
+  :components ((:file "package") (:file "facts") (:file "schema")
+               (:file "compile") (:file "run"))
+  :in-order-to ((test-op (test-op :graph-db/rules-test))))
+
+(defsystem graph-db/rules-test
+  :name "VivaceGraph rules test suite"
+  :description "FiveAM tests for claims as Prolog facts (GH #330)."
+  :depends-on (:graph-db/rules :graph-db/test-scratch :fiveam)
+  :pathname "tests/rules/"
+  :serial t
+  :components ((:file "package") (:file "suite") (:file "facts-tests")
+               (:file "schema-tests") (:file "compile-tests")
+               (:file "run-tests") (:file "fixpoint-tests")
+               (:file "scope-tests"))
+  :perform (test-op (op c)
+             (unless (uiop:symbol-call :graph-db/rules-test
+                                       :run-rules-tests)
+               (error "graph-db rules tests failed."))))
+
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
 ;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
@@ -189,8 +262,9 @@
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.1"
+  :version "4.1.0"
   :depends-on (:graph-db/replication
+               :graph-db/query
                :hunchentoot
                :ningle
                :clack
@@ -203,18 +277,7 @@
                :usocket
                :trivial-shell)
   :serial t
-  ;; QUERY-DSL is the structured JSON query compiler+runner extracted from
-  ;; rest.lisp (GH #278): REST's /query route and the GUI workbench compile
-  ;; through the one implementation.  It needs the prolog compiler (SELECT,
-  ;; via prologc/prolog-functors), the schema type lookups
-  ;; (LOOKUP-NODE-TYPE-BY-NAME) and NODE-SLOT-VALUE (index) -- all already
-  ;; loaded by graph-db/core, which the system-level :depends-on guarantees,
-  ;; so no intra-file :depends-on is possible or needed here.  It is NOT in
-  ;; graph-db/core because EMIT-QUERY-RESULTS' :ndjson arm sets a header on
-  ;; NINGLE:*RESPONSE*, and core deliberately drops ningle/clack (the
-  ;; ECL/Android build).  :serial t puts it before "rest", which calls into it.
-  :components ((:file "query-dsl")
-               (:file "rest"))
+  :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
 ;; OPTIONAL GUI cockpit backend (GH #269, design doc
@@ -230,7 +293,7 @@
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.1"
+  :version "4.1.0"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
@@ -254,8 +317,11 @@ and read-only neighborhood exploration."
   ;; :cl-ppcre is already in the image (graph-db/core depends on it) --
   ;; declared because the vendored-asset test scans the frontend sources
   ;; for CodeMirror entry points with it (GH #279).
+  ;; :lack and :lack-middleware-mount: the mount tests build the host
+  ;; arrangement of GH #384 with LACK:BUILDER.
   :depends-on (:graph-db/gui :graph-db/test-scratch :fiveam :drakma
-               :usocket :flexi-streams :bordeaux-threads :cl-ppcre)
+               :usocket :flexi-streams :bordeaux-threads :cl-ppcre
+               :lack :lack-middleware-mount)
   :pathname "tests/gui/"
   :serial t
   :components ((:file "package")
@@ -351,7 +417,8 @@ and read-only neighborhood exploration."
 (defsystem graph-db/perf-test
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
-  :depends-on (:graph-db :graph-db/test-scratch :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/spacetime :graph-db/test-scratch
+               :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
@@ -361,7 +428,9 @@ and read-only neighborhood exploration."
                (:file "check")
                ;; B+ tree vs skip-list side-by-side (in-package :graph-db so it can
                ;; trace both read paths); entry point (graph-db::bplus-bench).
-               (:file "bplus-bench"))
+               (:file "bplus-bench")
+               ;; edges under claims, spec sec.9 (GH #372)
+               (:file "spacetime-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 
@@ -502,7 +571,7 @@ and read-only neighborhood exploration."
   :description "The claim record and source-onboarding contract over
 cl-temporal-extent."
   :depends-on (:graph-db/core :local-time
-               (:version :cl-temporal-extent "0.2.0"))
+               (:version :cl-temporal-extent "0.3.0"))
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")
@@ -511,6 +580,9 @@ cl-temporal-extent."
                (:file "claim-query")
                (:file "source")
                (:file "resolve")
+               ;; Edges under claims: write-time linking (GH #369).
+               ;; After RESOLVE for NAMESPACE-SOURCES / SOURCE-CONTRACT.
+               (:file "link")
                (:file "register")
                ;; Membership disjointness (GH #157 4b): needs
                ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's
@@ -518,7 +590,10 @@ cl-temporal-extent."
                (:file "membership")
                ;; Temporal claim families (GH #296): the extent-overlap
                ;; validator; needs membership's post-commit overlay.
-               (:file "temporal")))
+               (:file "temporal")
+               ;; RELATED/3 and CLAIMED/4 over the endpoint edges (GH
+               ;; #369); needs claim-query's CLAIM-CURRENT-P.
+               (:file "functors")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -533,8 +608,10 @@ cl-temporal-extent."
   ;; without the add-on REGISTER-GEOMETRY correctly refuses to answer at
   ;; all (#138, design §6).  The GEOS-dependent test skips when libgeos_c
   ;; is absent, as tests/geos/ does.
+  ;; GRAPH-DB/QUERY: endpoint-edge-tests.lisp drives RELATED/3 and
+  ;; CLAIMED/4 through RUN-GUARDED-PROLOG (GH #369, spec sec.6.3).
   :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos
-               :graph-db/test-scratch :fiveam)
+               :graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -552,7 +629,11 @@ cl-temporal-extent."
                (:file "claim-transaction-tests")       ; GH #148
                (:file "register-tests")                ; GH #138
                (:file "membership-tests")              ; GH #157 4b
-               (:file "temporal-tests"))               ; GH #296
+               (:file "temporal-tests")                ; GH #296
+               (:file "epoch-tests")                   ; GH #347
+               (:file "vocabulary-tests")              ; GH #350
+               (:file "endpoint-edge-tests")             ; GH #369
+               (:file "link-sweep-tests"))               ; GH #372
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
@@ -590,6 +671,7 @@ cl-temporal-extent."
                (:file "segment-tests")
                (:file "linear-hash-tests")
                (:file "skip-list-tests")
+               (:file "bplus-tree-tests")    ; GH #404, #405
                (:file "index-list-tests")
                (:file "type-index-tests")
                (:file "graph-tests")
@@ -659,18 +741,38 @@ cl-temporal-extent."
                (:file "memory-graph-tests")
                (:file "unique-constraint-tests")
                (:file "index-tests")
+               (:file "count-index-tests")   ; GH #361
+               (:file "read-your-own-writes-tests") ; GH #408
                (:file "schema-retraction-tests")   ; GH #139, #140
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149
                (:file "cardinality-tests")          ; GH #155
                (:file "domain-range-tests")         ; GH #156
+               (:file "evaluator-tests")            ; GH #301
                (:file "disjointness-tests")         ; GH #157
                (:file "peer-unique-tests")
                (:file "peer-rejection-tests")           ; GH #151
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224
                (:file "scratch-cleanup-tests")  ; GH #214
+               (:file "ci-tiering-tests")       ; GH #340
+               (:file "codebase-notes-tests")
                (:file "perf/check-tests"))      ; GH #253
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))
+
+;; The fast CI tier (docs/ci.md, GH #340): the same suite minus the three
+;; that are 71% of its wall time for 8% of its checks.  Pull requests run
+;; this; a push to experiment still runs GRAPH-DB in full.
+(defsystem graph-db/fast-test
+  :name "VivaceGraph test suite, fast tier"
+  :description "GRAPH-DB/TEST minus *SLOW-SUITES*; docs/ci.md, GH #340."
+  :depends-on (:graph-db/test)
+  :perform (test-op (op c)
+                    (let ((slow (symbol-value
+                                 (uiop:find-symbol* :*slow-suites*
+                                                    :graph-db/test))))
+                      (unless (uiop:symbol-call :graph-db/test :run-tests
+                                                :exclude slow)
+                        (error "graph-db fast-tier test suite failed.")))))

@@ -462,3 +462,20 @@ disjoint later run is still admitted."
                (is (= 2 (length (%tt-runs g2 "r17")))))
           (close-graph g2)
           (collect-garbage))))))
+
+(test split-claim-identity-key-round-trips-a-temporal-key
+  "GH #321: a temporal family's seventh field reads back as the
+EXTENT-SEXP-START-KEY data the identity tuple canonicalises."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (%tt-run "r1" "a" (ts 2022 1 1) (ts 2022 3 31)))
+    (let ((c (first (%tt-runs g "r1"))))
+      (multiple-value-bind (producer ns key relation ons okey start)
+          (split-claim-identity-key (claim-identity-key c))
+        (is (string= "series" producer))
+        (is (eq :region ns))
+        (is (string= "r1" key))
+        (is (string= "in-state" relation))
+        (is (eq :state ons))
+        (is (string= "a" okey))
+        (is (equal (extent-sexp-start-key (claim-extent-sexp c)) start))))))

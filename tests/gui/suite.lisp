@@ -136,33 +136,68 @@ graph and clock (globals, not LET -- see the file header)."
     (unwind-protect (usocket:get-local-port s)
       (usocket:socket-close s))))
 
-(defmacro with-gui-server ((&key allow-prolog) &body body)
+(defmacro with-gui-server ((&key allow-prolog read-only) &body body)
   "Run BODY against a GUI on a fresh ephemeral port.  ALLOW-PROLOG
 opens the free-text Prolog endpoint; the default NIL is the shipped
-default, and the suite proves the flag in both states (GH #279)."
+default, and the suite proves the flag in both states (GH #279).
+READ-ONLY refuses the open/close verbs (GH #384)."
   `(let ((*gui-test-port* (free-tcp-port)))
      (unwind-protect
           (progn
             (start-gui :port *gui-test-port* :bind "127.0.0.1"
-                       :allow-prolog ,allow-prolog)
+                       :allow-prolog ,allow-prolog
+                       :read-only ,read-only)
             (sleep 0.3)                 ; let the listener bind
             ,@body)
        (ignore-errors (stop-gui)))))
+
+(defparameter *host-body* "host application"
+  "What the one-line host app under WITH-MOUNTED-GUI answers.")
+
+(defmacro with-mounted-gui ((&key (prefix "/gui") allow-prolog read-only)
+                            &body body)
+  "Run BODY against MAKE-GUI-APP mounted at PREFIX under a one-line
+host application on a fresh ephemeral port -- the arrangement of GH
+#384, through the same clackup START-GUI uses.  Everything outside the
+prefix answers *HOST-BODY* as text/plain."
+  `(let* ((*gui-test-port* (free-tcp-port))
+          (host (lambda (env)
+                  (declare (ignore env))
+                  (list 200 (list :content-type "text/plain")
+                        (list *host-body*))))
+          (app (lack:builder
+                (:mount ,prefix (graph-db.gui:make-gui-app
+                                 :allow-prolog ,allow-prolog
+                                 :read-only ,read-only))
+                host))
+          (handler (clack:clackup app :port *gui-test-port*
+                                      :address "127.0.0.1"
+                                      :debug nil :silent t)))
+     (unwind-protect
+          (progn
+            (sleep 0.3)                 ; let the listener bind
+            ,@body)
+       (ignore-errors (clack:stop handler)))))
 
 (defun gui-url (path)
   (format nil "http://127.0.0.1:~D~A" *gui-test-port* path))
 
 (defun gui-request (path &key (method :get) preserve-uri content
-                             (content-type "application/json"))
-  "Request PATH; (values decoded-json status content-type raw-body).
-DRAKMA returns 4xx/5xx without signaling, so status is always there.
-:PRESERVE-URI T sends PATH byte-for-byte (no client-side dot-segment
-or percent normalization) -- for the traversal tests.  :CONTENT is a
-UTF-8 request body sent under :CONTENT-TYPE (GH #278)."
+                             (content-type "application/json")
+                             headers (redirect t))
+  "Request PATH; (values decoded-json status content-type raw-body
+response-headers).  DRAKMA returns 4xx/5xx without signaling, so
+status is always there.  :PRESERVE-URI T sends PATH byte-for-byte (no
+client-side dot-segment or percent normalization) -- for the traversal
+tests.  :CONTENT is a UTF-8 request body sent under :CONTENT-TYPE (GH
+#278).  :HEADERS is an alist of extra request headers; :REDIRECT NIL
+returns a 3xx as is instead of following it (GH #384)."
   (multiple-value-bind (body status headers)
       (apply #'drakma:http-request (gui-url path)
              :method method
              :preserve-uri preserve-uri
+             :additional-headers headers
+             :redirect redirect
              (when content
                (list :content (flexi-streams:string-to-octets
                                content :external-format :utf-8)
@@ -175,7 +210,8 @@ UTF-8 request body sent under :CONTENT-TYPE (GH #278)."
                 (ignore-errors (json:decode-json-from-string string)))
               status
               (cdr (assoc :content-type headers))
-              string))))
+              string
+              headers))))
 
 (defun jref (alist key)
   "Decoded-body lookup.  ⚠ cl-json's decoder folds BOTH \"guiPerson\"

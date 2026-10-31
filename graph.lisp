@@ -10,6 +10,11 @@
                 ;; spatial-query.lisp / spatial-registry.lisp (both load later)
                 rebuild-spatial-indexes report-degraded-spatial-indexes
                 install-spatial-indexes))
+;; transactions.lisp and tx-overlay.lisp load later too; VECTOR-SEARCH's
+;; overlay half (GH #410) calls these.
+(declaim (ftype function current-overlay overlay-effective-write
+                overlay-live-nodes node-vector-index-slots %segment-key
+                %node-segment-value))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Spatial index persistence -- the v3 sidecar.
@@ -266,7 +271,40 @@ deliberately not done here."
           ;; to warn about, and nothing to scan.
           (t nil))))))
 
-(defun vector-search (graph class-name slot-name query-vector k)
+(defun %class-declares-vector-index-p (class slot-name)
+  "True when CLASS or an ancestor declares SLOT-NAME :vector-index t --
+the discrimination behind VECTOR-SEARCH's second value (GH #293)."
+  (some (lambda (c)
+          (find-if (lambda (sd)
+                     (and (eq (slot-definition-name sd) slot-name)
+                          (ignore-errors (vector-index-p sd))))
+                   (class-direct-slots c)))
+        (class-precedence-list class)))
+
+(defun %overlay-vector-hits (ov key slot-name query-vector filter)
+  "(SCORE . ID) for the open transaction's own live nodes whose SLOT-NAME
+vector the apply pass will store in the segment KEY names, scored against
+QUERY-VECTOR; FILTER as VECTOR-SEARCH's.  A vector of another length is
+left out: the commit would refuse it (GH #410)."
+  (loop for n in (overlay-live-nodes ov)
+        for v = (and (member slot-name
+                             (node-vector-index-slots (class-of n)))
+                     (equal (%segment-key n slot-name) key)
+                     (%node-segment-value n slot-name))
+        when (and v
+                  (= (length v) (length query-vector))
+                  (or (null filter) (funcall filter (id n))))
+          collect (cons (%cosine query-vector v) (id n))))
+
+(defun %top-k-hits (hits k)
+  "HITS, (SCORE . ID) conses, in the segment's ranking order, cut to K."
+  (let ((sorted (sort (copy-list hits)
+                      (lambda (a b)
+                        (%score-before-p (car a) (cdr a) (car b) (cdr b))))))
+    (subseq sorted 0 (min k (length sorted)))))
+
+(defun vector-search (graph class-name slot-name query-vector k
+                      &key filter)
   "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is
 nearest QUERY-VECTOR by cosine, as (score . node-id) conses, best first.
 
@@ -276,19 +314,58 @@ NIL when no segment exists yet: segments are created lazily on the first
 conforming write, so a declared-but-never-written slot simply has nothing to
 search.
 
-NIL is AMBIGUOUS, deliberately.  It means any of: (a) the legitimate lazy case
-above; (b) CLASS-NAME names no class; (c) SLOT-NAME is not a :VECTOR-INDEX slot
-on CLASS-NAME or any ancestor -- in which case %VECTOR-INDEX-SLOT-OWNER-NAME
-falls back to the queried class itself and the lookup misses a key nothing was
-ever stored under.  So a typo in either name is indistinguishable from an empty
-index and reports \"nothing indexed\" rather than signalling.  If you are
-debugging an unexpectedly empty result, check the declaration before the data."
+The SECOND value disambiguates an empty first value (GH #293):
+:OK (a real, possibly empty, answer), :NO-SUCH-CLASS, :NOT-A-VECTOR-
+INDEX-SLOT (the typo case that used to be indistinguishable from an
+empty index), or :NO-SEGMENT-YET (declared, never written -- the
+legitimate lazy case).
+
+:FILTER (GH #293) is a function of the candidate's node id, applied
+INSIDE the scan before the vector is read, so a bounded query fills K
+with in-bounds hits instead of post-filtering below K.  The filter never
+sees a node -- the segment's no-materialisation property survives.
+
+Inside an open transaction the answer is what it will commit (GH #410):
+the scan skips an id the transaction wrote, its own live nodes' current
+vectors are scored (%OVERLAY-VECTOR-HITS) and the K best of both are
+returned; with no segment yet, own hits alone answer :OK."
   (let* ((class (find-class class-name nil))
          (owner (and class (%vector-index-slot-owner-name class slot-name)))
-         (segment (and owner
-                       (gethash (cons owner slot-name) (vector-segments graph)))))
-    (when segment
-      (segment-scan segment query-vector k))))
+         (key (cons owner slot-name))
+         (segment (and owner (gethash key (vector-segments graph)))))
+    (cond ((null class) (values nil :no-such-class))
+          ((not (%class-declares-vector-index-p class slot-name))
+           (values nil :not-a-vector-index-slot))
+          (t
+           (let* ((ov (current-overlay graph))
+                  (own (and ov (%overlay-vector-hits ov key slot-name
+                                                     query-vector filter)))
+                  (skip (and ov
+                             (lambda (id)
+                               (and (not (overlay-effective-write ov id))
+                                    (or (null filter)
+                                        (funcall filter id)))))))
+             (cond ((and (null segment) (null own))
+                    (values nil :no-segment-yet))
+                   ((null segment) (values (%top-k-hits own k) :ok))
+                   (t
+                    (let ((hits (%scan-live-segment graph key segment
+                                                    query-vector k
+                                                    (or skip filter))))
+                      (values (if own (%top-k-hits (append hits own) k) hits)
+                              :ok)))))))))
+
+(defun %scan-live-segment (graph key segment query-vector k filter)
+  "SEGMENT-SCAN, re-fetching the segment once from GRAPH's table when the
+one in hand was closed under us by a rebuild or reset (GH #54).  The
+replacement is registered before the old one is closed, so one re-fetch
+finds it; a second SEGMENT-CLOSED propagates."
+  (handler-case (segment-scan segment query-vector k :filter filter)
+    (segment-closed ()
+      (let ((live (gethash key (vector-segments graph))))
+        (if (and live (not (eq live segment)))
+            (segment-scan live query-vector k :filter filter)
+            nil)))))
 
 (defstruct (%graph-open-state (:conc-name %gos-))
   "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private
@@ -1022,7 +1099,13 @@ policy.dat's ~S; the file wins."
           ;; index creation: crash-correctness comes from this rebuild, not from
           ;; CL-STORE I/O under the transaction-manager lock.)
           (when crash-recovery-p
-            (rebuild-spatial-indexes graph)))
+            (rebuild-spatial-indexes graph)
+            ;; Counting indexes (GH #361, R8): the replay above ran under
+            ;; *ADD-TO-INDEXES-UNLESS-PRESENT-P*, which counts nothing, and
+            ;; the restore below reopens the PRE-crash maps -- missing the
+            ;; replayed tail.  This LET closes before that restore, so the
+            ;; flag is what carries the decision to rebuild past it.
+            (setf (count-indexes-stale-p graph) t)))
         ;; Unique constraints (issue #6): reopen the persistent unique skip-lists from
         ;; the sidecar (durable, no scan); only rebuild from nodes if there is no
         ;; sidecar -- a fresh graph, or a crash before CLOSE-GRAPH saved the roots.
@@ -1035,7 +1118,16 @@ policy.dat's ~S; the file wins."
         ;; this graph existed, or added since the last close); no-op otherwise.
         (install-secondary-indexes graph)
         ;; Same for a def-unique'd multi-slot constraint (GH #107).
-        (install-unique-tuple-constraints graph))
+        (install-unique-tuple-constraints graph)
+        ;; Counting indexes (GH #361): reopen-or-rebuild like the others,
+        ;; then build any declaration the sidecar did not cover.
+        (unless (restore-count-index-roots graph)
+          (rebuild-count-indexes graph))
+        (install-count-indexes graph)
+        ;; A crash-recovery replay left the counters stale (R8, above):
+        ;; only a scan can put back what the replay did not count.
+        (when (count-indexes-stale-p graph)
+          (rebuild-count-indexes graph)))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role
@@ -1225,14 +1317,30 @@ a snapshot failure does NOT abort the close (GH #120)."
       ;; while the heap is still open, so OPEN can reopen them without a scan.
       ;; No-op on a memory graph.
       ;;
-      ;; These three are deliberately NOT guarded the way the snapshot below is
+      ;; These saves are deliberately NOT guarded the way the snapshot below is
       ;; (GH #120).  They write atomically (temp + rename, #63), so a failure
       ;; leaves the PREVIOUS sidecar naming the PREVIOUS roots; closing past
       ;; that and deleting .dirty would let the next open adopt roots that no
       ;; longer match the index, with no recovery pass to catch it.  A missing
       ;; snapshot costs replay time; a stale index root is silently wrong.
+      ;; The retired-map free among them IS guarded, on purpose: those pages
+      ;; are unreachable either way, so failing to reclaim them must not stop
+      ;; the sidecar saves around it (GH #361).
       (save-unique-index-roots graph)
       (save-secondary-index-roots graph)
+      ;; Counting indexes (GH #361, R8): a stale close would persist
+      ;; under-counted maps marked built, and the flag is not persisted.
+      ;; On a device EVERY pull marks them stale, so a pull and a clean
+      ;; close with no count query between them is the ordinary case.
+      ;; The rebuild retires the stale maps, the free below reclaims
+      ;; them, the save then persists correct roots.
+      (when (count-indexes-stale-p graph)
+        (rebuild-count-indexes graph))
+      ;; Free the maps a rebuild retired -- this is the one moment no
+      ;; reader can be mid-cursor -- and only then persist the live
+      ;; maps' roots.
+      (%free-retired-count-maps graph)
+      (save-count-index-roots graph)
       ;; Spatial indexes (v3 sidecar): the addresses are already durable from
       ;; creation, but the precision histogram is only in RAM, so this close is
       ;; what makes the coarsest-precision clamp survive the reopen intact.

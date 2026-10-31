@@ -106,6 +106,19 @@
            (ignore-errors (close-graph ,g))
            (collect-garbage))))))
 
+(defmacro with-ix-bplus-graph ((g) &body body)
+  "WITH-IX-GRAPH on the B+ tree index backend."
+  `(with-ix-graph (,g :backend :bplus-tree) ,@body))
+
+(defmacro with-ix-memory-graph ((g) &body body)
+  "A fresh in-memory graph named *IX-GRAPH-NAME*, in a temp dir."
+  (let ((dir (gensym)))
+    `(with-temp-directory (,dir)
+       (let ((,g (graph-db::make-memory-graph *ix-graph-name* (namestring ,dir))))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
 (defmacro with-ix-di-graph ((g) &body body)
   "A fresh on-disk graph named *IX-DI-GRAPH-NAME* (def-index-only schema)."
   (let ((dir (gensym)))
@@ -312,6 +325,48 @@ value component (#107)."
                                          :start (list "ops" "e1")
                                          :end   (list "ops" "e2")))
                      #'string<)))))
+
+(defun ix-ns-key-rows (g &rest range)
+  "INDEX-RANGE over IX-CLAIM's (ns key rel) index as (ns key) pairs, ascending."
+  (mapcar (lambda (n) (list (ix-ns n) (ix-key n)))
+          (apply #'index-range g 'ix-claim '(ns key rel) range)))
+
+(defmacro short-end-alone-includes-its-extensions-on (make-graph-macro)
+  "The #413 check inside MAKE-GRAPH-MACRO, one bound at a time."
+  `(,make-graph-macro (g)
+     (with-transaction ()
+       (make-ix-claim :ns "a" :key "x" :rel "at")
+       (make-ix-claim :ns "d" :key "x" :rel "at")
+       (make-ix-claim :ns "d" :key "y" :rel "at")
+       (make-ix-claim :ns "e" :key "x" :rel "at"))
+     (is (equal '(("a" "x") ("d" "x") ("d" "y"))
+                (ix-ns-key-rows g :end '("d")))
+         ":end alone, a short tuple, includes its extensions")
+     (is (equal '(("d" "x") ("d" "y") ("e" "x"))
+                (ix-ns-key-rows g :start '("d")))
+         ":start alone, a short tuple, begins at its first extension")
+     (is (equal '(("a" "x") ("d" "x") ("d" "y"))
+                (ix-ns-key-rows g :start '("a") :end '("d")))
+         "both bounds: the same rows as :end alone, below \"e\"")
+     (is (equal '(("a" "x") ("d" "x") ("d" "y") ("e" "x"))
+                (ix-ns-key-rows g))
+         "no bound: every row")))
+
+(test index-range-short-end-alone-includes-its-extensions
+  "GH #413: a short END tuple is a prefix bound, so [START, END] takes
+every stored tuple that starts with END -- whether or not START is also
+given.  Before the fix the single-bound path filtered on the bare tuple,
+under which a strict prefix sorts BEFORE its extensions, so :end '(\"d\")
+alone dropped the (\"d\" ...) rows the two-bound path returned."
+  (short-end-alone-includes-its-extensions-on with-ix-graph))
+
+(test index-range-short-end-alone-includes-its-extensions-bplus
+  "GH #413 on the B+ tree backend."
+  (short-end-alone-includes-its-extensions-on with-ix-bplus-graph))
+
+(test index-range-short-end-alone-includes-its-extensions-memory
+  "GH #413 on the memory-graph backend."
+  (short-end-alone-includes-its-extensions-on with-ix-memory-graph))
 
 (test index-range-open-ended-over-arity-start-signals
   "An over-arity :START alone (no :END) must signal -- the open-ended
@@ -771,15 +826,6 @@ fail OPEN-GRAPH outright on a sidecar that deserialized perfectly well."
 
 ;;; --- memory backend ---------------------------------------------------------
 
-(defmacro with-ix-memory-graph ((g) &body body)
-  "A fresh in-memory graph named *IX-GRAPH-NAME*, in a temp dir."
-  (let ((dir (gensym)))
-    `(with-temp-directory (,dir)
-       (let ((,g (graph-db::make-memory-graph *ix-graph-name* (namestring ,dir))))
-         (unwind-protect (let ((*graph* ,g)) ,@body)
-           (ignore-errors (close-graph ,g :snapshot-p nil))
-           (collect-garbage))))))
-
 ;;; --- arity-aware skip-list construction (GH #107) ---------------------------
 
 ;; Runs on the memory-graph mem-skip-list, not WITH-IX-GRAPH's on-disk
@@ -885,3 +931,242 @@ under it."
              (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI")))))
         (ignore-errors (close-graph g))
         (collect-garbage)))))
+
+(test a-withdrawn-index-s-pages-are-reclaimed-at-open
+  "GH #147: the open that drops a withdrawn declaration's sidecar record
+also frees the structure it built -- observed through the DELETE-VIEW-INDEX
+seam -- and a re-shaped record takes the same path."
+  (with-temp-directory (dir)
+    ;; A dedicated class with NO :index slot options: the declared-p
+    ;; predicate's class arm is graph-agnostic by design, so a shared
+    ;; class would keep the record alive past the undef.
+    (def-vertex ix-reclaim-item ()
+      ((tag :type string))
+      :ix-reclaim-graph)
+    (let ((g (make-graph :ix-reclaim-graph (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (graph-db:def-index ix-reclaim-item tag :ix-reclaim-graph
+                                 :name reclaim-probe)
+             (with-transaction ()
+               (make-ix-reclaim-item :tag "a" :graph g)))
+        (close-graph g :snapshot-p nil)))
+    (graph-db::undef-index ix-reclaim-item :ix-reclaim-graph
+                           :name reclaim-probe)
+    (let ((freed 0)
+          (orig (fdefinition 'graph-db::delete-view-index)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db::delete-view-index)
+                   (lambda (idx) (incf freed) (funcall orig idx)))
+             (let ((g (open-graph :ix-reclaim-graph (namestring dir)
+                                  :buffer-pool-size 1000)))
+               (close-graph g :snapshot-p nil)))
+        (setf (fdefinition 'graph-db::delete-view-index) orig))
+      (is (plusp freed)
+          "the dropped record's pages were stranded, not reclaimed"))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #350: distinct-prefix walk and counts (spec 2026-09-07 §2)
+;;; ---------------------------------------------------------------------------
+
+(defvar *ix-seeks* nil
+  "Seek counter for %COUNT-SEEKS; NIL when not counting.")
+
+(defun %count-seeks (thunk)
+  "Run THUNK counting MAKE-RANGE-CURSOR calls -- the one seek each hop
+of the prefix walk makes -- through an :AROUND method removed afterwards.
+Returns the count.  Callers prove the probe live with a control."
+  (let* ((gf #'make-range-cursor)
+         (method (eval '(defmethod make-range-cursor :around
+                            ((index t) start end &key &allow-other-keys)
+                          (declare (ignore start end))
+                          (when *ix-seeks* (incf *ix-seeks*))
+                          (call-next-method)))))
+    (unwind-protect
+         (let ((*ix-seeks* 0))
+           (funcall thunk)
+           *ix-seeks*)
+      (remove-method gf method))))
+
+(test map-index-prefixes-reports-each-distinct-prefix-once-in-order
+  "Spec §2: each distinct leading prefix once, in index order, at arity
+1 and 2; :START begins at the first prefix at or after it."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dolist (row '(("ops" "e1" "at") ("ops" "e1" "by") ("ops" "e2" "at")
+                     ("hr" "p1" "at") ("hr" "p1" "at") ("zz" "q" "at")))
+        (make-ix-claim :ns (first row) :key (second row)
+                       :rel (third row))))
+    (flet ((walk (arity &optional start)
+             (let ((out '()))
+               (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
+                                   '(ns key rel) :arity arity :start start)
+               (nreverse out))))
+      (is (equal '(("hr") ("ops") ("zz")) (walk 1)))
+      (is (equal '(("hr" "p1") ("ops" "e1") ("ops" "e2") ("zz" "q"))
+                 (walk 2))
+          "two claims share (hr p1): one prefix")
+      (is (equal '(("hr" "p1" "at") ("ops" "e1" "at") ("ops" "e1" "by")
+                   ("ops" "e2" "at") ("zz" "q" "at"))
+                 (walk 3))
+          "full arity: the +max-key+ hop collapses duplicate tuples")
+      (is (equal '(("ops") ("zz")) (walk 1 '("ops"))) ":start inclusive")
+      (is (equal '(("ops" "e1") ("ops" "e2") ("zz" "q"))
+                 (walk 2 '("ops")))
+          "a :start shorter than the arity starts at its first prefix")
+      (is (null (walk 1 '("zzz"))) "past the last prefix: nothing")
+      (signals query-precondition-error (walk 4))
+      (signals query-precondition-error (walk 1 '("a" "b"))))))
+
+(test map-index-prefixes-seeks-once-per-prefix
+  "Spec §2.1: seek-and-skip -- K distinct prefixes cost K+1 seeks
+whatever N is.  Control: one prefix INDEX-LOOKUP is one seek, so the
+probe fires.  Ablation, recorded in the task report: a linear hop makes
+the walk cost N+1 seeks and turns the second check red."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 30)
+        (make-ix-claim :ns (nth (mod i 3) '("a" "b" "c"))
+                       :key (format nil "k~D" i) :rel "r")))
+    (is (= 1 (%count-seeks
+              (lambda ()
+                (index-lookup g 'ix-claim '(ns key rel) '("a")
+                              :prefix t))))
+        "control: one range lookup is one seek")
+    (is (= 4 (%count-seeks
+              (lambda ()
+                (map-index-prefixes #'identity g 'ix-claim
+                                    '(ns key rel)))))
+        "3 prefixes over 30 entries: 3 hops plus the terminating seek")))
+
+(test map-index-prefixes-reports-a-null-component-as-nil
+  "Spec §2.2: a stored null (+NULL-COMPONENT+) reads back as NIL and
+sorts first; a NIL in :START maps the other way."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key nil :rel "at")
+      (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (flet ((walk (&optional start)
+             (let ((out '()))
+               (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
+                                   '(ns key rel) :arity 2 :start start)
+               (nreverse out))))
+      (is (equal '(("ops" nil) ("ops" "e1")) (walk)))
+      (is (equal '(("ops" nil) ("ops" "e1")) (walk '("ops" nil)))))))
+
+(test index-count-is-the-range-size
+  "Spec §2: INDEX-COUNT counts entries under a full tuple or, with
+:PREFIX T, under a prefix; 0 for an absent prefix and for a declared
+index with no entries; a short tuple without :PREFIX signals as
+INDEX-LOOKUP does."
+  (with-ix-graph (g)
+    (is (= 0 (index-count g 'ix-claim '(ns key rel) '("ops") :prefix t))
+        "declared, empty")
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at")
+      (make-ix-claim :ns "ops" :key "e1" :rel "by")
+      (make-ix-claim :ns "ops" :key "e2" :rel "at")
+      (make-ix-claim :ns "hr" :key "p1" :rel "at"))
+    (is (= 3 (index-count g 'ix-claim '(ns key rel) '("ops") :prefix t)))
+    (is (= 2 (index-count g 'ix-claim '(ns key rel) '("ops" "e1")
+                          :prefix t)))
+    (is (= 1 (index-count g 'ix-claim '(ns key rel) '("ops" "e1" "at"))))
+    (is (= 0 (index-count g 'ix-claim '(ns key rel) '("none")
+                          :prefix t)))
+    (signals query-precondition-error
+      (index-count g 'ix-claim '(ns key rel) '("ops")))))
+
+(test def-index-declared-on-an-open-graph-indexes-existing-instances
+  "GH #350 spec §3: a DEF-INDEX evaluated while the graph is open builds
+over the instances already stored -- the relation index's no-migration
+contract."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "late"))
+    (def-index ix-claim (rel) :graph-db-index-test :name ix-late-rel)
+    (unwind-protect
+         (is (= 1 (length (index-lookup g 'ix-claim '(rel) "late"))))
+      (undef-index ix-claim :graph-db-index-test :name ix-late-rel))))
+
+;;; ENSURE-INDEX / ENSURE-UNIQUE: the runtime twins of DEF-INDEX and
+;;; DEF-UNIQUE (GH #378), on a class of their own so the unique constraint
+;;; cannot touch the duplicates other tests write on purpose.
+
+(def-vertex ix-rt ()
+  ((a :initarg :a :accessor ix-rt-a)
+   (b :initarg :b :accessor ix-rt-b))
+  :graph-db-index-test)
+
+(test ensure-index-and-ensure-unique-are-the-runtime-twins
+  "GH #378: a consumer replaying runtime types declares indexes and
+uniqueness from data.  ENSURE-INDEX builds the index on an open graph
+and is idempotent; ENSURE-UNIQUE enforces at commit under its :NAME."
+  (with-ix-graph (g)
+    (is-true (graph-db:ensure-index 'ix-rt '(a) *ix-graph-name*))
+    (is-true (graph-db:ensure-index 'ix-rt '(a) *ix-graph-name*))
+    (is-true (graph-db:ensure-unique 'ix-rt '(b) *ix-graph-name*
+                                     :name 'ix-rt-b-unique))
+    (with-transaction ()
+      (make-ix-rt :a "x" :b 1)
+      (make-ix-rt :a "y" :b 2))
+    (is (= 1 (length (graph-db:index-lookup g 'ix-rt '(a) "x"))))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-ix-rt :a "z" :b 1)))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #345: index membership is live, versions are not.
+;;;
+;;; %IX-RELEASE removes an entry when the delete (or the update's old value)
+;;; is applied, not when the version it indexed is reaped.  A read snapshot
+;;; opened before that write resolves the node at its own epoch, so an
+;;; index-backed read used to answer the node under its NEW value with its
+;;; OLD version's slot.  %INDEX-HIT-P now checks the resolved version still
+;;; carries the key.  The other half -- the old value no longer finds the
+;;; node at the snapshot, because its entry is gone -- is documented, and
+;;; is MVCC phase C-1's versioned membership (#113).
+;;; ---------------------------------------------------------------------------
+
+(defun %ix-write-in-another-thread (graph thunk)
+  "Run THUNK in a fresh thread with *GRAPH* bound to GRAPH, and wait: a
+write that commits while the calling thread holds a read snapshot."
+  (let ((err nil))
+    (bt:join-thread
+     (bt:make-thread (lambda ()
+                       (let ((*graph* graph))
+                         (handler-case (funcall thunk)
+                           (error (e) (setq err e)))))
+                     :name "ix-snapshot-writer"))
+    (when err (error err))))
+
+(test index-reads-under-a-snapshot-never-answer-a-key-the-version-lacks
+  "GH #345: a node re-indexed under a new value after the snapshot is
+not found under that value at the snapshot, by INDEX-LOOKUP or
+MAP-INDEX, although its id sits under it.  Control: the point lookup
+and the committed view both answer as expected."
+  (with-ix-graph (g)
+    (let (id)
+      (with-transaction ()
+        (setq id (id (make-ix-person :name "before" :age 1))))
+      (graph-db:with-read-snapshot (g)
+        (%ix-write-in-another-thread
+         g (lambda ()
+             (with-transaction ()
+               (let ((c (copy (lookup-vertex id))))
+                 (setf (ix-name c) "after")
+                 (save c)))))
+        (is (string= "before" (ix-name (lookup-vertex id)))
+            "control: the point lookup answers the snapshot's version")
+        (is (null (index-lookup g 'ix-person 'name "after"))
+            "INDEX-LOOKUP found the node under a value its version lacks")
+        (let ((hits '()))
+          (map-index (lambda (n) (push n hits)) g 'ix-person 'name
+                     :start "after" :end "after")
+          (is (null hits)
+              "MAP-INDEX emitted the node under a value its version lacks"))
+        ;; The documented gap: the old value's entry was released at
+        ;; apply, so nothing finds the node at the snapshot (#113).
+        (is (null (index-lookup g 'ix-person 'name "before"))))
+      (is (equal '("after") (ix-names (index-lookup g 'ix-person 'name
+                                                    "after")))
+          "outside the snapshot the update is visible"))))

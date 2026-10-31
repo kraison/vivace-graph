@@ -153,11 +153,44 @@ no native arm gets a correct answer rather than silently falling through to NIL.
   (and (consp list) (null (cdr list))))
 
 (defun new-interned-symbol (&rest args)
-  "Concatenate symbols or strings to form an interned symbol"
-  (intern (format nil "~{~a~}" args)))
+  "Concatenate ARGS -- symbols, strings and integers -- into an interned
+symbol.  Spelled from SYMBOL-NAME and ~D, not the printer, so a caller's
+*PRINT-CASE* or *PRINT-BASE* cannot change the name (GH #342)."
+  (intern (apply #'concatenate 'string
+                 (mapcar (lambda (arg)
+                           (if (integerp arg)
+                               (format nil "~D" arg)
+                               (string arg)))
+                         args))))
 
 (defun gen-id ()
   (uuid:uuid-to-byte-array (uuid:make-v4-uuid)))
+
+;; The fold is as wide as a fixnum HERE: 62 bits on SBCL, 61 on ECL, 60
+;; on CCL.  A wider fold returns bignums, and a CCL custom-hash table
+;; misses keys whose code is a bignum (GH #424, #425).
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +fixnum-fold-bits+ (integer-length most-positive-fixnum))
+  (defconstant +fixnum-fold-mask+ (1- (ash 1 +fixnum-fold-bits+))))
+(deftype fixnum-fold-word () `(unsigned-byte ,+fixnum-fold-bits+))
+
+(declaim (inline %fixnum-hash-bytes))
+(defun %fixnum-hash-bytes (bytes &optional (seed 0))
+  "A consing-free fixnum hash of BYTES (a byte vector, normally a 16-byte
+id) mixed into SEED: a fixnum-wide multiply-add fold.  For IN-MEMORY hash
+tables only -- the on-disk linear hash places buckets with %HASH, whose
+value is part of the store format (GH #373; replacing it is GH #375).
+Anything that is not a byte vector falls back to SXHASH."
+  (declare (optimize (speed 3) (safety 1))
+           (type fixnum-fold-word seed))
+  (let ((h seed))
+    (declare (type fixnum-fold-word h))
+    (if (typep bytes '(simple-array (unsigned-byte 8) (*)))
+        (locally (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+          (dotimes (i (length bytes) h)
+            (setf h (logand (+ (* h 1000003) (aref bytes i))
+                            +fixnum-fold-mask+))))
+        (logand (+ (* h 1000003) (sxhash bytes)) +fixnum-fold-mask+))))
 
 (defun parse-uuid-block (string start end)
   (parse-integer string :start start :end end :radix 16))
@@ -460,10 +493,12 @@ characters.~@:>" string (length string)))
 (defun do-grab-lock-with-timeout (lock whostate timeout)
   (if timeout
       (or (ccl:try-lock lock)
+          ;; The predicate's arguments are &REST: the lock itself, not a
+          ;; list of it (GH #432).
           (ccl:process-wait-with-timeout whostate
                                          (round
                                           (* timeout ccl:*ticks-per-second*))
-                                         #'ccl:try-lock (list lock)))
+                                         #'ccl:try-lock lock))
       (ccl:grab-lock lock)))
 
 #+ccl
@@ -512,34 +547,73 @@ characters.~@:>" string (length string)))
   `(sb-ext:with-locked-hash-table (,table)
      (progn ,@body)))
 
+;; CCL's native read-write lock admits new readers while a writer waits,
+;; so readers that re-enter back to back starve it (GH #118: the segment
+;; scanners).  The wrapper gates NEW readers while a writer is queued,
+;; which is rw-lock.lisp's FIFO in effect; a thread already holding the
+;; lock on either side is never gated, or it would wait on a writer that
+;; waits on it.  Predicate RW-LOCK-P comes with the struct.
+#+ccl
+(defstruct (rw-lock (:constructor %make-rw-lock ()))
+  (native (ccl:make-read-write-lock))
+  (writers-waiting 0 :type fixnum)
+  (writer nil))
+
+#+ccl
+(defvar *rw-locks-read-held* '()
+  "The RW-LOCKs this thread holds on the read side, innermost first.")
+
+#+ccl
+(defun %rw-gate-readers (lock)
+  (unless (or (eq (rw-lock-writer lock) ccl:*current-process*)
+              (member lock *rw-locks-read-held* :test #'eq))
+    (loop while (plusp (rw-lock-writers-waiting lock))
+          do (ccl:process-allow-schedule))))
+
 #+ccl
 (defmacro with-read-lock ((lock) &body body)
-  `(ccl:with-read-lock (,lock)
-     (progn ,@body)))
+  (let ((l (gensym "LOCK")))
+    `(let ((,l ,lock))
+       (%rw-gate-readers ,l)
+       (ccl:with-read-lock ((rw-lock-native ,l))
+         (let ((*rw-locks-read-held* (cons ,l *rw-locks-read-held*)))
+           ,@body)))))
 
 #+ccl
 (defmacro with-write-lock ((lock) &body body)
-  `(ccl:with-write-lock (,lock)
-     (progn ,@body)))
+  (let ((l (gensym "LOCK")) (queued (gensym "QUEUED")) (prev (gensym "PREV")))
+    `(let ((,l ,lock) (,queued t))
+       (ccl::atomic-incf (rw-lock-writers-waiting ,l))
+       (unwind-protect
+            (ccl:with-write-lock ((rw-lock-native ,l))
+              (ccl::atomic-decf (rw-lock-writers-waiting ,l))
+              (setf ,queued nil)
+              (let ((,prev (rw-lock-writer ,l)))
+                (setf (rw-lock-writer ,l) ccl:*current-process*)
+                (unwind-protect (progn ,@body)
+                  (setf (rw-lock-writer ,l) ,prev))))
+         (when ,queued
+           (ccl::atomic-decf (rw-lock-writers-waiting ,l)))))))
 
 #+ccl
 (defun make-rw-lock ()
-  (ccl:make-read-write-lock))
-
-#+ccl
-(defun rw-lock-p (thing)
-  (ccl::read-write-lock-p thing))
+  (%make-rw-lock))
 
 #+ccl
 (defun acquire-write-lock (lock &key wait-p)
+  "CCL: WAIT-P is ignored, the native lock has no try form (GH #118)."
   (declare (ignore wait-p))
-  (let ((locked (ccl:make-lock-acquisition)))
-    (declare (dynamic-extent locked))
-    (ccl::write-lock-rwlock lock locked)
-    (when (ccl::lock-acquisition.status locked)
-      lock)))
+  (ccl::atomic-incf (rw-lock-writers-waiting lock))
+  (unwind-protect
+       (let ((locked (ccl:make-lock-acquisition)))
+         (declare (dynamic-extent locked))
+         (ccl::write-lock-rwlock (rw-lock-native lock) locked)
+         (when (ccl::lock-acquisition.status locked)
+           (setf (rw-lock-writer lock) ccl:*current-process*)
+           lock))
+    (ccl::atomic-decf (rw-lock-writers-waiting lock))))
 
 #+ccl
 (defun release-write-lock (lock)
-  (declare (ignore wait-p))
-  (ccl::unlock-rwlock lock))
+  (setf (rw-lock-writer lock) nil)
+  (ccl::unlock-rwlock (rw-lock-native lock)))

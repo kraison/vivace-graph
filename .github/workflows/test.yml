@@ -1,8 +1,9 @@
 # The full suite in CI (see docs/ci.md): main, concurrency,
-# ACID, spacetime, geos, algorithms, gui.  The habit this replaces:
-# running 35+ minutes of tests by hand on every change.  Local runs
-# are the affected subsystem's tests; every push here gets the full
-# matrix, and experiment -> master promotion waits for green.
+# ACID, spacetime, query, rules, geos, algorithms, gui.  The habit
+# this replaces: running 35+ minutes of tests by hand on every change.
+# Local runs are the affected subsystem's tests; every push here
+# gets the full matrix, and experiment -> master promotion waits
+# for green.
 name: test
 on:
   push:
@@ -10,6 +11,16 @@ on:
   pull_request:
     branches: [experiment, master]
   workflow_dispatch:
+
+# One live run per ref (docs/ci.md).  The runner is serial, so a
+# superseded run costs the next one its whole queue wait: a fixup
+# pushed to a PR used to sit behind the run it replaced, and two merges
+# landing close together queued two experiment runs when the second
+# already covers the first.  Groups are per-ref, so a PR can cancel
+# only its own earlier run, never experiment's and never another PR's.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   full-suite:
@@ -33,8 +44,18 @@ jobs:
               https://github.com/kraison/cl-temporal-extent $d
           fi
           echo "cl-temporal-extent @ $(git -C $d rev-parse --short HEAD)"
-      - name: full suite (12GiB heap per tests/README.md)
+      # Full on a push, fast tier on a pull request (docs/ci.md, GH #340):
+      # three suites are 71% of this step's wall time for 8% of its checks.
+      # The other lanes below run either way -- together they are ~4
+      # minutes, so there is nothing to tier there.
+      - name: main suite (12GiB heap per tests/README.md)
         run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SYSTEM=graph-db/fast-test
+          else
+            SYSTEM=graph-db
+          fi
+          echo "main suite: asdf:test-system :$SYSTEM"
           sbcl --dynamic-space-size 12288 --non-interactive \
             --load "$HOME/quicklisp/setup.lisp" \
             --eval '(setf ql:*local-project-directories* nil)' \
@@ -46,7 +67,7 @@ jobs:
                                                    (user-homedir-pathname)))
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/test :silent t)' \
-            --eval '(asdf:test-system :graph-db)'
+            --eval "(asdf:test-system :$SYSTEM)"
       - name: concurrency suite
         run: |
           sbcl --dynamic-space-size 12288 --non-interactive \
@@ -89,6 +110,34 @@ jobs:
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/spacetime-test :silent t)' \
             --eval '(asdf:test-system :graph-db/spacetime-test)'
+      - name: query suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/query-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/query-test)'
+      - name: rules suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/rules-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/rules-test)'
       - name: geos suite
         run: |
           sbcl --dynamic-space-size 12288 --non-interactive \
@@ -131,14 +180,23 @@ jobs:
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/gui-test :silent t)' \
             --eval '(asdf:test-system :graph-db/gui-test)'
+      # The two loadable examples, each in a fresh image with its
+      # /var/tmp scratch cleared first (GH #417): a wrong call in an
+      # example is only ever caught by loading it.
+      - name: examples load in a fresh image
+        run: |
+          CL_SOURCE_REGISTRY="$PWD//:$HOME/ci-deps-vivace-graph/cl-temporal-extent/:" \
+            tests/load-examples.sh
 
   arm64-advisory:
-    # horus, when awake: an advisory lane whose value is exactly the
-    # class of bug #218 was (arm64-only %POSIX-OPEN).  Never gates.
+    # thoth (infra hosts/thoth/README.md): an advisory lane whose value
+    # is exactly the class of bug #218 was (arm64-only %POSIX-OPEN).
+    # Never gates.  Runs on a push to experiment or master, or by hand
+    # on any ref: gh workflow run test.yml --ref <branch> (docs/ci.md).
     runs-on: [self-hosted, macOS, ARM64]
     continue-on-error: true
     timeout-minutes: 90
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - name: cl-temporal-extent at master head

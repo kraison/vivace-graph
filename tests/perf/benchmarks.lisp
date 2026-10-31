@@ -78,6 +78,23 @@
         (timed-ops ("scan-edges" (count-edges g))
           (count-edges g))))))
 
+(defun bench-tx-scan ()
+  "adjacency scans inside the transaction that wrote the edges, against
+the same scans after commit: the cost of the own-write overlay (GH #408)."
+  (let ((v (scale 1000)) (e (scale 1000)) (probes (scale 200)))
+    (with-perf-graph (g)
+      (let ((ids (insert-p-nodes v :batch 1000)))
+        (flet ((probe ()
+                 (dotimes (j probes)
+                   (outgoing-edges (lookup-vertex (aref ids j))
+                                   :edge-type 'p-knows))))
+          (with-transaction ()
+            (dotimes (j e)
+              (make-p-knows :from (lookup-vertex (aref ids (mod j v)))
+                            :to (lookup-vertex (aref ids (mod (1+ j) v)))))
+            (timed-ops ("scan-in-tx" probes) (probe)))
+          (timed-ops ("scan-committed" probes) (probe)))))))
+
 (defun bench-view ()
   "view lookup (invoke-graph-view :key) throughput."
   (let ((n (scale 20000)) (batch 1000) (q (scale 20000)))
@@ -980,6 +997,7 @@ Measurement-only; always returns T."
          (progn
            (bench-crud)
            (bench-edges)
+           (bench-tx-scan)
            (bench-view)
            (bench-unique)
            (bench-index)
@@ -997,6 +1015,7 @@ Measurement-only; always returns T."
            ;; coverage benches, batch B (GH #254)
            (bench-peer-replication)
            (bench-vector-search)
+           (bench-claim-linking)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).

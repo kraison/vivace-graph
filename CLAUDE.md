@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 VivaceGraph (`graph-db`) is an ACID-compliant object graph database written in pure Common Lisp, taking design inspiration from CouchDB, neo4j and AllegroGraph. It supports user-defined indexes, map-reduce views, master/slave replication, and a Prolog-like query language. The on-disk store is built from scratch on memory-mapped files — there is no external storage engine.
 
-Supported implementations: SBCL (>= 1.045), Clozure CL (CCL; Linux x86_64 only — see below), ECL (>= 21.2.1; full suite green on ECL 21.2.1 and 26.5.5, macOS arm64 + Linux), and LispWorks. CCL is usable on Linux but **not on Apple-Silicon macOS**: the Clozure ARM64 port has been stalled for ~5 years, and macOS support for Intel (x86_64) binaries is nearly gone, so there is no working CCL on an M-series Mac (development here is on an M3). On Apple Silicon, develop/test with SBCL or ECL; reach for CCL only on Linux. Code is heavily conditionalized with `#+sbcl` / `#+ccl` / `#+ecl` / `#+lispworks` reader macros — when editing low-level code (locks, MOP, mmap, hash tables) you usually must handle all four. ECL has its own gotchas worth knowing before touching that code: it has no custom hash-table tests (use `equalp`, never `:test`/`:hash-function`), cl-store can't serialize structs without the shim in `cl-store-ecl.lisp`, `defstruct` makes a setf *expander* but no `(setf accessor)` function, and any per-impl reader-conditional that wraps a value or a macro `,@body` must include an `#+ecl` branch or the form silently becomes empty.
+Supported implementations: SBCL (>= 1.045), Clozure CL (CCL; Linux x86_64 only — see below), ECL (>= 21.2.1; full suite green on ECL 21.2.1 and 26.5.5, macOS arm64 + Linux), and LispWorks. CCL is usable on Linux but **not on Apple-Silicon macOS**: the Clozure ARM64 port has been stalled for ~5 years, and macOS support for Intel (x86_64) binaries is nearly gone, so there is no working CCL on an M-series Mac (development here is on an M3). On Apple Silicon, develop/test with SBCL or ECL; reach for CCL only on Linux. Code is heavily conditionalized with `#+sbcl` / `#+ccl` / `#+ecl` / `#+lispworks` reader macros — when editing low-level code (locks, MOP, mmap, hash tables) you usually must handle all four. ECL has its own gotchas worth knowing before touching that code: it has no custom hash-table tests (use `equalp`, never `:test`/`:hash-function`), cl-store can't serialize structs without the shim in `cl-store-ecl.lisp`, `defstruct` makes a setf *expander* but no `(setf accessor)` function, and any per-impl reader-conditional that wraps a value or a macro `,@body` must include an `#+ecl` branch or the form silently becomes empty. CCL's own: a file stream is private to the thread that opened it unless opened with `:sharing :lock`, so a stream another thread writes or flushes needs it (#315); its fixnum is 60 bits, ECL's 61, SBCL's 62 (#424); a second `join-thread` on a finished thread blocks forever, so guard a repeat join with `thread-alive-p` (#433).
 
 ## Loading, building, running
 
@@ -21,7 +21,9 @@ Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, n
 
 **Component load order matters.** `graph-db.asd` encodes a strict dependency chain from the storage primitives up to the query/REST layers; if you add a file, place it in the right position and declare its `:depends-on`.
 
-`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by loading them in a fresh image.
+`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by `tests/load-examples.sh`, which loads each in a fresh image with a private scratch directory (`GRAPH_DB_EXAMPLE_ROOT`, which the examples honour; `/var/tmp/` by hand); CI runs it on every push (#417).
+
+`docs/codebase-notes.md` is the short version for writing code here: the core idioms, the efficient choice for each common access and its cost, and links to the traps. A test keeps every name it gives true.
 
 `docs/vivace-graph-v3-doc.org` is a full developer's manual (storage engine, object model, transactions, Prolog queries, views, REST, replication, backup/recovery, API reference). Originally written by Gwang-Jin Kim (@gwangjinkim) and adopted into this repo; keep it in sync when behavior changes.
 
@@ -40,6 +42,24 @@ subdirectories, **5,154 checks** as of 2026-08-31. Run a suite through ASDF:
 **SBCL needs `--dynamic-space-size 16384`** to run a suite. The default 1 GiB heap dies
 with "Heap exhausted, game over" partway in — `make-graph`'s type index eagerly builds
 131,072 index-lists, and a suite creates many graphs in one image.
+
+Three traps when running tests here:
+
+- **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
+  test system's `:perform`, which binds `graph-db::*system-directory*` and
+  `graph-db::*type-registry*`; without it every test fails at `make-graph`
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`.
+- **The node cache hides identity bugs.** While it is on, two lookups of
+  one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
+  or CLOS-valued slots passes by accident. A test that depends on two
+  lookups agreeing binds `graph-db::*cache-enabled*` to nil (house style:
+  `tests/multi-graph-tests.lisp`, `tests/skip-list-tests.lisp`).
+- **One FASL cache per checkout.** Two SBCL builds of the same tree at once
+  corrupt `~/.cache/common-lisp/sbcl-*/<checkout>/`, and so can a FASL left
+  from breaking and restoring a file; a correct tree then reports red. If
+  the check *count* changes, not just the pass/fail split, delete that
+  directory and rebuild. During a red/green loop run only the tests under
+  test: CI runs the full suite on every push (`docs/ci.md`).
 
 Two perf measurement systems coexist — `tests/perf/` (throughput trends, "did it
 get slower?") vs `profiling/` ("why is it slow?" — sprof/sb-profile harness).
@@ -85,6 +105,46 @@ Scratch locations differ between the two generations of tests:
   `/var/tmp/` (e.g. `/var/tmp/graph/`); clean those up between runs if state
   seems stale — nothing sweeps them.
 
+## Working in this repo
+
+- **Push to `experiment` in batches.** Each push runs the full suite on the
+  self-hosted CI runners (about 35 minutes, plus queue), so let several
+  finished units ride one push. Run the affected subsystem's suite locally
+  before each commit, read CI's verdict with `gh run list` (`docs/ci.md`),
+  and never run the full suite by hand.
+- **PRs merge into `experiment`, but the default branch is `master`,** so
+  `Closes #N` in a PR body never fires: close the issue by hand with the
+  landing SHA (PR #393).
+- **A worktree loads the main checkout's code** unless told otherwise:
+  Quicklisp's `local-projects` links `graph-db.asd` to the main checkout. In
+  an image started in a `.worktrees/` tree, first run
+  `(asdf:initialize-source-registry '(:source-registry (:tree "<worktree>/")
+  :inherit-configuration))`. Register the main checkout with `:directory`,
+  not `:tree`, or the nested worktrees' `.asd` files get picked up
+  (`tests/README.md`).
+- **ECL is not release-gating.** Verify on SBCL, catch ECL up in dedicated
+  sessions, and say when it was skipped. Support stays: don't remove
+  `#+ecl` arms. ECL's default GC heap cap (4 GB) is below what the suites
+  need (`STORAGE-EXHAUSTED`); raise it early with
+  `(ext:set-limit 'ext:heap-size 0)`.
+- **Engine traps:**
+  - a special variable that an earlier-compiled file binds must be
+    `defvar`ed in `globals.lisp` or earlier in `graph-db.asd`'s chain; a
+    later `defvar` leaves those bindings lexical and silently inert
+    (`*record-reads*`, GH #92);
+  - FiveAM test names are symbols, and the main suite's files share the
+    `graph-db/test` package, so a reused name silently replaces the first
+    test: grep `tests/` before naming one (90de8e8);
+  - a test that swaps an engine function with `(setf fdefinition)` needs it
+    declaimed `notinline`, or ECL compiles same-file calls directly and the
+    swap never fires (`mmap.lisp`, 2277ee8);
+  - the peer replication wire (`serialize.lisp`'s tag-length-value encoding
+    with its tags in `globals.lisp`, the packet framing, the node-head
+    layout and the plist handshake) is a frozen contract that non-Lisp
+    peers decode byte for byte. Change it only with a
+    `*peer-protocol-version*` bump agreed with its consumers (manual Ch16,
+    PR #217).
+
 ## Architecture (bottom-up)
 
 The system is layered. Lower layers know nothing of graph semantics; higher layers build on them.
@@ -106,7 +166,7 @@ Each graph is a directory. `make-graph`/`open-graph` create/expect: `heap.dat`, 
 
 ### Defining and using a graph (public API shape)
 
-- Schema is defined with `def-vertex` / `def-edge` (CLOS-like, with typed slots and single inheritance), associated with a named graph. See `examples/example.lisp`.
+- Schema is defined with `def-vertex` / `def-edge` (CLOS-like, with typed slots; single inheritance by convention, though several parents are accepted), associated with a named graph. See `examples/example.lisp`.
 - `def-view` defines secondary indexes; the `:map` lambda calls `yield`, and an optional `:reduce` lambda makes it a map-reduce view. Query views with `invoke-graph-view` / `map-view` / `map-reduced-view`.
 - All mutations go through `with-transaction`. `make-<type>` constructors, `save`, `update-node`, `delete-node`/`mark-deleted` operate inside a transaction.
 - `*graph*` is the dynamically-bound "current graph" used by most operations when no explicit graph is passed.
@@ -114,5 +174,5 @@ Each graph is a directory. `make-graph`/`open-graph` create/expect: `heap.dat`, 
 ## Conventions / gotchas
 
 - The compatibility note in `README.md` (2016-12-12) records a breaking change to the UUID/hash scheme: graphs created before commit `58f87d6` are incompatible and must be re-loaded via snapshot + `replay`.
-- Concurrency uses bordeaux-threads plus a custom `rw-lock.lisp` (SBCL/LispWorks/ECL; CCL uses its native `make-read-write-lock` via shims in `utilities.lisp`); per-class and per-view rw-locks are managed via `with-write-locked-class` / `with-read-locked-class` / `with-*-locked-view-group`.
-- Logging is log4cl (`log:info`, `log:error`, …); `examples/example.lisp` shows configuring it to `/var/tmp/graph.log`.
+- Concurrency uses bordeaux-threads plus a custom `rw-lock.lisp` (SBCL/LispWorks/ECL; CCL wraps its native `make-read-write-lock` in a reader gate in `utilities.lisp`, #118); per-class and per-view rw-locks are managed via `with-write-locked-class` / `with-read-locked-class` / `with-*-locked-view-group`.
+- Logging is log4cl (`log:info`, `log:error`, …); `examples/example.lisp` shows configuring it to `graph.log` under its scratch root (`/var/tmp/` by default).

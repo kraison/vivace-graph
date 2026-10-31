@@ -258,3 +258,86 @@ without enumerating a continent of grid cells."
     (declare (ignore ida idb idfar))
     (is (null (find-nearest-k 'geo-place (second *q-a*) (first *q-a*) 0 :graph g)))
     (is (null (find-nearest-k 'geo-place (second *q-a*) (first *q-a*) -3 :graph g)))))
+
+;;; ---- GH #410: the transaction overlay ----------------------------------
+
+(defparameter *own-box*
+  (make-polygon '(((12.340d0 45.670d0) (12.350d0 45.670d0)
+                   (12.350d0 45.676d0) (12.340d0 45.676d0)
+                   (12.340d0 45.670d0))))
+  "A polygon holding A, B and the created C; FAR and the moved B are out.")
+
+(defmacro with-own-spatial-writes ((g ida idb idfar idc idd) &body body)
+  "WITH-THREE-PLACES plus a committed D ~25 m from A, then one open
+transaction that creates C ~60 m from A, nudges D ~10 m (still beside
+A), moves B ~900 km to FAR's neighbourhood and deletes A.  BODY runs
+inside that transaction and again after it commits: both must agree
+\(GH #410).  D is the node the walk still finds under its old cell AND
+the overlay supplies: without the walk's skip it would answer twice."
+  `(with-three-places (,g ,ida ,idb ,idfar)
+     (declare (ignorable ,ida ,idb ,idfar))
+     (let (,idc ,idd)
+       (declare (ignorable ,idc ,idd))
+       (with-transaction ()
+         (setq ,idd (id (make-geo-place
+                         :loc (make-point 12.3426d0 45.6722d0)))))
+       (flet ((check () ,@body))
+         (with-transaction ()
+           (setq ,idc (id (make-geo-place
+                           :loc (make-point 12.3430d0 45.6725d0))))
+           (let ((d (copy (lookup-vertex ,idd))))
+             (setf (slot-value d 'loc) (make-point 12.3427d0 45.6722d0))
+             (save d))
+           (let ((b (copy (lookup-vertex ,idb))))
+             (setf (slot-value b 'loc) (make-point 2.4690d0 41.7770d0))
+             (save b))
+           (mark-deleted (lookup-vertex ,ida))
+           (check))
+         (check)))))
+
+(test find-nodes-near-sees-own-writes
+  "GH #410: FIND-NODES-NEAR finds the place the transaction created, the
+one it nudged once, drops the one it deleted, and finds the one it moved
+at its new location only."
+  (with-own-spatial-writes (g ida idb idfar idc idd)
+    (let ((near-a (mapcar #'car (find-nodes-near 'geo-place (second *q-a*)
+                                                 (first *q-a*) 600d0
+                                                 :graph g)))
+          (near-far (mapcar #'car (find-nodes-near 'geo-place
+                                                   (second *q-far*)
+                                                   (first *q-far*) 2000d0
+                                                   :graph g))))
+      (is (has-id-p idc near-a) "the created place")
+      (is (has-id-p idd near-a) "the nudged place")
+      (is (= 2 (length near-a)) "each once: C and D")
+      (is (not (has-id-p ida near-a)) "the deleted place")
+      (is (not (has-id-p idb near-a)) "the moved place, not where it was")
+      (is (has-id-p idb near-far) "the moved place, where it is now")
+      (is (has-id-p idfar near-far)))))
+
+(test find-nodes-within-sees-own-writes
+  "GH #410: FIND-NODES-WITHIN on the box holding A, B, C and D answers C
+and D, each once, with A deleted and B moved out."
+  (with-own-spatial-writes (g ida idb idfar idc idd)
+    (let ((in (find-nodes-within 'geo-place *own-box* :graph g)))
+      (is (= 2 (length in)))
+      (is (has-id-p idc in))
+      (is (has-id-p idd in)))))
+
+(test find-nodes-intersecting-sees-own-writes
+  "GH #410: FIND-NODES-INTERSECTING, the same shape."
+  (with-own-spatial-writes (g ida idb idfar idc idd)
+    (let ((in (find-nodes-intersecting 'geo-place *own-box* :graph g)))
+      (is (= 2 (length in)))
+      (is (has-id-p idc in))
+      (is (has-id-p idd in)))))
+
+(test find-nearest-k-sees-own-writes
+  "GH #410: FIND-NEAREST-K at A asks for three and gets D then C: A is
+deleted and B is beyond MAX-RADIUS now."
+  (with-own-spatial-writes (g ida idb idfar idc idd)
+    (let ((hits (find-nearest-k 'geo-place (second *q-a*) (first *q-a*) 3
+                                :graph g)))
+      (is (= 2 (length hits)))
+      (is (equalp idd (id (car (first hits)))))
+      (is (equalp idc (id (car (second hits))))))))

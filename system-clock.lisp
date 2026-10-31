@@ -144,6 +144,10 @@ the written record always reads back package-independently (GH #178)."
               (open (%clock-journal-file (system-clock-location clock))
                     :direction :output
                     :if-exists :append
+                    ;; CCL streams are private to the opening thread
+                    ;; unless told otherwise; JOURNAL-RECORDS flushes
+                    ;; this one from any thread (GH #315).
+                    #+ccl :sharing #+ccl :lock
                     :if-does-not-exist :create)))
       (let ((s (system-clock-journal clock)))
         ;; Full print-control set (GH #226); the #191 corruption/torn-

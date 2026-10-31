@@ -27,6 +27,8 @@ release wiring are in `docs/perf-baselines.md` (GH #253).
 - `check.lisp` — `check-perf` + `bless-perf-baseline` (GH #253).
 - `check-tests.lisp` — FiveAM tests for the checker (run by the main suite).
 - `bplus-bench.lisp` — B+ tree vs skip-list side-by-side (`graph-db::bplus-bench`).
+- `spacetime-bench.lisp` — edges-under-claims write/sweep/read measurement
+  (GH #372).
 - `variance.py` — run-to-run variance analysis over report files.
 - `results/` — committed report files (see below).
 

@@ -3,11 +3,11 @@ VivaceGraph
 
 VivaceGraph is an open source graph database written in pure Common Lisp.
 
-VG takes design inspiration from CouchDB, neo4j and AllegroGraph.  It implements an ACID-compliant object graph model with user-defined indexes and map-reduce views.  As of the MVCC release it also keeps immutable, versioned nodes CouchDB-style — each update retains the prior version, with configurable retention and snapshot-isolation reads (see Chapter 12 of the manual).  A geohash-backed spatial extension answers proximity and area queries over nodes that carry a geometry (Chapter 13).  An optional graph-algorithms add-on (`graph-db/algorithms`) brings shortest paths (Dijkstra/A*), ranking (PageRank, HITS), components, max-flow, random-graph generators, and GML/Pajek/Graphviz I/O, with the streaming algorithms also exposed as Prolog predicates (Chapter 14).  It also implements a master / slave replication scheme for redundancy and horizontal read scaling, and — for offline-first / mobile fleets — a bidirectional *peer* replication mode (hub-and-spoke) that syncs each device only the authorized subset of the graph it may see, with local authoring while disconnected (Chapter 16).  Besides the default on-disk engine, an optional *in-memory* backend (`make-memory-graph`) keeps the whole graph as live Lisp objects for lowest-latency reads when it fits in RAM, with a choice of eager or fault-on-access (lazy) open (Chapter 15).  Beyond map-reduce views, a slot may be indexed by value — ordered, unique, or as a dense embedding vector answering cosine k-nearest-neighbour search (Chapter 8).  Several graphs may be open in one image under a defined, enforced contract (Chapter 17).  Querying the graph is accomplished via a number of Lisp methods or via a Prolog-like query language.
+VG takes design inspiration from CouchDB, neo4j and AllegroGraph.  It implements an ACID-compliant object graph model with user-defined indexes and map-reduce views.  As of the MVCC release it also keeps immutable, versioned nodes CouchDB-style — each update retains the prior version, with configurable retention and snapshot-isolation reads (see Chapter 12 of the manual), and a node-local as-of read of the graph at any retained epoch (`with-as-of`, `docs/time-travel.md`).  A geohash-backed spatial extension answers proximity and area queries over nodes that carry a geometry (Chapter 13).  An optional graph-algorithms add-on (`graph-db/algorithms`) brings shortest paths (Dijkstra/A*), ranking (PageRank, HITS), components, max-flow, random-graph generators, and GML/Pajek/Graphviz I/O, with the streaming algorithms also exposed as Prolog predicates (Chapter 14).  It also implements a master / slave replication scheme for redundancy and horizontal read scaling, and — for offline-first / mobile fleets — a bidirectional *peer* replication mode (hub-and-spoke) that syncs each device only the authorized subset of the graph it may see, with local authoring while disconnected (Chapter 16).  Besides the default on-disk engine, an optional *in-memory* backend (`make-memory-graph`) keeps the whole graph as live Lisp objects for lowest-latency reads when it fits in RAM, with a choice of eager or fault-on-access (lazy) open (Chapter 15).  Beyond map-reduce views, a slot may be indexed by value — ordered, unique, or as a dense embedding vector answering cosine k-nearest-neighbour search (Chapter 8).  Several graphs may be open in one image under a defined, enforced contract (Chapter 17).  Querying the graph is accomplished via a number of Lisp methods or via a Prolog-like query language.
 
 VivaceGraph runs on SBCL (>= 1.045), ECL (>= 26.5.5), and Clozure CL (CCL, Linux x86_64). As of 3.0.0 the full test suite — seven suites, ~5,400 checks — passes with zero failures on SBCL 2.6.6 and ECL 26.5.5, on both macOS arm64 and Linux x86_64. One ECL-only test (the full-system mixed storm) can intermittently time out late in the concurrent-stress suite on many-core Linux hosts — cumulative GC/resource state slowing tests run later in the same image, not the test itself (issue #43). (Earlier ECL releases such as 21.2.1 are no longer supported — 26.5.5 is required.)
 
-**CCL has a known concurrency limitation as of 3.0.0** ([#118](https://github.com/kraison/vivace-graph/issues/118)): a vector-segment writer starves against sustained concurrent scanners, so the two segment growing-writes tests do not terminate there. CCL alone does not use this repo's `rw-lock.lisp`, whose FIFO writer queue makes writer starvation structurally impossible — it uses `ccl:make-read-write-lock`, which offers no writer fairness. The shims long predate this release; vector segments are simply the first workload that provokes it. Because the main suite does not terminate on CCL, **3.0.0 is not fully validated there** — treat CCL as best-effort for this release. SBCL and ECL are unaffected.
+**CCL's writer starvation is fixed** ([#118](https://github.com/kraison/vivace-graph/issues/118), fixed in 4.1.0): CCL does not use this repo's `rw-lock.lisp`, and its native `ccl:make-read-write-lock` admits new readers while a writer waits, so a vector-segment writer starved against sustained scanners from 3.0.0 to 4.0.1 and the main suite did not terminate there. The shim in `utilities.lisp` now gates new readers while a writer is queued, which is `rw-lock.lisp`'s FIFO in effect. SBCL and ECL were never affected.
 
 LispWorks support is currently **untested** for lack of access to a license; the free Personal Edition's heap limit is too small to compile VivaceGraph. The codebase still carries `#+lispworks` conditionalization, but its status is unknown until it can be exercised on a current LispWorks.
 
@@ -26,6 +26,23 @@ it: [`examples/example-spacetime.lisp`](examples/example-spacetime.lisp)
 A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), offline-first peer replication, and temporal extents, provenance-carrying claims and geometry registration (the optional `graph-db/spacetime` add-on), plus an API reference.
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
+
+### Announcement, 2026-10-31 — VivaceGraph 4.1.0 (features and fixes)
+
+A minor release: 98 changes since 4.0.1, with no on-disk format change
+and no peer-protocol bump, so 4.0.x stores open as they are. Two new
+subsystems: `graph-db/rules` reads claims as Prolog facts and runs rules
+as versioned producers, recursive ones included; `graph-db/query` is a
+web-free guarded query runner with paging. Spacetime claims gain edges
+and endpoint linking, runtime twins of the schema macros
+(`register-source`, `ensure-index`, `ensure-unique`) and a counting
+index (`def-count-index`); node-local time travel (`with-as-of`) lands;
+`vector-search` takes a `:filter`. A transaction now sees its own writes
+through every index-backed read, and a snapshot read never answers a
+node from a later commit. ECL and CCL run the whole suite green
+(fixnum-width id folds, CCL writer starvation #118, sparse shadow copies
+#434). Requires cl-temporal-extent >= 0.3.0. See
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ### Announcement, 2026-09-02 — VivaceGraph 4.0.1 (bug fix)
 
@@ -87,9 +104,9 @@ pass. The temporal algebra now lives in its own library,
 
 Validated for release on SBCL and ECL (macOS arm64 + Linux) and CCL
 (Linux) across all eight test suites (#299). Known and documented:
-CCL's main suite still hangs on writer starvation (#118), and the
-peer type-table wire field stays 16-bit by contract (#199) — type-ids
-above 65535 cannot cross the peer wire.
+the peer type-table wire field stays 16-bit by contract (#199) —
+type-ids above 65535 cannot cross the peer wire. CCL's main-suite
+hang (#118) is fixed since 4.0.1 (see above).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full record and the
 developer's manual for chapters on each subsystem.

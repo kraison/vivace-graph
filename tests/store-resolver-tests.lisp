@@ -537,3 +537,20 @@ hand-built instances)."
                    (finishes (graph-db::compact-edges g))))
             (ignore-errors (close-graph g :snapshot-p nil))
             (collect-garbage)))))))
+
+(test v5-scan-candidates-are-hint-ordered-and-complete
+  "GH #244: the edge-occupancy hint ORDERS the untagged-id scan -- hinted
+stores first -- but never restricts it: the candidate list always holds
+every open graph, so a stale or incomplete hint costs lookups, not
+answers."
+  (let ((all '()))
+    (maphash (lambda (k g) (declare (ignore k)) (push g all))
+             graph-db::*graphs*)
+    ;; No hint: every open graph, nothing lost.
+    (let ((c (graph-db::%v5-scan-candidates nil)))
+      (is (= (length all) (length c)))
+      (is (null (set-difference all c))))
+    ;; A bogus hint changes nothing but order.
+    (let ((c (graph-db::%v5-scan-candidates 'no-such-edge-class)))
+      (is (= (length all) (length c)))
+      (is (null (set-difference all c))))))

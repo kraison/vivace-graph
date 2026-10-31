@@ -68,8 +68,31 @@
                      report))))
     report))
 
+;;; RECORD-GRAPH-READ runs on every cached node lookup.  Reading the wall
+;;; clock and locking the histogram per call was half of an adjacency
+;;; read's profile (GH #373), so both are sampled: one fixnum increment
+;;; per call, and every +STATS-SAMPLE+ calls the current second's bucket
+;;; gains +STATS-SAMPLE+.  Per-graph totals are exact to within one
+;;; sample; the plain INCF may lose a count under contention, which the
+;;; report tolerates.
+
+(defconstant +stats-sample+ 64
+  "Reads or writes per histogram update in RECORD-GRAPH-READ / -WRITE; a
+power of two, so the sample test is one LOGAND (GH #373).")
+
 (defun record-graph-write (&optional (graph *graph*))
-  (incf (gethash (get-universal-time) (write-stats graph) 0)))
+  "Count one write of GRAPH into its per-second histogram, sampled every
++STATS-SAMPLE+ calls (GH #373)."
+  (when (zerop (logand (incf (write-sample-counter graph))
+                       (1- +stats-sample+)))
+    (incf (gethash (get-universal-time) (write-stats graph) 0)
+          +stats-sample+)))
 
 (defun record-graph-read (&optional (graph *graph*))
-  (incf (gethash (get-universal-time) (read-stats graph) 0)))
+  "Count one read of GRAPH into its per-second histogram, sampled every
++STATS-SAMPLE+ calls (GH #373).  Trap: a graph read fewer than
++STATS-SAMPLE+ times reports no reads at all."
+  (when (zerop (logand (incf (read-sample-counter graph))
+                       (1- +stats-sample+)))
+    (incf (gethash (get-universal-time) (read-stats graph) 0)
+          +stats-sample+)))

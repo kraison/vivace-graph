@@ -396,3 +396,32 @@
 ;;;      CREATE-*-TYPE time and again at MATERIALIZE-SCHEMA time;
 ;;;      RESOLUTION to the actual function happens at each check, so a
 ;;;      re-registration takes effect immediately (R5).
+
+;;; A runtime type that is also a SOURCE (GH #378): the spacetime
+;;; contract is registered from data too, with REGISTER-SOURCE -- the
+;;; runtime twin of DEF-SOURCE's registration.  All seven facets, as a
+;;; plist; the identity index and unique constraint are declared through
+;;; ENSURE-INDEX / ENSURE-UNIQUE, the runtime twins of DEF-INDEX /
+;;; DEF-UNIQUE.  Nothing is persisted: the consumer replays this call at
+;;; start alongside CREATE-VERTEX-TYPE, exactly as it replays :CHECK
+;;; registrations.
+
+(graph-db.spacetime:register-source
+ (find-class (intern "READING" :telemetry))
+ '(:identity     (:namespace :telemetry-readings :key-slot sensor-id)
+   :space        :none
+   :time         :none
+   :attribution  (:licence "CC0-1.0" :citation "Telemetry")
+   :sensitivity  (:class :internal)
+   :registration :none
+   :indexed-text :none))
+;; => TELEMETRY:READING; RESOLVE-ENDPOINT :TELEMETRY-READINGS "s-17"
+;; now finds the record written above.
+
+;;; Withdrawing the source (GH #381): the namespace stops resolving, the
+;;; contract goes; the class, its index and its records stay readable.
+;;; A consumer that keeps its own record passes :RECORD-P NIL to the type
+;;; constructors as it does to ENSURE-NAMESPACE, so the engine's manifest
+;;; never holds a TYPE row the consumer will replay itself.
+(graph-db.spacetime:unregister-source (find-class (intern "READING" :telemetry)))
+;; => TELEMETRY:READING

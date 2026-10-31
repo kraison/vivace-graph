@@ -46,27 +46,33 @@ nothing (design §4)."
   (or (gethash namespace *namespace-sources*)
       (error 'unknown-namespace :namespace namespace)))
 
-(defun %unregister-old-identity (class)
-  "Remove CLASS from whatever namespace it was PREVIOUSLY registered under
-in *SOURCE-CONTRACTS*, if any.  Called before a (re-)registration, so
-re-evaluating DEF-SOURCE with a changed :IDENTITY -- ordinary practice --
-leaves *NAMESPACE-SOURCES* in step with *SOURCE-CONTRACTS* instead of
-accumulating a stale entry forever (Finding 2, GH #132 review)."
-  (let ((old (gethash class *source-contracts*)))
-    (when old
-      (let ((old-identity (source-facets-identity old)))
-        (unless (eq old-identity :none)
-          (let ((old-ns (getf old-identity :namespace)))
-            (setf (gethash old-ns *namespace-sources*)
-                  (remove class (gethash old-ns *namespace-sources*)))))))))
+(defun %unregister-old-identity (class old-contract)
+  "Remove CLASS from whatever namespace OLD-CONTRACT (its SOURCE-FACETS
+before this registration, or NIL for a first-ever one) declared, if
+any.  Takes the old contract as an argument rather than re-reading
+*SOURCE-CONTRACTS*: DEF-SOURCE's expansion writes the new contract
+before calling this (GH #369 minor 9), so the hash table no longer
+holds the old one by the time this runs."
+  (when old-contract
+    (let ((old-identity (source-facets-identity old-contract)))
+      (unless (eq old-identity :none)
+        (let ((old-ns (getf old-identity :namespace)))
+          (setf (gethash old-ns *namespace-sources*)
+                (remove class (gethash old-ns *namespace-sources*))))))))
 
-(defun %register-identity (class identity)
+(defun %register-identity (class identity
+                            &optional (old-contract
+                                       (gethash class *source-contracts*)))
   "Register CLASS under its namespace.  :NONE registers nothing: such a
 class is never an endpoint target (plan clarification).  Always drops
-CLASS's prior registration first (Finding 2, GH #132 review), so this is
-correct whether the new IDENTITY names the same namespace, a different
-one, or :NONE."
-  (%unregister-old-identity class)
+CLASS's prior registration first, from OLD-CONTRACT -- a caller that
+omits it gets whatever *SOURCE-CONTRACTS* holds for CLASS right now
+(the direct callers in source-tests.lisp); DEF-SOURCE's expansion
+passes the contract it is about to replace explicitly, since by the
+time it calls this the new one is already written (Finding 2, GH #132
+review; GH #369 minor 9).  Correct whether the new IDENTITY names the
+same namespace, a different one, or :NONE."
+  (%unregister-old-identity class old-contract)
   (unless (eq identity :none)
     (let ((ns (getf identity :namespace)))
       (pushnew class (gethash ns *namespace-sources*)))))
@@ -120,6 +126,20 @@ not the keyword ~S" key v)))
                  ((not (and (symbolp v) v))
                   (bad (format nil "~S must be a symbol, not ~S" key v))))
                v))
+           (req-scope (key)
+             "A required sub-key naming a spatial SCOPE: a class name, or
+a non-empty proper list of class names -- what REGISTER-GEOMETRY takes.
+:ALL is refused: a registry must be named (GH #394)."
+             (let ((v (req key)))
+               (flet ((class-name-p (x)
+                        (and x (symbolp x) (not (keywordp x)))))
+                 (unless (or (class-name-p v)
+                             (and (consp v)
+                                  (null (cdr (last v)))
+                                  (every #'class-name-p v)))
+                   (bad (format nil "~S must be a class name or a ~
+non-empty list of class names, not ~S" key v))))
+               v))
            (req-keyword (key)
              "A required sub-key whose value must be a keyword."
              (let ((v (req key)))
@@ -165,7 +185,7 @@ not the keyword ~S" key v)))
         ;; :METHOD for every record (cl-llm#13 unit 2, vivace-graph#138
         ;; task 6b).
         (:registration
-         (req-symbol :registry)
+         (req-scope :registry)
          (req-keyword :registry-namespace)
          (req-symbol :claim-class)
          (req-string :producer)
@@ -228,12 +248,89 @@ review) -- a source class inherits exactly as any other vertex does."
            ;; and what an unregister keyed by slot-names could not express.
            (graph-db:def-unique ,name (,(getf identity :key-slot))
              ,graph-name :name source-identity-key)))
-     (%register-identity ',name ',identity)
-     (setf (gethash ',name *source-contracts*)
-           (make-source-facets :class ',name :graph ',graph-name
-                               :identity ',identity :space ',space
-                               :time ',time :attribution ',attribution
-                               :sensitivity ',sensitivity
-                               :registration ',registration
-                               :indexed-text ',indexed-text))
+     (let ((old-contract (gethash ',name *source-contracts*)))
+       (setf (gethash ',name *source-contracts*)
+             (make-source-facets :class ',name :graph ',graph-name
+                                 :identity ',identity :space ',space
+                                 :time ',time :attribution ',attribution
+                                 :sensitivity ',sensitivity
+                                 :registration ',registration
+                                 :indexed-text ',indexed-text))
+       (%register-identity ',name ',identity old-contract))
      ',name))
+
+;;; REGISTER-SOURCE: the runtime twin of DEF-SOURCE's registration (GH
+;;; #378), the way CREATE-VERTEX-TYPE twins DEF-VERTEX (#172).  Nothing is
+;;; persisted -- the consumer keeps its own record and replays it.
+
+(defun %class-name-of (class)
+  "CLASS as a class name: a symbol as given, a CLASS object's name."
+  (etypecase class
+    (symbol class)
+    (class (class-name class))))
+
+(defun %class-default-store (name)
+  "NAME's registered default store, or NIL when it has none (#172 R4)."
+  (let ((meta (graph-db::%find-registered-node-type name :vertex)))
+    (and meta (graph-db::node-type-graph-name meta))))
+
+(defun register-source (class facets &key graph-name)
+  "Register CLASS -- an existing vertex class name, or the class object
+CREATE-VERTEX-TYPE returned -- as a source with FACETS, a plist of all
+seven facets as DEF-SOURCE takes them.  Does what the macro's expansion
+does after its DEF-VERTEX: the identity index and the named
+SOURCE-IDENTITY-KEY constraint when :IDENTITY is not :NONE, the contract,
+and the namespace registration; idempotent, replacing an earlier
+registration of CLASS as the macro does.  GRAPH-NAME is the store the
+records live in, defaulting to the class's default store;
+SOURCE-STORE-UNKNOWN when neither exists.  A missing facet is
+MISSING-SOURCE-FACET, a malformed one INVALID-SOURCE-FACET, and nothing is
+registered on refusal.  Returns the class name (GH #378)."
+  (let* ((name (%class-name-of class))
+         (missing (loop for key in +source-facets+
+                        unless (%facet-present-p facets key) collect key)))
+    (when missing
+      (error 'missing-source-facet :name name :facets missing))
+    (dolist (key +source-facets+)
+      (%check-facet key (getf facets key)))
+    (let ((store (or graph-name (%class-default-store name)))
+          (identity (getf facets :identity)))
+      (unless store
+        (error 'source-store-unknown :class name))
+      (unless (eq identity :none)
+        (let ((slot (getf identity :key-slot)))
+          (graph-db:ensure-index name (list slot) store)
+          ;; Named, so a changed :KEY-SLOT replaces the constraint --
+          ;; the macro's own reason (GH #139).
+          (graph-db:ensure-unique name (list slot) store
+                                  :name 'source-identity-key)))
+      (let ((old-contract (gethash name *source-contracts*)))
+        (setf (gethash name *source-contracts*)
+              (make-source-facets :class name :graph store
+                                  :identity identity
+                                  :space (getf facets :space)
+                                  :time (getf facets :time)
+                                  :attribution (getf facets :attribution)
+                                  :sensitivity (getf facets :sensitivity)
+                                  :registration (getf facets :registration)
+                                  :indexed-text (getf facets :indexed-text)))
+        (%register-identity name identity old-contract))
+      name)))
+
+(defun %facet-present-p (facets key)
+  "True when KEY is a key of the plist FACETS -- present with any value,
+NIL included; only absence is missing (DEF-SOURCE's rule)."
+  (loop for (k nil) on facets by #'cddr thereis (eq k key)))
+
+(defun unregister-source (class)
+  "The inverse of REGISTER-SOURCE (GH #381): take CLASS -- a name or the
+class object -- out of its namespace, so RESOLVE-ENDPOINT stops answering
+for it, and drop its contract.  The class, its identity index and
+constraint, and its records stay: a withdrawn source's history is still
+readable.  Idempotent; returns the class name."
+  (let* ((name (%class-name-of class))
+         (old (gethash name *source-contracts*)))
+    (when old
+      (%unregister-old-identity name old)
+      (remhash name *source-contracts*))
+    name))

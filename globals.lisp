@@ -453,6 +453,24 @@ strictly-safe pre-durability abort.")
 ;;; inherits it: unique, value, cardinality, domain/range, vector dimension
 ;;; (core) and the spacetime disjointness conditions.
 
+;; GH #92.  Lives HERE, not transactions.lisp: vertex.lisp/edge.lisp
+;; compile first and bind it in MAP-VERTICES/MAP-EDGES -- a later defvar
+;; would leave those bindings lexical and the opt-out silently inert.
+(defvar *record-reads* t
+  "When true (the default), a transactional read joins the read-set and
+so participates in OCC backward validation.  MAP-VERTICES/MAP-EDGES bind
+this NIL under :RECORD-READS NIL -- the explicit opt-out of
+serializability against a whole scanned corpus (GH #92).")
+
+;; GH #408.  Here for the same reason as *RECORD-READS*: vertex.lisp,
+;; edge.lisp and index.lisp consult it and cardinality.lisp binds it.
+(defvar *read-own-writes* t
+  "When true (the default), a read inside a read-write transaction sees
+the transaction's own creates, updates and deletes.  Bound NIL underneath
+a commit view -- %COMMIT's validators, VALIDATE-WRITES and the evaluators
+that add their own write-set delta -- so those read committed state
+(spec 2026-10-29-read-your-own-writes-design.md, §4.6).")
+
 (define-condition constraint-violation (error) ()
   (:documentation "Superclass of every DETERMINISTIC commit refusal: the same
 write against the same schema is refused again, however often it is retried.
@@ -473,7 +491,7 @@ not match established segment dimension ~D"
 ;;; failed (GH #286): an unindexed slot, an unscoped spatial class, a wrong
 ;;; index arity.  Distinct from SIMPLE-ERROR / TYPE-ERROR so a server can
 ;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
-;;; (query-dsl.lisp) is its DSL-level subclass.
+;;; (query/dsl.lisp) is its DSL-level subclass.
 
 (define-condition query-precondition-error (error)
   ((reason :initarg :reason :reader query-precondition-error-reason))

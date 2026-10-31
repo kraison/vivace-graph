@@ -172,13 +172,35 @@ persisted)."
   "True if the segment's on-disk state at open time was cleanly closed."
   (segment-clean-at-open segment))
 
+(define-condition segment-closed (error)
+  ((segment :initarg :segment :reader segment-closed-segment))
+  (:documentation "A read of a vector segment that has been closed and
+unmapped -- a rebuild or reset replaced it after the caller fetched it
+(GH #54).  VECTOR-SEARCH re-fetches from the graph's table on it; a
+direct caller of SEGMENT-SCAN, SEGMENT-GET or SEGMENT-SCORE-SUBSET
+should do the same.")
+  (:report (lambda (c s)
+             (format s "Vector segment ~A is closed; fetch the live one ~
+from the graph's VECTOR-SEGMENTS table"
+                     (segment-closed-segment c)))))
+
 (defun close-vector-segment (segment)
-  "Release the segment's mmap."
-  (when (segment-mmap segment)
-    (serialize-uint64 (segment-mmap segment) +segment-clean+ +segment-clean-offset+)
-    (munmap-file (segment-mmap segment))
-    (setf (segment-mmap segment) nil))
+  "Release the segment's mmap, under its WRITE lock: a scan in flight holds
+the read side, so the unmap waits for it, and a reader that fetched this
+object later finds MMAP NIL and signals SEGMENT-CLOSED (GH #54)."
+  (with-write-lock ((segment-lock segment))
+    (when (segment-mmap segment)
+      (serialize-uint64 (segment-mmap segment) +segment-clean+
+                        +segment-clean-offset+)
+      (munmap-file (segment-mmap segment))
+      (setf (segment-mmap segment) nil)))
   nil)
+
+(defun %seg-check-open (segment)
+  "Signal SEGMENT-CLOSED unless SEGMENT is still mapped.  Call under the
+segment's read lock, before touching the mmap (GH #54)."
+  (unless (segment-mmap segment)
+    (error 'segment-closed :segment segment)))
 
 (defun %seg-rebuild-id->slot (segment)
   "Repopulate SEGMENT's RAM id->slot hash by sweeping the on-disk id array.
@@ -590,6 +612,7 @@ run under this lock."
 Takes the segment's READ lock: shared against concurrent reads, exclusive
 against a concurrent segment-put/segment-remove."
   (with-read-lock ((segment-lock segment))
+    (%seg-check-open segment)
     (let ((slot (%seg-slot-of segment id)))
       (when slot (%seg-read-vector segment slot)))))
 
@@ -623,35 +646,20 @@ vector is swept into the OWNER's segment, matching exactly what the
 live apply path (APPLY-TX-WRITE-TO-VECTOR-SEGMENTS, via %SEGMENT-KEY) does on
 create/update/delete.
 
-NOT SAFE against a concurrent reader of the OLD segment -- latent, not live.
-Making VECTOR-SEGMENTS a :SYNCHRONIZED hash table only guarantees that every
-individual GETHASH/(SETF GETHASH) on the table is atomic; it says nothing
-about a query thread that already holds the OLD segment object (fetched from
-the table before this function ran) and is scanning it via SEGMENT-SCAN when
-CLOSE-VECTOR-SEGMENT below unmaps it underneath that scan, nor about the NIL
-window between REMHASH and the final (SETF GETHASH) -- during which a
-concurrent VECTOR-SEARCH legitimately (if misleadingly, mid-rebuild) reports
-\"nothing indexed\" rather than either the old or the new results. Both are
-real gaps in a table-synchronization-only story.
-
-This is safe TODAY only because of the caller discipline documented above:
-REBUILD-VECTOR-SEGMENT runs from OPEN-GRAPH (before any query traffic exists)
-or from tests, and never while VECTOR-SEARCH could be running concurrently.
-If a future caller ever invokes this against a live graph, that invariant
-must be re-examined -- e.g. by having VECTOR-SEARCH hold a strong reference to
-the segment it looked up for the duration of its own scan (so a rebuild's
-CLOSE-VECTOR-SEGMENT can't unmap out from under it) plus a defined answer for
-the NIL window, rather than assuming quiescence.  Deliberately NOT fixed here:
-out of scope for this task, and the right design (reference-counted segment
-handles? RCU-style swap? a rebuild that queues behind in-flight scans?) is a
-later design question, not a one-line patch."
+SAFE against concurrent READERS (GH #54): the replacement is built at a
+temporary path, renamed into place and registered BEFORE the old segment is
+closed, so the table is never empty; CLOSE-VECTOR-SEGMENT takes the old
+segment's write lock, so a scan in flight finishes first, and a reader that
+fetched the old object afterwards gets SEGMENT-CLOSED and re-fetches.  Still
+NOT safe against concurrent WRITERS: a commit applied to the old segment
+during the sweep is lost from the replacement, so run it with no write
+traffic -- at open, before writes, like rebuild-spatial-indexes."
   (let* ((key (cons owner-name slot-name))
          (table (vector-segments graph))
-         (path (%segment-file graph owner-name slot-name)))
-    (let ((old (gethash key table)))
-      (when old (close-vector-segment old)))
-    (remhash key table)
-    (ignore-errors (delete-file path))
+         (path (%segment-file graph owner-name slot-name))
+         (tmp (concatenate 'string path ".rebuilding"))
+         (old (gethash key table)))
+    (ignore-errors (delete-file tmp))
     ;; Counting pre-pass, so the fresh file is CREATED at its corpus size.
     ;;
     ;; WHY: a segment's mmap reservation is computed once, from the file's size
@@ -710,23 +718,91 @@ later design question, not a one-line patch."
                (unless dimension (setf dimension (length v)))
                (incf live-count)))))
        graph owner-name)
-      ;; No conforming vector anywhere: create no segment at all, as before.
-      (when dimension
-        (let ((seg (create-vector-segment
-                    path dimension
-                    ;; Never below CREATE-VECTOR-SEGMENT's own default: a small
-                    ;; corpus gains nothing from a hair-tight file, and this
-                    ;; keeps the small-graph shape exactly as it was.
-                    :initial-capacity (max 1024 live-count))))
-          (setf (gethash key table) seg)
-          (%sweep-vector-index-owner
-           (lambda (node)
-             (unless (deleted-p node)
-               (let ((v (%node-segment-value node slot-name)))
-                 (when v
-                   (segment-put seg (id node) v)))))
-           graph owner-name)
-          seg)))))
+      ;; No conforming vector anywhere: no segment at all, as before; the
+      ;; old one, if any, goes away.
+      (if (null dimension)
+          (progn
+            (remhash key table)
+            (when old (close-vector-segment old))
+            (ignore-errors (delete-file path))
+            nil)
+          ;; Build the replacement at TMP, then swap it in (GH #54): rename
+          ;; into place, reopen at the final path (the mapping tracks its
+          ;; path for growth), register, and only then close OLD -- which
+          ;; waits for any scan still holding it.
+          (let ((fresh (create-vector-segment
+                        tmp dimension
+                        ;; Never below CREATE-VECTOR-SEGMENT's own default:
+                        ;; a small corpus gains nothing from a hair-tight
+                        ;; file, and this keeps the small-graph shape.
+                        :initial-capacity (max 1024 live-count))))
+            (%sweep-vector-index-owner
+             (lambda (node)
+               (unless (deleted-p node)
+                 (let ((v (%node-segment-value node slot-name)))
+                   (when v
+                     (segment-put fresh (id node) v)))))
+             graph owner-name)
+            (close-vector-segment fresh)
+            ;; rename(2), not CL:RENAME-FILE: the target exists, and ECL
+            ;; and CCL refuse to replace it (GH #427, as #313).
+            (%posix-rename tmp path)
+            (let ((seg (open-vector-segment path)))
+              (setf (gethash key table) seg)
+              (when old (close-vector-segment old))
+              seg))))))
+
+(define-condition vector-segment-in-use (error)
+  ((owner :initarg :owner :reader vector-segment-in-use-owner)
+   (slot :initarg :slot :reader vector-segment-in-use-slot)
+   (count :initarg :count :reader vector-segment-in-use-count))
+  (:documentation "RESET-VECTOR-SEGMENT refused: live nodes still hold a
+conforming vector in the slot (GH #365).")
+  (:report (lambda (c s)
+             (format s "Vector segment (~A . ~A) is in use: ~D live node~:P ~
+still hold a vector in the slot; clear them first"
+                     (vector-segment-in-use-owner c)
+                     (vector-segment-in-use-slot c)
+                     (vector-segment-in-use-count c)))))
+
+(defun reset-vector-segment (graph class-name slot-name)
+  "Drop the (owner of CLASS-NAME, SLOT-NAME) segment so the next conforming
+write recreates it, at that write's dimension: the supported way to change
+a :VECTOR-INDEX slot's dimension, since an emptied segment keeps its
+dimension on disk and across a reopen (GH #365).  Refuses with
+VECTOR-SEGMENT-IN-USE while any live node of the owner holds a conforming
+vector -- clear them (unbound or NIL) and commit first.  Runs under the
+transaction manager's lock, so no commit interleaves; the close waits for
+a scan in flight and a reader holding the old object gets SEGMENT-CLOSED
+(GH #54).  Returns T when a segment was dropped, NIL when there was none."
+  (let* ((class (find-class class-name))
+         (owner (%vector-index-slot-owner-name class slot-name))
+         (key (cons owner slot-name))
+         (path (%segment-file graph owner slot-name)))
+    (unless (%class-declares-vector-index-p class slot-name)
+      (error 'query-precondition-error
+             :reason (format nil "~A.~A is not a :vector-index slot"
+                             class-name slot-name)))
+    ;; The function, not WITH-TRANSACTION-MANAGER-LOCK: that macro lives
+    ;; in transactions.lisp, compiled after this file.
+    (call-with-transaction-manager-lock
+     (lambda ()
+       (let ((held 0))
+         (%sweep-vector-index-owner
+          (lambda (node)
+            (unless (deleted-p node)
+              (when (%node-segment-value node slot-name)
+                (incf held))))
+          graph owner)
+         (when (plusp held)
+           (error 'vector-segment-in-use :owner owner :slot slot-name
+                                         :count held)))
+       (let ((old (gethash key (vector-segments graph))))
+         (remhash key (vector-segments graph))
+         (when old (close-vector-segment old))
+         (ignore-errors (delete-file path))
+         (and old t)))
+     (transaction-manager graph))))
 
 (defun rebuild-vector-segment-batched (graph owner-name slot-name
                                        &key (batch-size 5000) progress-fn)
@@ -986,7 +1062,7 @@ scoring many B's against the same A (segment-scan) should call
   (declare (type (simple-array single-float (*)) a b))
   (%cosine-with-norm a (%vector-norm a) b))
 
-(defun segment-scan (segment query-vector k)
+(defun segment-scan (segment query-vector k &key filter)
   "Top-K by full cosine over every occupied slot, best first, as (score . id)
 conses.  Takes the segment's READ lock, so it is safe against a concurrent
 growing commit (which holds the write lock).
@@ -1003,7 +1079,14 @@ rejected loudly instead of silently scored against a prefix.
 
 The query's own norm is computed ONCE here and threaded through
 %COSINE-WITH-NORM for every candidate, rather than recomputed per occupied
-slot."
+slot.
+
+:FILTER (GH #293), a function of one argument -- the candidate's 16-byte
+node id -- gates a slot BEFORE its vector is read or scored, so a bounded
+top-K fills K with IN-BOUNDS hits in one pass instead of post-filtering
+an unbounded top-K down to fewer than K.  The filter sees only the id
+(never a node -- the no-materialisation property survives); rejecting is
+cheap since the vector block is not touched for a rejected slot."
   (declare (type (simple-array single-float (*)) query-vector))
   (unless (= (length query-vector) (segment-dimension segment))
     (error "query vector length ~D does not match segment dimension ~D"
@@ -1012,6 +1095,7 @@ slot."
     (when (or (zerop k) (zerop qnorm))
       (return-from segment-scan nil))
     (with-read-lock ((segment-lock segment))
+      (%seg-check-open segment)
       (let* ((mmap (segment-mmap segment))
              (cap (segment-capacity segment))
              (collector (%make-topk k))
@@ -1024,8 +1108,11 @@ slot."
         (dotimes (slot cap)
           (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
             (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+)))
-              (%seg-read-vector-into segment slot v)
-              (%topk-offer collector (%cosine-with-norm query-vector qnorm v) id))))
+              (when (or (null filter) (funcall filter id))
+                (%seg-read-vector-into segment slot v)
+                (%topk-offer collector
+                             (%cosine-with-norm query-vector qnorm v)
+                             id)))))
         (%topk-results collector)))))
 
 (defun segment-score-subset (segment query-vector node-ids)
@@ -1067,6 +1154,7 @@ side, so this is safe against a concurrent growing commit."
     (when (or (null node-ids) (zerop qnorm))
       (return-from segment-score-subset nil))
     (with-read-lock ((segment-lock segment))
+      (%seg-check-open segment)
       (let ((out '())
             ;; One reusable scratch vector, as in SEGMENT-SCAN.
             (v (make-array (segment-dimension segment)

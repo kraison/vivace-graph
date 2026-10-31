@@ -206,6 +206,9 @@
            #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
+           #:segment-closed                     ; GH #54
+           #:reset-vector-segment               ; GH #365
+           #:vector-segment-in-use
            ;; Presize a segment's capacity up front (GH #170 Task 5) -- turns
            ;; a mid-apply VECTOR-SEGMENT-CAPACITY-EXHAUSTED into an upfront one.
            #:presize-vector-segment
@@ -279,8 +282,22 @@
            #:peer-type-class-not-loaded-error     ; GH #200
 
            #:with-transaction
+           #:*read-own-writes*                    ; GH #408
            #:with-read-snapshot
            #:call-with-read-snapshot
+           ;; GH #115: node-local time travel
+           #:with-as-of
+           #:latest-epoch
+           #:as-of-skipped-count
+           #:as-of-refused
+           #:as-of-refused-graph
+           #:as-of-refused-epoch
+           #:as-of-refused-reason
+           #:version-reaped-error
+           #:version-reaped-id
+           #:version-reaped-epoch
+           #:version-reaped-oldest-epoch
+           #:version-reaped-oldest-revision
            #:lookup-object
            #:update-node
            #:delete-node
@@ -320,6 +337,7 @@
            ;; runtime schema definition API (GH #172)
            #:ensure-namespace
            #:create-vertex-type
+           #:ensure-index #:ensure-unique        ; GH #378
            #:create-edge-type
            #:materialize-schema
            #:register-schema-function
@@ -364,6 +382,10 @@
            #:lookup-edge
            ;; MVCC: public read path over the versions KEEP-REVISIONS retains
            #:vertex-history
+           #:edge-history
+           #:node-history
+           ;; MVCC: a version's committing epoch (GH #347)
+           #:commit-epoch
            #:to
            #:from
            #:weight
@@ -394,8 +416,11 @@
            #:regenerate-unique-indexes
            ;; multi-slot uniqueness constraint (issue #107)
            #:def-unique
+           #:unique-lookup                              ; GH #415
            ;; general ordered index (:index slot option / def-index)
            #:def-index
+           ;; counting index (GH #361)
+           #:def-count-index #:undef-count-index
            ;; schema retraction: withdraw a declaration (GH #139, #140)
            #:undef-index #:undef-unique
            #:schema-withdrawal-matched-nothing              ; GH #152
@@ -431,6 +456,11 @@
            #:check-domain-range-constraints
            ;; The commit view + subsystem validator seam (#109 note; #157 4b)
            #:make-commit-view #:view-node #:view-old-node #:view-writes
+           ;; GH #301: the evaluator entry point
+           #:validate-writes #:validation-report
+           #:validate-transaction #:writes                 ; GH #320
+           #:validation-report-violations #:validation-report-family-counts
+           #:validation-report-checked-counts #:validation-report-spec-counts
            #:commit-view-graph #:*commit-validators*
            ;; Disjointness over vertex types (GH #157, 4a)
            #:def-disjoint #:undef-disjoint #:disjointness-violation
@@ -441,9 +471,13 @@
            #:vc-violation-actual #:vc-violation-expected
            #:vc-violation-reason
            #:unregister-index-spec #:unregister-unique-tuple-spec
+           #:unregister-count-index-spec                    ; GH #361
            #:index-lookup #:index-range #:map-index
+           #:map-index-prefixes #:index-count            ; GH #350
+           #:count-index-lookup #:map-count-index        ; GH #361
            ;; index-backed generator predicates for Prolog (GH #102)
            #:find-by-slot/4 #:find-slot-range/5
+           #:find-by-unique/4                           ; GH #415
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes
 
            #:def-view
@@ -472,6 +506,18 @@
            #:compile-body
            #:args
            #:*prolog-global-functors*
+           ;; GH #333: the fixpoint's delta, bound by RUN-RULES around
+           ;; a recursive stratum for RULE-DELTA/2 to generate over.
+           #:*rule-delta*
+           ;; GH #333: producers a fixpoint round's CLAIM/7 must not
+           ;; answer from, bound by %RUN-STRATUM around every round.
+           #:*claim-exclude-producers*
+           ;; GH #333, C1: a fixpoint run's own derivation, indexed
+           ;; like CLAIM/7's routes so a rule with more than one
+           ;; recursive goal still sees its other goal's answers.
+           #:derived-index #:make-derived-index #:derived-index-by-subject
+           #:derived-index-by-object #:derived-index-all
+           #:*claim-derived-this-run*
            #:deref-exp
            #:unify
            #:select
@@ -499,8 +545,12 @@
            #:prolog-error-ball
            #:prolog-throw
            #:prolog-resource-error
+           ;; cost-boundedness classification (GH #285)
+           #:declare-functor-cost-unbounded #:functor-cost-unbounded-p
+           #:cost-unbounded-predicate-names #:prolog-cost-unbounded-error
            #:prolog-permission-error
            #:*inference-budget*
+           #:*allow-cost-unbounded*
            #:*default-inference-budget*
            #:*default-query-timeout*
            #:*allowed-effects*

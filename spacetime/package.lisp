@@ -51,12 +51,22 @@
    #:claim-extent-sexp #:claim-geometry
    #:claim-precision-m #:claim-fraction                 ; GH #138
    #:claim-extent #:claims-touching
+   #:claim-namespaces #:claim-relations #:claim-keys     ; GH #350
+   #:claim-identity-key                                ; GH #303
+   #:split-claim-identity-key                          ; GH #321
+   #:malformed-claim-identity-key
+   #:claim-version-stamp                               ; GH #300
+   #:claim-commit-epoch                                ; GH #347
+   #:epoch-axis-unavailable                            ; GH #347
+   #:epoch-axis-unavailable-graph-name
+   #:reaped-claim #:reaped-claim-p #:reaped-claim-id   ; GH #300
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
    #:claim-current-p #:retract-claim                   ; GH #162
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:canonical-relation-p #:canonical-producer-p      ; GH #160
+   #:canonical-namespace-p                             ; GH #327
    #:transaction-extent-step                           ; GH #158
    ;; membership disjointness (GH #157 4b)
    #:def-disjoint-membership #:undef-disjoint-membership
@@ -64,6 +74,7 @@
    #:mdv-name #:mdv-subject-namespace #:mdv-subject-key #:mdv-members
    #:check-disjoint-memberships
    #:unknown-claim-family
+   #:claim-family-conflict                             ; GH #323
    ;; temporal claim families (GH #296)
    #:claim-family-temporal-p #:extent-sexp-start-key
    ;; extents-disjoint-p is cl-temporal-extent's since its 0.2.0 (#1 there)
@@ -72,7 +83,9 @@
    #:edv-object-namespace #:edv-object-key #:edv-relation
    #:edv-conflicting-ids #:check-extent-disjointness
    ;; source onboarding contract (GH #132)
-   #:def-source #:source-contract #:+source-facets+
+   #:def-source #:register-source #:unregister-source
+   #:source-contract #:+source-facets+
+   #:source-store-unknown #:source-store-unknown-class      ; GH #378
    #:source-facets #:source-facets-p #:source-facets-class
    #:source-facets-graph #:source-facets-identity #:source-facets-space
    #:source-facets-time #:source-facets-attribution
@@ -85,4 +98,20 @@
    #:unopened-source-graph #:unopened-source-graph-class
    #:unopened-source-graph-graph-name
    ;; registration (GH #138)
-   #:register-geometry #:register-node))
+   #:register-geometry #:register-node
+   ;; edges under claims (GH #369)
+   #:subject-of #:object-of
+   #:make-subject-of #:make-object-of
+   #:subject-of-p #:object-of-p
+   #:lookup-subject-of #:lookup-object-of
+   #:subject-of/2 #:subject-of/3 #:object-of/2 #:object-of/3
+   #:claim-endpoint #:claim-endpoints #:node-claims
+   #:endpoint-link-skipped #:endpoint-link-skipped-claim
+   #:endpoint-link-skipped-namespace #:endpoint-link-skipped-key
+   #:endpoint-link-skipped-classes
+   #:endpoint-mismatch #:endpoint-mismatch-node
+   #:endpoint-mismatch-namespace #:endpoint-mismatch-key
+   #:endpoint-mismatch-reason
+   #:related/3 #:claimed/4
+   ;; the linking sweep (GH #372)
+   #:*link-claims-at-write* #:link-claim-endpoints))

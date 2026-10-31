@@ -222,3 +222,136 @@ answering NIL, which is also the correct answer for 'wrote nothing'."
   (with-claim-graph (g)
     (signals unknown-claim-family
       (claims-by-producer g 'no-such-claim "rule-a"))))
+
+(test a-transaction-reads-its-own-retraction-and-assertion
+  "GH #324: retract-then-assert in one WITH-TRANSACTION -- the idiom
+RETRACT-CLAIM's docstring recommends -- reads back inside the
+transaction as it will commit: the retracted claim no longer current,
+the new one present, both in CLAIMS-TOUCHING and CLAIMS-BY-PRODUCER."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :object "old"))
+    (with-transaction ()
+      (let ((c (first (claims-touching g 'ct-claim :ns "s1"
+                                       :role :subject :current t))))
+        (retract-claim c)
+        (is (null (claims-touching g 'ct-claim :ns "s1"
+                                   :role :subject :current t)))
+        (make-b :object "new")
+        (let ((live (claims-touching g 'ct-claim :ns "s1"
+                                     :role :subject :current t)))
+          (is (= 1 (length live)))
+          (is (equal "new" (claim-object-key (first live)))))
+        (is (= 2 (length (claims-touching g 'ct-claim :ns "s1"
+                                          :role :subject))))
+        ;; The object side has no index on the new claim yet: the
+        ;; overlay is what admits it.
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "new"
+                                          :role :object))))
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "old"
+                                          :role :object))))
+        (is (null (claims-touching g 'ct-claim :ns "old"
+                                   :role :object :current t)))
+        (is (= 2 (length (claims-by-producer g 'ct-claim "rule-a"))))))
+    (let ((live (claims-touching g 'ct-claim :ns "s1"
+                                 :role :subject :current t)))
+      (is (= 1 (length live)))
+      (is (equal "new" (claim-object-key (first live)))))))
+
+(test as-of-answers-committed-history-only
+  "GH #324: the overlay is for the present.  An :AS-OF read inside a
+transaction still answers from committed versions, so an uncommitted
+retraction does not rewrite history the transaction may yet abandon."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :object "old"))
+    ;; THEN from the engine's monotonic clock, so it is strictly after
+    ;; the commit's stamp: on a whole-second clock (ECL, GH #308)
+    ;; LOCAL-TIME:NOW can sit at or before it, and an :AS-OF there finds
+    ;; no version (GH #429).
+    (let ((then (graph-db.spacetime::%st-now)))
+      (with-transaction ()
+        (retract-claim (first (claims-touching g 'ct-claim :ns "s1"
+                                               :role :subject)))
+        (let ((hist (claims-touching g 'ct-claim :ns "s1" :role :subject
+                                     :as-of then)))
+          (is (= 1 (length hist)))
+          (is (claim-current-p (first hist))))))))
+
+(test the-relation-index-answers-and-survives-reopen
+  "GH #350 spec §3: DEF-CLAIM-CLASSES declares a (RELATION) index named
+CLAIM-RELATION on the parent; it answers INDEX-LOOKUP on a fresh family
+and again after close and reopen (the sidecar round trip)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (make-u :subject "a" :relation "likes")
+                 (make-b :subject "a" :object "b" :relation "knows")
+                 (make-u :subject "c" :relation "likes"))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes"))))
+               (is (= 1 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "knows")))))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g2 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes")))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test an-existing-family-gets-the-relation-index-at-its-next-open
+  "GH #350 spec §3: a family whose claims predate the CLAIM-RELATION
+declaration gets the index at its next open -- INSTALL-SECONDARY-INDEXES
+builds every declared index the sidecar does not hold, scanning the
+claims already stored.  The withdrawn open is the control: it makes the
+reconcile drop the sidecar's record, so the final assertions cannot pass
+off a restored index as a built one.  Trap: the index registry is keyed
+by graph name and shared by every test here, so the declaration is
+restored in UNWIND-PROTECT."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (make-u :subject "a" :relation "likes")
+                 (make-b :subject "a" :object "b" :relation "knows")))
+          (close-graph g)))
+      (graph-db:undef-index ct-claim :graph-db-claim-test
+                            :name claim-relation)
+      (unwind-protect
+           (progn
+             (let ((g2 (open-graph *claim-graph-name* path)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g2))
+                      (signals graph-db:query-precondition-error
+                        (graph-db:index-lookup
+                         g2 'ct-claim
+                         '(graph-db.spacetime::relation) "likes")))
+                 (ignore-errors (close-graph g2 :snapshot-p nil))))
+             (graph-db:def-index ct-claim (graph-db.spacetime::relation)
+                 :graph-db-claim-test :name claim-relation)
+             (let ((g3 (open-graph *claim-graph-name* path)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g3))
+                      (is (equal '("knows" "likes")
+                                 (claim-relations g3 'ct-claim)))
+                      (is (= 1 (length (graph-db:index-lookup
+                                        g3 'ct-claim
+                                        '(graph-db.spacetime::relation)
+                                        "likes"))))
+                      (is (= 1 (length (graph-db:index-lookup
+                                        g3 'ct-claim
+                                        '(graph-db.spacetime::relation)
+                                        "knows")))))
+                 (ignore-errors (close-graph g3 :snapshot-p nil))
+                 (collect-garbage))))
+        ;; The suite shares the registry: restore whatever the body left.
+        (graph-db:def-index ct-claim (graph-db.spacetime::relation)
+            :graph-db-claim-test :name claim-relation)))))

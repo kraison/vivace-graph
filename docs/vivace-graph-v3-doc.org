@@ -495,7 +495,7 @@ Beyond the primary UUID→head tables, VivaceGraph maintains *secondary ordered 
 Two interchangeable *backends* implement that abstraction:
 
 - *Skip list* (~skip-list.lisp~) — the default. A probabilistic ordered structure with O(log n) expected operations and simple, lock-friendly concurrency; range scans walk the bottom-level linked list.
-- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages). On disk it beats the skip list on every operation once warm: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, range scans are sequential within a leaf, and it uses less space. It supports in-place cell edits and merge-on-delete rebalancing.
+- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages), opt-in. It wins point lookup, range scan and space: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, and range scans are sequential within a leaf. It loses on insert and remove (whole-page read-modify-write; several times slower in the 2026-07 measurements, ~docs/bplus-tree-experiment.md~), and through the spatial index, whose many short per-cell prefix scans pay cursor setup each time, so prefer ~:skip-list~ for spatial-heavy graphs. It supports in-place cell edits and merge-on-delete rebalancing; the concurrency audit items (vivace-graph#319) closed in 2026-10.
 
 Both implement the same internal ordered-map protocol, so views, unique indexes and the spatial index are all *backend-agnostic* — the choice is transparent to your application code.
 
@@ -756,6 +756,100 @@ The two new conditions:
 Ephemeral and meta slots are unaffected -- the guard only ever sees
 persistent slots.
 
+**** What a transaction sees (GH #408)
+
+A read inside ~with-transaction~ answers as the transaction will commit:
+its own creates, updates and deletes sit on top of the snapshot it reads
+(Chapter 10, snapshot-isolation reads), and a delete masks the committed
+node. Two layers give this. The transaction's own nodes live in its
+private local cache, which every transactional lookup consults before
+the store, so ~lookup-vertex~, ~lookup-edge~ and the generated
+~lookup-<type>~ return the created node, the saved copy or the deleted
+copy. An overlay over the write set then feeds the enumeration points:
+the typed ~map-vertices~ and ~map-edges~, the adjacency forms (so
+~outgoing-edges~, ~incoming-edges~, ~traverse~ and the Prolog functors),
+~edge-exists-p~, ~index-lookup~, ~map-index~ and ~index-range~ on
+~:index~ and ~def-index~ slots, and ~unique-lookup~ on a ~:unique~ slot
+or a ~def-unique~ tuple (#415). Each committed walk skips an id the
+transaction wrote and the overlay supplies every own live node at its
+current type, endpoints or key, so a moved index key is found under the
+new value and not the old, and ~map-index~ stays in ascending order.
+The entry-level reads that resolve no node follow the same rule
+(#409): ~index-count~ counts the entries the transaction will commit,
+and ~map-index-prefixes~ lists each prefix it will commit once, in
+index order. All four answer the same way on a declared index no commit
+has populated yet: the overlay alone supplies the rows (#416). So do the
+count index's ~count-index-lookup~ and
+~map-count-index~ (#411): the committed counters plus the apply pass's
+arithmetic over the transaction's writes. Spacetime's three hand-rolled
+overlays over these reads went with #411; cardinality's edge delta
+stays, because the commit view's validators read with the overlay off.
+Spatial and vector-segment membership follow too (#410): the index walk
+skips an id the transaction wrote, and its own live nodes are tested at
+their current geometry (~find-nodes-within~, ~find-nodes-intersecting~,
+~find-nodes-near~, ~find-nearest-k~ and the functors) or scored by
+their current vector (~vector-search~) and merged into the answer.
+
+What stays committed-only: views (#7), and the fully untyped
+~map-vertices~ / ~map-edges~ lhash scans (admin paths that bypass MVCC
+as well). A nested ~with-transaction~ is an
+independent commit and sees nothing of the outer one. A read snapshot
+opened inside a transaction inherits it and so sees its writes; an
+~:as-of~ read is refused there, as before.
+
+Two rules follow from reads returning an uncommitted node. ~copy~ and
+~mark-deleted~ of a node this transaction already saved chain to the
+*committed* pre-image, never to the copy, so the version chain and the
+secondary-index entries stay right; ~copy~ of a node this transaction
+*created* still signals ~copying-uncommitted-node~ (pattern B above).
+And code that composes its own "committed state plus write-set delta"
+-- the commit view's validators in ~%commit~ and ~validate-writes~ --
+reads with the overlay off, through ~*read-own-writes*~ (default ~t~),
+so the commit path counts an own edge once. A scan inside a transaction
+costs O(pending writes) extra; ~docs/perf-baselines.md~ has the number.
+Design: ~docs/superpowers/specs/2026-10-29-read-your-own-writes-design.md~.
+
+*** The transaction contract, in five rules (GH #401)
+
+The whole of what a caller may rely on, gathered in one place; each rule
+points at the section that explains it.
+
+1. *A transaction is one ~with-transaction~; nesting does not flatten.* A
+   nested ~with-transaction~ opens an independent transaction that commits
+   on its own, and its writes survive a rollback of the outer one. The
+   write operations -- ~make-<type>~, ~save~, ~mark-deleted~ -- join an
+   ambient transaction when one is open and wrap their own otherwise;
+   ~copy~ and ~save~ require one. The atomic unit is therefore one
+   ~with-transaction~ whose body calls the write operations directly; a
+   helper that opens its own ~with-transaction~ is a separate commit.
+
+2. *Validation is write-set driven.* A commit conflicts with another
+   transaction that committed during its lifetime and wrote a node this
+   one read or wrote ("Read/Write Sets and Validation"). An empty write set
+   never conflicts. Two transactions with disjoint write sets never
+   conflict, so OCC cannot catch a phantom or a write skew: two
+   transactions that each create a child under the same parent both
+   commit. To make them conflict, copy and save the parent in each.
+
+3. *A transaction reads what it will commit.* Its own creates, updates
+   and deletes are seen through lookups, the typed and adjacency scans,
+   ~edge-exists-p~, the secondary, unique, count, spatial and vector
+   index reads ("What a transaction sees", above). Committed-only, by
+   design: views, and the fully untyped ~map-vertices~ / ~map-edges~
+   scans. A write's base is the version the transaction sees for the
+   node's id, whatever object was copied (GH #355).
+
+4. *~with-read-snapshot~ is the consistent read, and it nests by
+   inheriting.* Every read inside it resolves at one epoch; an inner
+   snapshot of the same graph inherits the outer one, the opposite of
+   ~with-transaction~. It is the tool for a consistent export or report.
+   Index membership under it is live, not versioned (GH #345).
+
+5. *A committed write is durable without a snapshot.* The store is
+   memory-mapped and the commit writes through; the transaction log is
+   for replicas and recovery. ~snapshot~ is a separate backup
+   (Chapter 11), not part of durability.
+
 *** Locking and Concurrency (~rw-lock.lisp~)
 
 While the transactional system uses an optimistic model for application-level data, the database still relies on low-level locks to protect the integrity of its own internal data structures. VivaceGraph implements a custom, fair *Read-Write Lock*, defined in ~rw-lock.lisp~.
@@ -903,7 +997,7 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 **** Slot and Property Predicates
 | Predicate                                   | Description                                                     |
 |---------------------------------------------+-----------------------------------------------------------------|
-| ~(node-slot-value ?node slot-name ?value)~  | Unifies ~?value~ with the value of the node's slot.             |
+| ~(node-slot-value ?node slot-name ?value)~  | Unifies ~?value~ with the value of the node's slot. An unbound ~?node~ enumerates every vertex declaring the slot; an unbound ~slot-name~ lists the node's slots (GH #351). |
 | ~(weight ?edge ?weight)~                    | Unifies ~?weight~ with the edge's weight (same as the 3-arg version). |
 
 *Example:* Find the text of all posts, along with their timestamp.
@@ -1049,6 +1143,8 @@ Let's create a simple predicate `(divisible-by ?x ?y)` that succeeds if the numb
           ;; Success! Call the continuation to proceed with the query.
           (funcall cont)))))
 #+END_SRC
+
+One rule for the body: never wrap ~(funcall cont)~ in ~handler-case~ or any other catch-all. The continuation runs every later goal of the query, so an error raised there — including the resource and permission refusals of the guarded runners — would be swallowed and turn into a silent non-match. Guard only the functor's own computation, and call ~cont~ outside the handler.
 
 Now we can use this new predicate directly in any query, just like a built-in one.
 
@@ -1236,6 +1332,7 @@ That's it! VivaceGraph will now automatically maintain these indexes. When you c
 
 - *A changed view is rebuilt automatically.*  If you change a view's ~:map~/~:reduce~ code or its sort order, the next reconcile detects the difference, rebuilds the index from scratch, and emits a ~log:warn~.  This is the safe default: serving queries from an index built by an *old* ~:map~ lambda would be a subtle, hard-to-find bug.
 
+- *A view added later is backfilled.*  A ~def-view~ evaluated against an open graph that already holds nodes builds its index over them at once; one evaluated while the graph is closed (a new image loading its schema) is built by the next ~open-graph~. No ~regenerate-view~ is needed for a new view (vivace-graph#402, pinned by two tests). The graph name in ~def-view~ must be the name the graph is open under, or the spec is registered under a name nothing reconciles and a query reports the graph "not loaded".
 - *Forcing a rebuild.*  Use ~regenerate-view~ to force one view, ~regenerate-all-views~ to force all of them, or pass ~:regenerate-views t~ to ~open-graph~ (or ~open-memory-graph~) to rebuild everything at open.
 
 - *Removing a view.*  Deleting a ~def-view~ form does not drop the persisted index (just as deleting a ~def-vertex~ form does not drop the persisted type).  Call ~delete-view~ to remove it explicitly.
@@ -1374,6 +1471,16 @@ Handle a violation like any other condition (readers ~ucv-class-name~, ~ucv-slot
               (ucv-value c) (ucv-existing-id c))))
 #+END_SRC
 
+Read the constraint's index with ~unique-lookup~: the live node holding a value, or ~nil~ (GH #415). The canonicalizer applies to the probe, a null probe is nothing's value, and the holder may be of any class under the constraint's owner, since a parent's constraint is one index across its subclasses. A ~def-unique~ tuple is probed by its component list (see "Multi-slot (tuple) indexes and unique constraints" below). Inside a transaction the answer is what it will commit (Chapter 5, "What a transaction sees"). An undeclared slot signals ~query-precondition-error~.
+
+#+BEGIN_SRC lisp
+  (unique-lookup *graph* 'user 'username "alice")         ; the holder, or NIL
+  (unique-lookup *graph* 'user 'email "Alice@X.com")      ; canonicalized first
+  (unique-lookup *graph* 'claim '(ns key) '("ops" "e1"))  ; a def-unique tuple
+#+END_SRC
+
+From Prolog, ~(find-by-unique ?node user username "alice")~ binds ~?node~ at most once.
+
 **** Scope: uniqueness under peer replication
 
 By default a constraint is ~:scope :local~ — the value is unique within *this* graph. Global uniqueness across a whole fleet is not a coordination-free property, so peer replication (Chapter 16) offers a second scope for VivaceGraph-minted values:
@@ -1452,12 +1559,13 @@ What withdrawal does: the declaration stops being enforced or maintained immedia
 
 **** Reaching the index from Prolog
 
-Two *generating* predicates put the index in front of the query language, which for most users is the surface they actually reach for:
+Three *generating* predicates put the indexes in front of the query language, which for most users is the surface they actually reach for:
 
 #+BEGIN_SRC prolog
   (find-by-slot    ?node user email "alice@x.com")   ; equality
   (find-slot-range ?node user age 18 65)             ; ordered range, ascending
   (find-slot-range ?node user age 18 nil)            ; open above; ?end may also be left unbound
+  (find-by-unique  ?node user username "alice")      ; the unique holder, at most once (GH #415)
 #+END_SRC
 
 ⚠ These *generate* — they bind ~?node~ once per hit. That is a different shape from ~geo-within/3~, which *filters* already-bound arguments; ~find-within/3~ is the right analogue, and ~?node~ comes first for the same reason it does there. Without them, a query over an indexed slot had to generate candidates with ~is-a/2~ — every instance of the class — and filter one at a time with ~node-slot-value/3~, which is a filter and not a lookup. That is O(instances) against an O(log n) index the graph was already maintaining on every commit.
@@ -1533,6 +1641,8 @@ This is intentional, pre-existing behavior (the single-slot backward-compatibili
 
 ~index-lookup~'s ~value~ list must supply exactly as many components as the index's arity — unless you pass ~:prefix t~, in which case a *shorter* list scans every tuple that starts with those components. This is deliberate strictness, not an oversight: a short value list without ~:prefix t~ signals rather than silently returning a superset of what you meant to ask for. Too many components is never rescued by ~:prefix t~ either — an overshoot always signals, on both ~index-lookup~ and ~index-range~.
 
+A range bound needs no ~:prefix t~: a short tuple given as ~:start~ or ~:end~ is always a prefix bound, standing for every tuple that starts with it. So ~:start '("ops")~ begins at the first ~("ops" ...)~ row and ~:end '("ops")~ ends after the last one — the window is inclusive of the prefix's extensions at both ends, whether one bound is given or both (GH #413).
+
 #+BEGIN_SRC lisp
   (index-lookup graph 'claim '(ns key rel) (list "ops"))             ; signals: too short
   (index-lookup graph 'claim '(ns key rel) (list "ops") :prefix t)   ; ok: prefix scan
@@ -1602,7 +1712,7 @@ Creating a node stores its vector; updating one overwrites it (and *removes* it 
   ;;=> ((0.93 . #<16-byte id>) (0.88 . #<16-byte id>) ...)
 #+END_SRC
 
-The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~.
+The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~. Inside an open transaction the answer is what it will commit: the scan skips an id the transaction wrote, its own nodes' current vectors are scored, and the K best of both come back (#410).
 
 *It returns ids, not nodes, and that is the entire point.* A scan touches only the segment's id array and its contiguous block of floats; it never deserializes a node, never touches the heap, never conses one object per candidate. Materialize only the handful you actually want:
 
@@ -1667,6 +1777,10 @@ A value is indexed only if it is a ~(simple-array single-float (*))~. Anything e
 ~segment-score-subset~ exists as an *extension seam*. It makes no assumption that it has seen every vector in the segment, and ids it does not hold are silently skipped, so an approximate index (ANN, or an int8 pre-rank) can propose a cheap candidate set and have it re-scored *exactly* against the float32 block. Note that it does not de-duplicate: an id offered twice is scored and returned twice.
 
 **** Migrating an existing corpus
+
+A segment is safe to replace under readers: ~rebuild-vector-segment~ registers its finished replacement before closing the old one, a close waits for any scan in flight, and a reader that still holds a closed segment gets ~segment-closed~ and re-fetches (vivace-graph#54). A rebuild still needs no concurrent *writers*: run it with write traffic stopped.
+
+A segment's dimension is fixed when its first vector is written and kept even when every vector is cleared, so re-embedding with a model of another width needs ~reset-vector-segment~ (vivace-graph#365): clear the slot on every live node and commit, then ~(reset-vector-segment *graph* 'document 'embedding)~ drops the segment and its file; the next conforming write recreates it at the new width. It refuses with ~vector-segment-in-use~ while a live node still holds a vector.
 
 Because maintenance is on the apply path, nodes written *before* you added the ~:vector-index~ declaration were never indexed. Fill them in with ~rebuild-vector-segment-batched~, which sweeps live nodes and *adds* what is missing without disturbing what is already there:
 
@@ -1871,6 +1985,38 @@ is a member of class C", the shape the deployed spatial tenant encodes in
 its relation strings — is a different feature (4b), a real constraint
 family that needs a membership representation the substrate does not
 yet have. It is deferred, not folded in.
+
+*** Validating before the side effect (~validate-writes~)
+
+Every family above enforces at commit: the only way to learn a write
+would be refused is to attempt it and catch the condition. When the
+question is *would this be refused, and why* — an agent planning a
+write, a decision trace that must record a refusal structurally —
+~validate-writes~ answers for the cost of a read (vivace-graph#301):
+
+#+BEGIN_SRC lisp
+  (validate-writes graph
+                   (list (list :create new-node)
+                         (list :update changed-copy committed-original)
+                         (list :delete doomed-copy committed-original)))
+  ;; => #S(validation-report ...)
+#+END_SRC
+
+It runs the six constraint families — value, unique, cardinality,
+domain/range, and every subsystem commit validator (membership and
+extent disjointness when ~graph-db/spacetime~ is loaded) — over the same
+commit view ~%commit~ builds, so the two cannot disagree; nothing is
+journaled and nothing changes. The ~validation-report~ carries each
+family's own violation structs tagged with the refused write
+(~validation-report-violations~, a list of ~(family write detail)~),
+violation counts per family, how many writes each family examined, and
+how many specs each family has registered — so "no violations, N specs
+checked" and "nothing to check" stay distinguishable. Two caveats: the
+answer is advisory (the report is computed outside the manager lock, so
+a racing commit can invalidate it — the commit path remains the
+enforcement), and the ~:unique~ and subsystem families report only
+their first violation, which still covers everything ~%commit~ itself
+would have said, since ~%commit~ stops at its first refusal.
 
 ** Chapter 9: The REST API (~rest.lisp~)
 
@@ -2206,6 +2352,49 @@ exactly what ~/types~ and ~/stats~ emit — digits included
 (~minAge~) is still accepted whenever a name carries an uppercase
 letter (vivace-graph#281).
 
+**** Mounting under a host application (GH #384)
+
+~start-gui~ starts its own listener. A host application that already
+runs a clack listener in the same image — an engine store is
+single-process, so any cockpit over a live store runs in the image
+that holds it — mounts the GUI under a prefix of its own instead:
+
+#+BEGIN_SRC lisp
+  (lack:builder
+   (:mount "/gui" (graph-db.gui:make-gui-app))
+   host-app)
+#+END_SRC
+
+~make-gui-app~ returns the clack application ~start-gui~ serves — a
+function of the request environment: ~/api/*~ through the API routes,
+everything else through the static tree with the request-body-size
+refusal, ~index.html~ at the mount's root. Its paths are relative to
+its own root, and the frontend names its assets and the API by
+relative URL, so the same build serves at ~/~ and under ~/gui/~. A
+request for the bare mount root (~/gui~) is redirected to ~/gui/~
+first: relative URLs resolve under the mount only from a directory
+URL. Keyword arguments:
+
+- ~:static-root~ — the asset directory; defaults to
+  ~(graph-db.gui:gui-static-root)~, the ~gui/static/~ of the loaded
+  source tree.
+- ~:allow-prolog~ — ~t~, or a *function of the clack environment*
+  decided per request, so a host admits the free-text Prolog
+  workbench for some visitors only (the identity the host puts in
+  front of the mount is what the function reads — a header, a
+  session). The value is bound around every request, shadowing any
+  outer binding of the flag.
+- ~:read-only~ — refuse every request but GET, HEAD and the query and
+  Prolog POSTs with ~403 read-only~ at dispatch, before any handler
+  runs (vivace-graph#386); ~/api/capabilities~ reports ~readOnly~ so
+  the roster drops its open/close verbs. The open and close handlers
+  keep their own refusal as a second layer.
+
+~start-gui~ takes the same ~:allow-prolog~ and ~:read-only~ and passes
+them through. Localhost remains the security boundary of the
+standalone server; under a mount the host supplies identity in front
+of it.
+
 **** Free-text Prolog (opt-in, GH #279)
 
 The builder above reads no user text at all. A second surface inside
@@ -2217,7 +2406,9 @@ therefore off unless asked for:
 #+END_SRC
 
 ~start-gui~ is idempotent, so it sets the flag only when it actually
-starts a server; restart to change it. With the flag off, ~POST
+starts a server; restart to change it. A GUI mounted through
+~make-gui-app~ can decide it per request instead (GH #384, above).
+With the flag off, ~POST
 /api/graphs/:name/prolog~ answers ~403 prolog-disabled~ *before it
 resolves the graph* — the flag is enforced at the endpoint, and the UI
 hiding the sub-tab is decoration, not the control. A frontend learns
@@ -2302,7 +2493,11 @@ the control constructs out of the ~prolog-compiler-macro~ property on
 exists would create the very symbol it was asking about. Names are
 compared as strings.
 
-Three things are withheld on purpose:
+Three things are withheld on purpose (the cost-unboundedness category
+is now engine data — ~declare-functor-cost-unbounded~ /
+~cost-unbounded-predicate-names~, vivace-graph#285 — and this list
+derives from it; a resource-bounded ~select~ refuses such goals itself,
+so every caller gets the guard, not only this surface):
 
 - ~regex-match/2~, because its worst-case cost is bounded neither by
   the graph nor by the length of the query. The rails are enforced by
@@ -2648,7 +2843,7 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 
 2.  *Checks Data Integrity (Opt-in):* With ~:check-data-integrity-p t~, ~snapshot~ first runs a full data integrity check on the graph: it iterates through every vertex and edge, attempting to deserialize its data from the heap, and if any corruption is found the snapshot is aborted with a list of the problematic nodes. This sweep deserializes the whole graph a *second* time, which on a large graph is the larger half of the snapshot's memory cost, so since vivace-graph#119 it is *off by default* — routine snapshots (including the one ~close-graph~ takes) skip it. Run ~check-data-integrity~ directly when you want the audit; ~replay~ still verifies restored data by default.
 
-3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`.
+3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`. Every line is printed under standard I/O syntax, not the caller's: a client that binds print limits around the call (a SWANK client, cl-mcp's remote-eval) cannot truncate the file, and a non-default float format cannot change what a double reads back as (vivace-graph#354). Only the caller's ~*package*~ is kept, so symbols print relative to it as ~recreate-graph~'s ~:package-name~ expects.
 
 **** Heap sizing for snapshots
 
@@ -2800,6 +2995,11 @@ function carries either source straight to v3 in one call; it is a logical
 snapshot-and-replay, described in full in Chapter 12, "MVCC: Immutable
 Versioned Nodes," under "Migrating an older graph to v3."
 
+A source already in the current format is accepted too, which makes
+~migrate-graph~ a logical copy: the way to import a store into another
+system directory. Pass ~:renumber-p t~ so the copy's type-ids come from the
+destination's registry.
+
 ** Chapter 12: MVCC — Immutable Versioned Nodes
 
 VivaceGraph took early design inspiration from CouchDB, including its idea of keeping previous revisions of a document around rather than overwriting them in place. The MVCC release makes good on that idea: every update or delete now writes a *new* version of a node and *retains* the old one, chained together, until a background reaper decides it is safe to reclaim. This chapter explains how that works and the knobs you have for controlling it.
@@ -2859,7 +3059,7 @@ You do not call the reaper directly; it is automatic. Its only tunable is the re
 
 *** Snapshot-isolation reads
 
-Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) now returns the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down.
+Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down. A write's *base* is the version the transaction sees for the node's id, whatever object ~copy~ or ~mark-deleted~ was handed: an as-of result, a history entry, or a node read before the transaction began (~mark-deleted~'s own idiom) all produce a proper new revision over the live head, and a concurrent commit is an OCC retry that sees the newer version (GH #355). The commit still refuses a base that is not the live head with ~stale-revision-error~, as a safety net no public path reaches.
 
 #+BEGIN_SRC lisp
   ;; Transaction A reads X, sees its value as of A's start, and keeps seeing
@@ -2867,6 +3067,54 @@ Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or 
 #+END_SRC
 
 *A note on scans.* This isolation applies to *lookups* (and to *typed* scans such as ~(map-vertices fn g :vertex-type 'user)~, which resolve each node through the lookup path). An *untyped*, whole-graph scan — ~(map-vertices fn g)~ with no ~:vertex-type~ — still reads each node's *live* version. This is a deliberate, documented limitation: making whole-graph scans snapshot-consistent would require versioning the indexes themselves (membership history), which is out of scope. In practice untyped scans are used for read-only maintenance and analytics, where this is harmless; when you need a consistent view, use a point lookup or a typed scan. Crucially, none of this affects *data integrity*: writes remain serializable via the engine's optimistic concurrency control regardless of how reads are resolved.
+
+*** Reading as of an epoch
+
+Where the transaction snapshot above always means "now", GH #115 (Phase
+C-3) lets a caller name a past epoch explicitly. Every commit takes the
+next epoch from the graph's transaction manager (or the ~system-clock~
+it is attached to); ~with-as-of~ opens a read-only extent pinned to a
+given epoch, and every read inside it — a point lookup, a typed scan,
+adjacency, or a ~select~ with ~:as-of~ — resolves to the version whose
+~commit-epoch~ is the newest *at or below* that epoch. ~(latest-epoch
+graph)~ returns the newest epoch you may name.
+
+#+BEGIN_SRC lisp
+  ;; Read GRAPH as it stood at EPOCH, across a lookup and a typed scan.
+  (with-as-of ((graph) epoch)
+    (list (lookup-vertex some-id)
+          (map-vertices #'collect graph :vertex-type 'user)))
+
+  ;; The newest epoch you may currently name:
+  (latest-epoch graph)
+#+END_SRC
+
+How far back you can go is bounded by ~:keep-revisions~: the default of
+~0~ retains only the live version and the one lagging version the
+committing transaction's own floor keeps, so an as-of read older than
+that on an updated node cannot be answered. Rather than silently
+substituting a newer version, the engine signals
+~version-reaped-error~, naming the id, the epoch asked for, and the
+oldest epoch it still retains; ~:if-reaped :skip~ on the extent skips
+such reads instead and counts the *reads*, not the nodes, via
+~as-of-skipped-count~ — nothing caches a NIL, so two reads of one reaped
+id count 2. An epoch is node-local (#116): it names a point in this
+node's own history and is not portable to a replica. An as-of read is refused
+(~as-of-refused~) for a future epoch, from inside a read-write
+transaction, from inside a snapshot already open at another epoch, for
+an untyped scan, and on a graph with no version history (the in-memory
+backend, or a graph with no transaction manager yet).
+
+A ~select~ with ~:as-of~ snapshots ~*graph*~ only, exactly as ~:snapshot
+t~ does: a query that touches a second store reads that store *live*
+unless the ~select~ is nested inside that store's own ~with-as-of~.
+
+An as-of result is materialised, so it is safe to *read* after the call,
+and a copy of it saved inside a transaction is a new revision over the
+live head carrying the old values — the write's base is the version the
+transaction sees for the id, never the object copied (GH #355). That is
+how to restore an old value. See ~docs/time-travel.md~ for the full API
+and its bounds.
 
 *** Migrating an older graph to v3 (~migrate-graph~)
 
@@ -3056,7 +3304,7 @@ Here is a second spatial type, so the query examples below have two classes to s
 
 *** Querying
 
-Two read styles are provided, both refining the index's candidates with exact geometry math.
+Two read styles are provided, both refining the index's candidates with exact geometry math. Inside an open transaction every query answers what that transaction will commit: a node it created with a geometry is found, a moved one only at its new location, a deleted one not at all (#410; Chapter 5, "What a transaction sees").
 
 Every query takes a *scope* as its first argument: a node-class name, a list of names, or ~:all~. The scope both /selects/ which per-class indexes are scanned and /filters/ the results by type. Both halves matter — a geometry slot declared on a mixin gives its subclasses one *shared* index, so storage separation alone would not keep a sibling subclass's nodes out of the answer. Naming a class that is not spatially indexed signals an error; a class whose index simply holds nothing yet returns ~nil~, which is a legitimate empty result.
 
@@ -3689,6 +3937,10 @@ consumer treats the whole field as one opaque string. Qualifying by
 package is what lets two same-named types from two different packages
 share one wire table without colliding.
 
+Two facts a decoder of that table must build in. Vertex and edge type-ids come from separate counters, so one integer routinely names both a vertex type and an edge type: key on (kind, id), never on the id alone. And ~def-vertex~ accepts several superclasses (single inheritance is a convention), so the ~supers~ field is a list.
+
+Node data travels as an alist of ~(:slot . value)~ pairs, serialized as the list it is. Because ~(:k . nil)~ is ~(:k)~ and ~(:k . (a b))~ is ~(:k a b)~, a non-Lisp decoder must accept three shapes for one entry: a dotted pair (an atom value), a one-element list (the value NIL), and a longer list (a list value).
+
 **What the table contains changed with GH #186: it is the IMAGE's type
 registry, not the hub graph's schema — narrowed again to the hub's own
 store by GH #206.** Type-ids are image-level (Chapter 17), so in
@@ -4025,10 +4277,20 @@ Sometimes the type's name and shape only exist at runtime — an ETL that
 discovers a new record shape, an operator adding a type without a deploy —
 and a macro cannot help, because the data is not there yet when the form
 would need to be read. #172 adds a functional twin of the same machinery:
-~ensure-namespace~ and ~create-vertex-type~/~create-edge-type~ build a
+~ensure-namespace~ and ~create-vertex-type~/~create-edge-type~ (and, for
+their indexes and constraints, ~ensure-index~/~ensure-unique~, plus
+~register-source~ for a source's contract, GH #378) build a
 namespace and a class from data, driving the *same* installation path
 (~%install-node-type~) a ~def-vertex~ expansion drives, so a runtime type is
 indistinguishable from a source-defined one once built.
+
+Both constructors take ~:record-p~ (default ~t~), as ~ensure-namespace~
+does: ~nil~ writes no manifest TYPE row at creation and none when a store
+later instantiates the type, for a consumer that keeps its own record of
+its runtime types and never runs ~materialize-schema~ -- without it that
+consumer's manifest would hold type rows with no namespace rows, the
+orphan-package state ~materialize-schema~ warns about. Re-creating the
+type with the default records it again (GH #381).
 
 This section is a developer workflow in three sessions — the same shape as
 ~docs/runtime-schema-example.lisp~, which stays in the repository as the
@@ -4710,12 +4972,16 @@ carrying both conditions.
 The copy is sparse-preserving because a fresh store already reserves
 several gigabytes of mostly-zero mmap regions — a byte-for-byte copy
 would materialize every one of those unwritten reservations. The
-copier walks each file in fixed-size chunks and re-creates only the
-holes: an all-zero chunk is skipped via a bare seek on the (already
-zero) destination file rather than written, so an empty multi-gigabyte
-store copies in seconds. This is why "copies in seconds against a load
-measured in tens of minutes" (spec §8) holds in practice, not just in
-principle.
+copier asks the filesystem where the data is (~lseek~ with
+~SEEK_DATA~/~SEEK_HOLE~, ~%posix-data-extents~ in =posix.lisp=) and
+reads and writes only those runs, so the cost is the data, not the
+apparent size; an all-zero chunk inside a run is still skipped via a
+bare seek on the (already zero) destination rather than written, and
+the last byte is pinned so the copy has the source's exact length.
+Where a filesystem has no ~SEEK_DATA~ the whole file is one run and
+the chunk scan alone keeps the copy sparse (GH #170, #434). This is
+why "copies in seconds against a load measured in tens of minutes"
+(spec §8) holds in practice, not just in principle.
 
 **Loading: ~open-shadow-graph~.** Opens the shadow directory as a
 graph under the *live* store's own name — so its schema metadata
@@ -5353,7 +5619,9 @@ cannot see could not be created in the first place. Storing the endpoint as
 data rather than a live reference sidesteps the problem entirely — there is
 nothing left to resolve *inside* the transaction, so the cross-graph
 question never comes up. Resolving ~(namespace, key)~ back into an actual
-node is deliberately left to a later add-on; see below.
+node is the source onboarding contract's ~resolve-endpoint~ (below); from
+4.1.0 a claim also carries a *derived* edge to each endpoint that
+resolves in its own store — see "Edges under claims".
 
 Claims are defined with a macro, not shipped as ready-made classes —
 ~DEF-VERTEX~ binds a class to one graph at definition time, and class names
@@ -5390,6 +5658,16 @@ path-like ~"tenant/rule"~ names a producer carries. A keyword, an empty
 string, or a case or whitespace variant aborts the transaction on every
 write path, including a ~SETF~ + ~SAVE~ and the REST put. Both predicates
 are exported, so a tenant can pre-check a value it is about to write.
+
+Anything that must *refer* to a claim from outside the graph — another
+claim, a document, a decision trace — should name it by identity, not by
+node id: an id is a location, and it changes across retraction,
+re-assertion and regeneration. ~claim-identity-key~ renders the identity
+tuple as one canonical string (~|~-joined, ~|~ and ~\~ escaped inside
+string fields): producer, subject namespace and key, the object pair for
+a binary claim, the relation, and — for a temporal family — the extent
+start exactly as ~extent-sexp-start-key~ canonicalises it. Equal tuples
+render ~string=~ keys (vivace-graph#303).
 ~relation~ stays an OPEN vocabulary — the check is on form, not on
 membership; a closed vocabulary is ~DEF-VALUE-CONSTRAINT :ONE-OF~.
 
@@ -5697,8 +5975,65 @@ from the same index-bounded candidate set (vivace-graph#296):
   ;; ... as believed now
 #+END_SRC
 
+~:RELATION~ (a canonical string) restricts the read to one relation. On
+the subject side it rides a dedicated ~(subject-namespace subject-key
+relation)~ index every family declares (~claim-subject-relation~), so a
+one-relation read of an endpoint carrying thousands of claims touches
+only that relation's rows; on the object side it filters the endpoint
+candidates. A family also declares a fifth index, ~claim-relation~ on
+~(relation)~ alone, for walking distinct relations without an endpoint
+(vivace-graph#350). ~:LIMIT~ and ~:OFFSET~ cut the final filtered result, and
+the second return value is ~T~ exactly when more claims existed past the
+cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
+past the cap, the same rule the REST query envelope uses.
+~claims-by-producer~ paginates the same way (vivace-graph#302).
+
+~:AS-OF~ (a TIMESTAMP) answers on the *transaction* axis
+(vivace-graph#300): each claim comes back as the *version* believed at
+that instant. An in-place update after the instant is unwound to the
+earlier version; a claim retracted before it, or not yet created, drops
+out; ~:at~/~:during~ then filter the *resolved* version's validity. The
+time→version mapping is a wall-clock stamp in the claim's own data
+(~version-stamp~, written at every create and save), walked over
+~vertex-history~ — so ~def-claim-classes~ now declares
+~:keep-revisions~ for the family (default effectively unbounded; pass
+~:keep-revisions n~ to bound it). Three honest limits: a version past
+the retention window is reported as a ~reaped-claim~ (test with
+~reaped-claim-p~), never silently substituted by a newer one; a claim
+swept by ~delete-claims-by-producer~ is invisible to ~:as-of~; and the
+stamps replicate with the claim, so a device and the hub each answer
+"believed at T" from their *own* applied history — they can differ by
+apply lag, the same footing as any LWW stamp. For ~:as-of~, no argument
+or result is an epoch; the epoch axis is ~:as-of-epoch~, below.
+
 One of ~:AT~ or ~:DURING~, not both. A claim with no extent makes no
 validity statement and is excluded by either filter.
+
+~:AS-OF-EPOCH~ (an integer) answers on the same transaction axis by
+*commit epoch* rather than by wall clock (vivace-graph#347): each claim
+comes back as the version whose committing transaction id is the newest
+at or below the epoch, and drops out when that version is retracted — a
+retraction is a version, so its epoch is the retracting transaction's.
+When older versions existed but are past ~:keep-revisions~ the claim is
+a ~reaped-claim~, told apart from "created after the epoch" by the
+oldest retained version's ~revision~ (0 is the create), which is a
+sharper rule than the wall-clock axis has. ~claim-commit-epoch~ reads a
+version's epoch (~NIL~ for a ~reaped-claim~ or a version not yet
+committed — the epoch is assigned at commit, so a claim read inside
+its own open transaction has none). Epochs compare across stores only
+while the stores share one system clock (~open-system-clock~ and
+~make-graph :system-clock~, Chapter 12); a store with no clock signals
+~epoch-axis-unavailable~ — a ~query-precondition-error~ that names the
+graph — rather than answering from its private counter, while ~:as-of~
+on the same store keeps working. One of ~:as-of~ or ~:as-of-epoch~, not
+both. An uncommitted write has no epoch, so ~:as-of-epoch~ answers
+committed history only, as ~:as-of~ does. Index membership is not
+versioned (vivace-graph#345): a claim deleted or re-keyed after the epoch
+is not returned under the value it had then, and never under one its
+version at the epoch lacks; versioned membership is phase C-1 (#113). A claim whose transaction period was already closed when it
+was created — a replicated or restored belief retracted upstream —
+reads as retracted at every epoch. ~claims-by-producer~ takes
+~:as-of-epoch~ the same way.
 
 ~CLAIMS-BY-PRODUCER~ asks the other question: not "what names this endpoint"
 but "what did this rule write". It is the non-destructive twin of
@@ -5756,6 +6091,150 @@ questions and vary independently — the claim's says how the claim came to
 be known, the extent's says how the *time* was known. An ~:asserted~ claim
 can carry an ~:observed~ extent, or any other combination; neither one
 determines the other.
+
+*** Edges under claims: derived adjacency to the endpoints (GH #369)
+
+The ~(namespace, key)~ slots stay the truth and ~claims-touching~ stays the
+complete read. Beside them, a claim written into a store that also holds
+its endpoint gains one edge per endpoint — ~subject-of~ to its subject's
+node, ~object-of~ to its object's — so the engine's adjacency, ~traverse~
+and Prolog can walk claim topology without an index probe per hop
+(see the measured caveat at the end of this section). Both edge
+classes are shipped by ~graph-db/spacetime~, have no slots and no
+default store, and are always placed in the claim's own store.
+
+Linking happens in the constructor, inside your transaction:
+
+- An endpoint whose namespace has a registered source (~def-source~) in
+  the *same* store is looked up by its identity key — through the index,
+  and through the transaction's own uncommitted creates, so a source and
+  a claim about it written together still link. Exactly one node: an
+  edge. None: the claim is key-only, as before. Several: no edge and an
+  ~endpoint-link-skipped~ warning.
+- An endpoint anywhere else is the caller's to resolve *before* the
+  transaction (~resolve-endpoint~ refuses to run inside one); pass it as
+  ~:subject-node~ / ~:object-node~ and the engine verifies it is a source
+  of that namespace with that key — ~endpoint-mismatch~, an error, if not.
+
+Linking never fails a claim write. Retraction keeps the edges (the
+record of what was believed); reads filter by currency. Deleting a
+claim or a source hides the edges through ~active-edge-p~, and
+~compact-edges~ reclaims them.
+
+Reads over the edges — ~claim-endpoint~ (one side, one probe),
+~claim-endpoints~, ~node-claims~ (the adjacency twin
+of ~claims-touching~, same filters), ~(traverse node :edge-type '(or
+subject-of object-of) ...)~, and the goals ~(related ?s ?r ?o)~ (current
+claims) and ~(claimed ?c ?s ?r ?o)~ (with history) — see *linked claims
+only*. Two facts to keep in mind: adjacency is indexed in the *edge's*
+store, so ~node-claims~ takes ~:graph~, the claim store, defaulting to the
+node's own; and the Prolog goals resolve endpoints in the claim's graph,
+so a caller-resolved endpoint in another store is linked but does not
+unify until cross-store continuation lands (GH #368). Backfilling a
+store written before edges existed, or repairing claims whose sources
+arrived later, is the sweep:
+
+#+BEGIN_SRC lisp
+(link-claim-endpoints graph &key family since limit)
+;; => (values linked unresolved ambiguous skipped-namespaces more-p)
+#+END_SRC
+
+It reads under a snapshot, resolves each missing endpoint with
+~resolve-endpoint~ — so it may link across stores, which write-time
+linking never does — and creates the edges in one short transaction,
+re-checking each claim is still present, not deleted and still
+unlinked, so a repeated sweep is idempotent. Sweeps on one graph are
+serialized by a per-graph lock, so a second call waits rather than
+racing the first into a duplicate edge. ~:since~ is a commit epoch
+(~claim-commit-epoch~), which lets an operator sweep exactly what a
+regeneration wrote; ~:limit~ bounds both the work and the scan —
+collection stops at the first claim with a missing edge past the
+window. It never prunes and never signals: a namespace with no
+registered source or a source store that is not open is skipped for the
+call and named in ~skipped-namespaces~; the other counts are the
+report. Nothing runs on open.
+
+~more-p~ says that a claim with a missing edge exists beyond this
+call's window — *not* that progress remains. Claims that can never be
+resolved (an unregistered namespace, a key nobody holds) are
+re-collected on every call, so a window full of them returns ~linked~ 0
+with ~more-p~ T for ever. The backfill loop is therefore ~(loop while
+(and more-p (plusp linked)))~: stop when a call links nothing, then
+widen ~:limit~, fix the sources, or sweep a later ~:since~. Give a
+large backfill a ~:limit~ of a few thousand so each write transaction
+stays short.
+
+The sweep links a source that was deleted and re-created under the same
+key to the *new* record, adding a fresh edge; the superseded one stays
+hidden by ~active-edge-p~ until ~compact-edges~ reclaims it, so run
+~compact-edges~ after a source regeneration. A bulk loader can bind
+~*link-claims-at-write*~ to NIL, write key-only, and sweep once
+afterwards; a ~:subject-node~ / ~:object-node~ passed under that binding
+is still *verified* — ~endpoint-mismatch~ still refuses the write — and
+simply left unlinked for the sweep. The write-cost, sweep-cost and
+read-benefit numbers behind that trade are ~bench-claim-linking~ in the
+perf suite (GH #372).
+
+Measured on a synthetic store of two thousand sources and four
+thousand claims (~bench-claim-linking~ in the perf suite, GH #372):
+write-time linking costs roughly 60% of claim-write throughput, the
+backfill sweep links eight thousand edges in about three seconds,
+and — the surprise — a two-hop read through the edges is *slower*
+than the same read through ~claims-touching~ and ~resolve-endpoint~,
+by about 2.5× in Lisp and far more under the guarded Prolog runner.
+The suspected cost is not the walk but the engine's per-edge
+endpoint validation — ~active-edge-p~ looks up both endpoints of
+every edge it emits — tracked as an engine follow-up in GH #373 with
+the bench as its harness. Until it lands, treat the edges as what
+~traverse~ and the Prolog goals need — topology — and keep
+~claims-touching~ as the fast read.
+
+Write-time linking, unlike the sweep, is always on: a store crosses
+the schema version floor at its first linkable write, not only when
+the sweep is run — harmless, since a claim store already needs its
+tenant's ~def-claim-classes~ types loaded to write claims at all.
+
+*** Vocabulary: what a family names (GH #350)
+
+Before an exact read a caller often needs to know what is there:
+which namespaces a family's claims use, which relations, which keys
+sit under a namespace. Three functions answer from the family's own
+indexes, in index order, without walking its claims:
+
+#+BEGIN_SRC lisp
+  (claim-namespaces graph 'site-claim)                 ; (:device :sym ...)
+  (claim-namespaces graph 'site-claim :role :object :counts t)
+  (claim-relations graph 'site-claim :counts t)        ; (("wifi-drop" . 12) ...)
+  (claim-keys graph 'site-claim :device :limit 50)     ; ("d1" "d42" ...), more-p
+#+END_SRC
+
+~:counts t~ makes each entry ~(name . count)~; under ~:role :either~
+the count sums the subject and object roles. Every family declares
+three counting indexes -- ~claim-subject-count~, ~claim-object-count~
+and ~claim-relation-count~ (GH #361) -- so outside an open ~with-as-of~
+extent all three functions are lookups on those indexes and resolve no
+claim: the default count is the counting index's ~all~ counter,
+~:current t~ reads its ~current~ counter, and inside an open
+transaction the transaction's own writes are overlaid on the lookup
+before it returns (GH #324), as ~claims-touching~ overlays its own.
+The default lists every name the indexes hold, retracted claims
+included -- they are the record of what was believed; ~:current t~
+keeps a name only if a claim under it is current, and counts only
+those. Names come from index membership, which is live: ~:as-of~ and
+~:as-of-epoch~ are refused as keyword arguments, and inside an open
+~with-as-of~ extent the listing falls back to the distinct-prefix walk
+of GH #350 -- the only mechanism that can answer at an epoch -- and
+costs what it cost before the counting indexes existed (Chapter 12,
+"Reading as of an epoch"). The ~claim-relation~ secondary index stays
+as that walk's relation source; a family created before the counting
+indexes existed builds them at its next open. On a device, a
+replication pull -- state-sync or an authored pull alike -- marks the
+counting indexes stale rather than counting the pulled write, so the
+first vocabulary query after a pull pays one scan rebuild before it
+goes back to answering as a lookup; and a clean ~close-graph~ after a
+pull rebuilds them before saving, so a device that closes without ever
+asking the vocabulary reopens with counts that are right rather than
+one pull behind.
 
 *** The source onboarding contract: what a source declares about itself
 
@@ -5898,7 +6377,8 @@ Every key but the ~:NONE~ escape is required, same as every other
 facet:
 
 #+BEGIN_SRC lisp
-  :registration (:registry <class>          ; a DEF-SOURCE class
+  :registration (:registry <class or (class ...)> ; a scope, per
+                                                    ; REGISTER-GEOMETRY
                  :registry-namespace <kw>    ; where its regions live
                  :claim-class <symbol>       ; a DEF-CLAIM-CLASSES parent
                  :producer <string>          ; who wrote the claim
@@ -5940,6 +6420,32 @@ registration exists to provide.
 carries ~:INFERRED~, because a registration is derived by computation.
 See "Registration: binding geometry to a registry" below for what
 reads this facet.
+
+**** Registering a source at run time (~register-source~)
+
+A consumer that lets its users define source types while running builds
+the class with ~create-vertex-type~ and then registers it as a source
+from data rather than a macro form:
+
+#+BEGIN_SRC lisp
+(register-source class facets &key graph-name) ; => class name
+#+END_SRC
+
+~class~ is the class name or the class object ~create-vertex-type~
+returned; ~facets~ is a plist of all seven facets exactly as ~def-source~
+takes them. It does what the macro's expansion does after its
+~def-vertex~: the identity index and the named ~source-identity-key~
+constraint when ~:identity~ is not ~:none~, the contract, and the
+namespace registration. Re-registering replaces the earlier contract, as
+re-evaluating the macro does. ~graph-name~ is the store the records live
+in; it defaults to the class's default store and ~source-store-unknown~
+is signalled when the class has none and none is given. Nothing here is
+persisted: like ~:check~ functions under the runtime schema, the
+consumer keeps its own record of the definition and replays it at start
+(GH #378). Its inverse, ~(unregister-source class)~, takes the class out
+of its namespace and drops the contract while leaving the class, its
+index, its constraint and its records in place -- a withdrawn source's
+history stays readable, it simply no longer resolves (GH #381).
 
 *** Registration: binding geometry to a registry
 
@@ -6261,7 +6767,7 @@ This chapter provides a categorized reference for the most important exported sy
   A special dynamic variable that should be bound to the currently active graph instance for most operations to work correctly.
 
 - ~graph-stats (&key graph detail-p)~ ::
-  Returns an alist of performance statistics for the graph, including free memory, cache size, read/write rates, and node counts.
+  Returns an alist of performance statistics for the graph, including free memory, cache size, read/write rates, and node counts. The read and write rates are sampled: the engine counts every lookup with a fixnum increment and advances the per-second histogram once every ~+stats-sample+~ (64) calls, so totals are exact to within one sample per graph and a graph touched fewer than 64 times reports no rate at all. The per-lookup clock read this replaced was half of an adjacency read's profile (GH #373).
 
 **** Schema Definition
 - ~def-vertex (name (parent-classes) (slot-definitions) graph-name)~ ::
@@ -6285,7 +6791,7 @@ This chapter provides a categorized reference for the most important exported sy
   Constructor functions automatically generated by ~def-vertex~ and ~def-edge~. Use these to create new nodes within a transaction. For example, `(make-user :name "Alice")`.
 
 - ~lookup-vertex (id &key graph)~ ::
-  Retrieves a vertex object from the database given its 16-byte UUID or string representation.
+  Retrieves a vertex object from the database given its 16-byte UUID or string representation. The per-graph node cache is keyed by id alone, so given an edge's id this can return that cached edge; when the kind of an id is unknown, branch on the returned object's class (GH #271).
 
 - ~lookup-edge (id &key graph)~ ::
   Retrieves an edge object from the database given its ID.
@@ -6352,7 +6858,7 @@ This chapter provides a categorized reference for the most important exported sy
 - ~index-lookup (graph class slot value &key (collect-p t))~ ::
   The nodes of ~class~ (and subclasses) whose ~slot~ equals ~value~, via the ordered index (equality).  Resolves nodes in ~graph~.  A declared-but-empty index returns an empty result; an unindexed slot signals an error.
 - ~index-range (graph class slot &key start end)~ / ~map-index (function graph class slot &key start end)~ ::
-  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.
+  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.  On a multi-slot index a bound is a tuple; a short tuple is a prefix bound at either end, so a short ~end~ includes its extensions (GH #413).
 - ~regenerate-secondary-indexes (graph)~ ::
   Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~regenerate-spatial-indexes~; see Chapter 3).
 
@@ -6507,6 +7013,12 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~make-graph ( ... :keep-revisions N)~ / ~open-graph ( ... :keep-revisions N)~ ::
   Graph-wide default retained-version count (persisted by ~make-graph~; an optional session override on ~open-graph~).
+
+- ~commit-epoch (node)~ (accessor) ::
+  The id of the transaction that committed this version of ~node~. Transaction ids are globally monotonic, so this doubles as a logical timestamp.
+
+- ~vertex-history (graph id &key limit)~ ::
+  The retained versions of vertex ~id~ in ~graph~, newest first, as ~(version . commit-epoch)~ conses; the live version is always first. Depth is bounded by ~:keep-revisions~. See Chapter 12.
 
 **** Spatial (see Chapter 13)
 

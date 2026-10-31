@@ -201,6 +201,15 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
    ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
    (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
+   ;; Counting indexes (DEF-COUNT-INDEX, GH #361): (owner . slot-names) ->
+   ;; COUNT-INDEX; STALE-P is set by a re-applying apply and cleared by
+   ;; REBUILD-COUNT-INDEXES (spec R8).  See count-index.lisp.
+   (count-indexes :accessor count-indexes :initarg :count-indexes
+                  :initform nil)
+   (count-indexes-stale-p :accessor count-indexes-stale-p :initform nil)
+   ;; Count maps a rebuild swapped out: freed by CLOSE-GRAPH, never
+   ;; mid-session -- a MAP-COUNT-INDEX reader holds no lock (spec §2.3).
+   (retired-count-maps :accessor retired-count-maps :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)
@@ -220,6 +229,11 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
                                        #+graph-db-ecl-sync-hash :synchronized
                                        #+graph-db-ecl-sync-hash t)
                #+sbcl (make-hash-table :test 'eq :synchronized t))
+   ;; Sampling counters behind RECORD-GRAPH-READ / -WRITE: the clock and
+   ;; the synchronized histograms above are touched once per
+   ;; +STATS-SAMPLE+ calls, not once per lookup (GH #373).
+   (read-sample-counter :accessor read-sample-counter :initform 0)
+   (write-sample-counter :accessor write-sample-counter :initform 0)
    ;; The image-level epoch clock (GH #168), or NIL for this store's own
    ;; counter.  NIL is the pre-#168 behaviour and the default.  Reader
    ;; public, writer internal: ATTACH-TO-SYSTEM-CLOCK is the only entry

@@ -18,9 +18,14 @@
 
 ;; Type-ids come from the registry in *SYSTEM-DIRECTORY*; a store cannot
 ;; be opened without one (GH #186).
+;; Scratch goes under GRAPH_DB_EXAMPLE_ROOT when set (tests/load-examples.sh
+;; gives each run a private directory), else /var/tmp/.
+(defvar *example-root*
+  (or (uiop:getenv "GRAPH_DB_EXAMPLE_ROOT") "/var/tmp/"))
 (setf *system-directory*
       (namestring
-       (ensure-directories-exist "/var/tmp/spacetime-example-system/")))
+       (ensure-directories-exist
+        (concatenate 'string *example-root* "spacetime-example-system/"))))
 
 ;;; Schema.  DEF-CLAIM-CLASSES defines a claim family: a parent class
 ;;; plus UNARY and BINARY subclasses, with identity, standing and
@@ -32,7 +37,8 @@
 ;; SETQ, not DEFVAR: GRAPH-DB:*GRAPH* is already bound (to NIL), and
 ;; DEFVAR would skip the init form entirely.
 (setq *graph*
-      (make-graph :spacetime-example "/var/tmp/spacetime-example/"
+      (make-graph :spacetime-example
+                  (concatenate 'string *example-root* "spacetime-example/")
                   :buffer-pool-size 1000))
 
 ;;; Two small helpers (the same shapes the test suite uses).

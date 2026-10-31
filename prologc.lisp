@@ -119,6 +119,14 @@ present, so an error from the continuation after Goal succeeds is not caught.")
  Specialize this for new types that will be stored in the db.")
   (:method ((x number) (y number)) (= x y))
   (:method ((x string) (y string)) (string= x y))
+  ;; A keyword-valued slot has no keyword spelling in a guarded query
+  ;; (the screen refuses every colon), so a string stands in for one,
+  ;; case-insensitively; two strings stay STRING= (GH #351).
+  ;; KEYWORD is a type, not a class: dispatch on SYMBOL.
+  (:method ((x string) (y symbol))
+    (if (keywordp y) (string-equal x (symbol-name y)) (call-next-method)))
+  (:method ((x symbol) (y string))
+    (if (keywordp x) (string-equal (symbol-name x) y) (call-next-method)))
   (:method ((x character) (y character)) (char= x y))
   (:method ((x timestamp) (y timestamp)) (timestamp= x y))
   ;;(:method ((x timestamp) (y integer)) (= (timestamp-to-universal x) y))
@@ -190,8 +198,47 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   (loop for i from 1 to arity
         collect (new-interned-symbol '?arg i)))
 
-(defun make-functor-symbol (symbol arity)
-  (new-interned-symbol symbol '/ arity))
+(defun %registered-functor-p (symbol)
+  "True when SYMBOL is a live functor -- a user clause (GET-FUNCTOR-FN)
+or a global primitive (*PROLOG-GLOBAL-FUNCTORS*).  Both lookups are
+read-only: no symbol is created or registered by asking (GH #322)."
+  ;; GET-FUNCTOR-FN (compiled fn), not LOOKUP-FUNCTOR (struct): an
+  ;; uncompiled registered functor falls through to the old rule.
+  (or (get-functor-fn symbol)
+      (nth-value 1 (gethash symbol *prolog-global-functors*))))
+
+(defun %functor-name-string (symbol arity)
+  "NAME/ARITY as a string, from SYMBOL's name (a string stands as is)
+and ARITY in decimal -- independent of the printer's bindings (GH #342)."
+  (concatenate 'string (string symbol) "/" (format nil "~D" arity)))
+
+(defun make-functor-symbol (symbol arity &key define)
+  "The NAME/ARITY functor symbol for SYMBOL.  DEFINE (true only from
+the definition path -- <- via ADD-CLAUSE, and any other site minting
+a symbol for a NEW functor) skips lookup and interns NAME straight
+into *PACKAGE*, the rule those callers already depended on -- a
+schema-package clause must not silently land on, or collide with, an
+existing GRAPH-DB functor of the same name.  Otherwise resolved by
+LOOKUP first: an already-registered functor in SYMBOL's own package,
+then in GRAPH-DB -- so a goal list whose canonical heads span the
+engine's package and a schema's resolves each in its home, and a head
+inherited from COMMON-LISP (>, atom, write) still finds the engine's
+functor.  A string SYMBOL never probes a package -- like DEFINE, it
+interns exactly as before this rule existed.  NAME is spelled by
+%FUNCTOR-NAME-STRING, never by the printer: a caller's *PRINT-CASE* or
+*PRINT-BASE* used to mint claim/7 where CLAIM/7 was registered and every
+goal was refused (GH #342).  NEW-INTERNED-SYMBOL (utilities.lisp) spells
+its parts the same way, so every path spells the identical symbol
+(GH #322)."
+  (let ((name (%functor-name-string symbol arity)))
+    (flet ((hit (pkg)
+             (and pkg
+                  (let ((s (find-symbol name pkg)))
+                    (and s (%registered-functor-p s) s)))))
+      (or (and (not define) (symbolp symbol)
+               (or (hit (symbol-package symbol))
+                   (hit (find-package :graph-db))))
+          (intern name)))))
 
 (defun make-= (x y) `(= ,x ,y))
 
@@ -219,8 +266,11 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   ;; user package (e.g. GRAPH-DB/TEST::ONCE) is a *different* symbol from the
   ;; GRAPH-DB symbol the macro is defined on.  CL-inherited heads (=, and, or,
   ;; not, if) are the same symbol everywhere and hit directly; for the rest we
-  ;; fall back to the same-named symbol interned in GRAPH-DB -- mirroring how
-  ;; MAKE-FUNCTOR-SYMBOL canonicalizes runtime predicate names by string.
+  ;; fall back to the same-named symbol interned in GRAPH-DB, by NAME.
+  ;; Unrelated to MAKE-FUNCTOR-SYMBOL's routing, which since GH #322
+  ;; looks up a registered functor in the head's OWN package before
+  ;; falling back to GRAPH-DB -- a different question, asked by LOOKUP
+  ;; rather than NAME alone.
   (flet ((canonical (sym)
            (let ((c (find-symbol (symbol-name sym) :graph-db)))
              (and c (not (eq c sym)) (get c 'prolog-compiler-macro)))))
@@ -624,12 +674,14 @@ inline, composing with cut and the control constructs.  When Goal is a variable
     body))
 
 (defun add-clause (clause)
-  "add a user-defined functor"
+  "add a user-defined functor.  :DEFINE T -- a clause always interns
+in *PACKAGE*, never the lookup-first read path (GH #322)."
   (let* ((functor-name (first (clause-head clause))))
     (when *prolog-trace* (format t "TRACE:  Adding clause ~A~%" clause))
     (assert (and (atom functor-name) (not (variable-p functor-name))))
     (let* ((arity (relation-arity (clause-head clause)))
-           (functor (make-functor-symbol functor-name arity)))
+           (functor (make-functor-symbol functor-name arity
+                                         :define t)))
       (if (gethash functor *prolog-global-functors*)
           (error 'prolog-error
                  :reason
@@ -754,7 +806,10 @@ inline, composing with cut and the control constructs.  When Goal is a variable
   (let* ((goals (replace-?-vars goals))
          (vars (delete '? (variables-in goals)))
          (top-level-query (prolog-gensym "PROVE"))
-         (*functor* (make-functor-symbol top-level-query 0)))
+         ;; New functor per invocation (GH #322): DEFINE T so this
+         ;; never resolves onto an existing functor of the same name.
+         (*functor* (make-functor-symbol top-level-query 0
+                                         :define t)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
@@ -792,7 +847,8 @@ inline, composing with cut and the control constructs.  When Goal is a variable
   ((:entity Spot) (:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -879,6 +935,12 @@ for the current query, or nil for unlimited.")
   "Inference budget applied to queries that don't specify :MAX-INFERENCES.")
 (defvar *default-query-timeout* nil
   "Default query timeout in seconds for queries that don't specify :TIMEOUT.")
+(defvar *allow-cost-unbounded* nil
+  "True while a query whose :ALLOW-COST-UNBOUNDED option was set is running.
+Read it in a functor that is unbounded per GOAL rather than per functor --
+cheap with an argument bound to an indexed value, unbounded with nothing
+bound -- so its own run-time refusal honours the same escape hatch
+DECLARE-FUNCTOR-COST-UNBOUNDED's static one does (GH #334).")
 
 (defun %deadline (seconds)
   "Translate a timeout in SECONDS into an INTERNAL-REAL-TIME deadline (or nil)."
@@ -919,6 +981,46 @@ resource bound is exceeded.  A no-op when no bound is in effect."
 ;;; the same way, since the tag lives on the functor itself.
 ;;; ---------------------------------------------------------------------------
 
+(define-condition prolog-cost-unbounded-error (prolog-error)
+  ((functor :initarg :functor :reader prolog-cost-unbounded-functor))
+  (:report
+   (lambda (c s)
+     (format s "Goal ~(~a~) is cost-unbounded: %TICK cannot preempt ~
+                inside one functor call, so :MAX-INFERENCES/:TIMEOUT ~
+                cannot bound it.  Run without resource bounds, or pass ~
+                :ALLOW-COST-UNBOUNDED T to accept the risk (GH #285)."
+             (prolog-cost-unbounded-functor c))))
+  (:documentation "A resource-bounded SELECT refused a goal the rails
+cannot actually bound (GH #285)."))
+
+(defun %static-goal-functors (goals)
+  "The NAME/ARITY functor symbols named by GOALS, walking the control
+constructs (and/or/not/if/when/unless).  Conservative and static: a
+meta-call through a variable is invisible here, exactly as it is to the
+compile-time path (GH #285, #279)."
+  (let ((acc '()))
+    (labels ((walk (goal)
+               (when (and (consp goal) (symbolp (first goal)))
+                 (let ((head (first goal)))
+                   (if (member head '(and or not if when unless))
+                       (mapc #'walk (rest goal))
+                       (push (make-functor-symbol head
+                                                  (length (rest goal)))
+                             acc))))))
+      (mapc #'walk goals))
+    acc))
+
+(defun %refuse-cost-unbounded (functors)
+  "Signal for the first cost-unbounded functor in FUNCTORS when a
+resource bound is in effect and the query did not opt out (GH #285).
+Reads *ALLOW-COST-UNBOUNDED*, which SELECT binds, so this static refusal
+and a functor's own run-time one answer to one value (GH #334)."
+  (when (and (not *allow-cost-unbounded*)
+             (or *inference-budget* *query-deadline*))
+    (dolist (f functors)
+      (when (functor-cost-unbounded-p f)
+        (error 'prolog-cost-unbounded-error :functor f)))))
+
 (define-condition prolog-permission-error (prolog-error)
   ()
   (:documentation "Signaled when a goal attempts a side effect (:write, :eval or
@@ -958,7 +1060,12 @@ flat list of the single var's values rather than a list of tuples), :LIMIT,
 and :SKIP.  :MAX-INFERENCES bounds the number of inference steps and :TIMEOUT
 bounds the wall-clock seconds; exceeding either aborts the query with a
 PROLOG-RESOURCE-ERROR (both default to the *DEFAULT-INFERENCE-BUDGET* /
-*DEFAULT-QUERY-TIMEOUT* globals, which are nil = unlimited).  :EFFECTS sets the
+*DEFAULT-QUERY-TIMEOUT* globals, which are nil = unlimited).  When either
+bound is in effect, a goal naming a COST-UNBOUNDED functor (one %TICK
+cannot preempt mid-call -- REGEX-MATCH/2, and anything
+DECLARE-FUNCTOR-COST-UNBOUNDED classifies) is refused up front with
+PROLOG-COST-UNBOUNDED-ERROR; pass :ALLOW-COST-UNBOUNDED T to accept
+that the bound cannot cover it (GH #285).  :EFFECTS sets the
 side-effect policy -- T (all, the default) or a list of permitted tags drawn
 from (:write :eval :io); a disallowed effect aborts with a
 PROLOG-PERMISSION-ERROR.  Reads and pure logic are always allowed, so
@@ -967,6 +1074,8 @@ of solutions instead of the list, consing nothing per solution (see
 SELECT-COUNT).  :SNAPSHOT t runs the query under one consistent MVCC read
 snapshot, so all of its reads resolve at a single epoch -- stable against
 concurrent writers (it inherits an enclosing transaction if one is active).
+:AS-OF EPOCH runs the query as of that epoch (GH #115, WITH-AS-OF) -- exclusive
+with :SNAPSHOT; :IF-REAPED :SKIP skips reaped versions instead of signalling.
 :CALLBACK FN streams each result row to FN as it is produced (consing nothing
 onto a result list) and returns the number of rows -- for unbounded or very
 large result sets.  Returns a list of solutions (or, with :COUNT or :CALLBACK, a
@@ -977,7 +1086,10 @@ SELECT-FIRST for common shorthands."
   (let* ((goals (replace-?-vars goals))
          (options (plist-alist options)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            ;; New functor per invocation (GH #322): DEFINE T so
+            ;; this never resolves onto an existing functor.
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -996,10 +1108,16 @@ SELECT-FIRST for common shorthands."
             (*allowed-effects* ,(if (assoc :effects options)
                                     `',(cdr (assoc :effects options))
                                     '*default-allowed-effects*))
+            (*allow-cost-unbounded* ,(cdr (assoc :allow-cost-unbounded
+                                                 options)))
             (*select-count-only* ,(cdr (assoc :count options)))
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
             (functor (make-functor :name *functor* :clauses nil)))
+       ;; A resource-bounded query must not carry a goal the rails
+       ;; cannot bound (GH #285).  Static over the goal list; checked
+       ;; at runtime because the budgets default from runtime globals.
+       (%refuse-cost-unbounded ',(%static-goal-functors goals))
        (unwind-protect
             (let ((func
                    (lambda (cont)
@@ -1021,14 +1139,28 @@ SELECT-FIRST for common shorthands."
                        (undefined-function (condition)
                          (error 'prolog-error :reason condition))))))
               (set-functor-fn *functor* func)
-              ,(if (cdr (assoc :snapshot options))
-                   ;; Run the query under one consistent MVCC read snapshot:
-                   ;; all reads resolve at a single epoch (lock-free, stable
-                   ;; against concurrent writers).  Inherits an enclosing
-                   ;; transaction if one is already active.
-                   `(call-with-read-snapshot
-                     (lambda () (funcall func #'prolog-ignore)) *graph*)
-                   `(funcall func #'prolog-ignore)))
+              ,(let ((as-of (cdr (assoc :as-of options)))
+                     (snapshot (cdr (assoc :snapshot options))))
+                 (when (and as-of snapshot)
+                   (error ":SNAPSHOT and :AS-OF are exclusive on SELECT ~
+(GH #115)"))
+                 (cond
+                   (as-of
+                    ;; GH #115: the query at a named epoch.
+                    `(call-with-read-snapshot
+                      (lambda () (funcall func #'prolog-ignore)) *graph*
+                      :as-of ,as-of
+                      :if-reaped ,(or (cdr (assoc :if-reaped options))
+                                      :error)))
+                   (snapshot
+                    ;; Run the query under one consistent MVCC read
+                    ;; snapshot: all reads resolve at a single epoch
+                    ;; (lock-free, stable against concurrent writers).
+                    ;; Inherits an enclosing transaction if one is
+                    ;; already active.
+                    `(call-with-read-snapshot
+                      (lambda () (funcall func #'prolog-ignore)) *graph*))
+                   (t `(funcall func #'prolog-ignore)))))
          (progn
            (delete-functor functor)
            (release-prolog-symbol top-level-query)))
@@ -1072,7 +1204,8 @@ goals like (trigger ...) or (retract ...)."
   ((:entity Spot)(:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)

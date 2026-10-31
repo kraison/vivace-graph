@@ -8,9 +8,13 @@
 ;;; adding :synchronized to the table too would just double-lock the hottest
 ;;; read path in the engine.  Guard the ECL node-cache with its own lock; a
 ;;; no-op everywhere else.
+;; The cache's get-or-install must be atomic (GH #406): SBCL locks the
+;; table itself; the others take this mutex.  A CCL :SHARED table only
+;; serializes single operations (GH #425).
 (defmacro with-sl-cache-lock ((skip-list) &body body)
-  #+ecl `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
-  #-ecl `(progn ,@body))
+  #+(or ecl lispworks) `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
+  #+ccl `(ccl:with-lock-grabbed ((%sl-cache-lock ,skip-list)) ,@body)
+  #-(or ecl lispworks ccl) `(progn ,@body))
 
 ;;; On the lock-free implementations, MUTATORS coordinate through a striped
 ;;; per-node lock vector (%SL-LOCKS).  The one rule: a mutator that needs
@@ -278,6 +282,19 @@ garbage), but is cleared here too so both caches are dropped in one place."
   (with-sl-cache-lock (skip-list)
     (remhash addr (%sl-node-cache skip-list))))
 
+(defun %sl-cache-node (skip-list addr node)
+  "Cache NODE for ADDR unless another thread cached one first; return the
+cached node.  Two objects for one address go stale apart: a splice updates
+one's pointers and a writer walking the other retries forever (GH #406).
+Atomic everywhere: the table lock on SBCL, the cache mutex elsewhere."
+  (let ((table (%sl-node-cache skip-list)))
+    (with-sl-cache-lock (skip-list)
+      #+sbcl (sb-ext:with-locked-hash-table (table)
+               (or (gethash addr table)
+                   (setf (gethash addr table) node)))
+      #-sbcl (or (gethash addr table)
+                 (setf (gethash addr table) node)))))
+
 (defun read-skip-node (skip-list addr)
   (declare (type word addr))
   (if (= addr 0)
@@ -314,12 +331,10 @@ garbage), but is cleared here too so both caches are dropped in one place."
                         ;; binding *CACHE-ENABLED* to NIL really does force a
                         ;; fresh read (the profiler's cold-read workloads and
                         ;; any correctness-sensitive bypass depend on that).
-                        (when *cache-enabled*
-                          (setf (aref cache idx) node)
-                          (with-sl-cache-lock (skip-list)
-                            (setf (gethash addr (%sl-node-cache skip-list))
-                                  node)))
-                        node)))))))))
+                        (if *cache-enabled*
+                            (setf (aref cache idx)
+                                  (%sl-cache-node skip-list addr node))
+                            node))))))))))
 
 
 (defstruct
@@ -360,7 +375,8 @@ garbage), but is cleared here too so both caches are dropped in one place."
   ;; Explicit lock retained instead of :synchronized on NODE-CACHE itself: it
   ;; also covers ECLs predating that option, and :synchronized would be
   ;; redundant given this lock (GH #101).  See WITH-SL-CACHE-LOCK.
-  #+ecl (cache-lock (mp:make-lock))
+  #+(or ecl lispworks) (cache-lock (mp:make-lock))
+  #+ccl (cache-lock (ccl:make-lock))
   ;; ECL-only: a per-skip-list reader/writer lock (see WITH-SL-READ-LOCK /
   ;; WITH-SL-WRITE-LOCK).  Shared among concurrent readers, exclusive for writers.
   #+ecl (lock (make-rw-lock))
@@ -700,6 +716,13 @@ without re-grabbing, and the caller's unwind released it anyway."
                           skip-list
                           (loop for level from 0 to (1- top-level)
                                 collect (%sn-addr (aref preds level))))))
+                  ;; Re-read every locked pred's pointer BEFORE judging
+                  ;; (GH #406): the fresh read below sits behind the marked
+                  ;; tests, so a stale pred that led to a removed succ was
+                  ;; never refreshed and every retry found the same node.
+                  (loop for level from 0 to (1- top-level)
+                        do (get-node-pointer skip-list (aref preds level)
+                                             level))
                   (setq valid-p
                         (loop for level from 0 to (1- top-level)
                               always
@@ -826,6 +849,11 @@ none matched."
                             (values n lvl)
                             (values nil -1))))
            (unless node (return-from remove-from-skip-list nil))
+           ;; Refresh the preds before judging the node (GH #406): a
+           ;; stale pred that reaches an already-removed node would
+           ;; otherwise fail OK-TO-DELETE-P and loop here forever.
+           (loop for level from 0 to (1- (%sn-level node))
+                 do (get-node-pointer skip-list (aref preds level) level))
            (when (ok-to-delete-p skip-list node level-found)
              ;; Stripe-ordered locking (GH #294): the victim's stripe joins
              ;; the preds' in ONE sorted acquisition, and mark-and-splice

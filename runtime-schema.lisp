@@ -368,11 +368,16 @@ SLOTS are %NORMALIZE-SLOT-SPECS output; only :TYPE is forwarded to
    :metaclass (find-class 'node-class)))
 
 (defun %create-node-type (name slot-specs kind &key parents default-store
-                                                    keep-revisions)
+                                                    keep-revisions
+                                                    (record-p t))
   "Shared body of CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE.  %ENSURE-NODE-CLASS
 must run before %INSTALL-NODE-TYPE -- the latter requires the class to
-already exist, since it calls FINALIZE-INHERITANCE (GH #172, R4)."
+already exist, since it calls FINALIZE-INHERITANCE (GH #172, R4).
+RECORD-P NIL marks the type manifest-silent for this image (GH #381)."
   (let ((sym (%parse-schema-type-name name)))
+    (if record-p
+        (remhash sym *manifest-silent-types*)
+        (setf (gethash sym *manifest-silent-types*) t))
     ;; Before %RETARGET-SLOT-SPECS: the SYMBOL-argument path (a bare CL-
     ;; homed symbol) skips %PARSE-SCHEMA-TYPE-NAME's own string-path
     ;; package check, so interning slot names into SYM's package first
@@ -402,7 +407,7 @@ already exist, since it calls FINALIZE-INHERITANCE (GH #172, R4)."
       (find-class sym))))
 
 (defun create-vertex-type (name slot-specs &key parents default-store
-                                                keep-revisions)
+                                                keep-revisions (record-p t))
   "Runtime twin of DEF-VERTEX: build and register a vertex type from data
 instead of a macro form.  NAME is a symbol or a \"PACKAGE:NAME\" string --
 the package must already exist (see ENSURE-NAMESPACE); a missing one
@@ -413,19 +418,23 @@ type need not commit to placement at creation.  Redefining an existing
 name -- runtime- or source-defined -- follows ordinary CLOS class
 redefinition, with the #196 divergence warning when slot sets disagree
 across stores, exactly like re-evaluating DEF-VERTEX.  Returns the
-finalized class (GH #172, R4)."
+finalized class (GH #172, R4).  RECORD-P NIL (GH #381) writes no manifest
+TYPE row now or at any later store open -- for a consumer that keeps its
+own record; the default records, as ENSURE-NAMESPACE's does."
   (%create-node-type name slot-specs :vertex :parents parents
                      :default-store default-store
-                     :keep-revisions keep-revisions))
+                     :keep-revisions keep-revisions
+                     :record-p record-p))
 
 (defun create-edge-type (name slot-specs &key parents default-store
-                                              keep-revisions)
+                                              keep-revisions (record-p t))
   "Runtime twin of DEF-EDGE; see CREATE-VERTEX-TYPE for the shared
 semantics.  Also installs the NAME/2 and NAME/3 Prolog functors
-(GH #172, R4)."
+(GH #172, R4).  RECORD-P as CREATE-VERTEX-TYPE (GH #381)."
   (%create-node-type name slot-specs :edge :parents parents
                      :default-store default-store
-                     :keep-revisions keep-revisions))
+                     :keep-revisions keep-revisions
+                     :record-p record-p))
 
 ;;; ---------------------------------------------------------------------
 ;;; MATERIALIZE-SCHEMA (R3): the load-order answer

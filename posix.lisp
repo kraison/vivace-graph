@@ -235,6 +235,60 @@ Linux/x86-64 is 4 KiB, and this file is compiled on one host per target."
 (defun %posix-file-size-fd (fd)
   (%posix-lseek fd 0 +seek-end+))
 
+;; SEEK_DATA/SEEK_HOLE are OS-specific AND swapped between the two
+;; targets: Linux 3/4, Darwin 4/3 (GH #274).
+(defconstant +seek-data+ #+graph-db-posix-linux 3 #-graph-db-posix-linux 4)
+(defconstant +seek-hole+ #+graph-db-posix-linux 4 #-graph-db-posix-linux 3)
+
+(defconstant +enxio+ 6)                 ; Linux and Darwin agree
+
+(defun %posix-seek-data (fd pos)
+  "lseek(FD, POS, SEEK_DATA): the next data offset at or after POS, :END
+when there is none (ENXIO: at or past EOF, or inside a trailing hole),
+NIL when the filesystem has no SEEK_DATA (#438)."
+  (let* ((r (cffi:foreign-funcall "lseek" :int fd :long pos :int +seek-data+
+                                  :long))
+         (e (when (minusp r) (%errno))))
+    (cond ((not (minusp r)) r)
+          ((eql e +enxio+) :end)
+          (t nil))))
+
+(defun %posix-data-extents (path)
+  "PATH's data runs: (values EXTENTS LENGTH SUPPORTED-P), EXTENTS a list
+of (START . END) in file order.  SUPPORTED-P NIL means the filesystem
+has no SEEK_DATA and EXTENTS is NIL; a caller then treats the whole
+file as data (#434).  SEEK_DATA past the last run is ENXIO, the end of
+the walk, not a failure (#438).  Signals when PATH cannot be opened."
+  (let ((fd (%posix-open path 0)))      ; 0 = O_RDONLY on both targets
+    (unwind-protect
+         (let ((size (%posix-file-size-fd fd))
+               (extents '())
+               (pos 0))
+           (loop
+             (when (>= pos size)
+               (return (values (nreverse extents) size t)))
+             (let ((data (%posix-seek-data fd pos)))
+               (cond ((null data) (return (values nil size nil)))
+                     ((or (eq data :end) (>= data size))
+                      (return (values (nreverse extents) size t))))
+               (let ((hole (min size (%posix-lseek fd data +seek-hole+))))
+                 (push (cons data hole) extents)
+                 (setf pos hole)))))
+      (%posix-close fd))))
+
+(defun %posix-allocated-size (path)
+  "Bytes PATH actually occupies -- the sum of its data extents -- or NIL
+where the filesystem does not support the probe (caller falls back to
+the apparent size).  Sparse mmap stores report GiB of apparent size
+for MiB of data (GH #274)."
+  (handler-case
+      (multiple-value-bind (extents length supported)
+          (%posix-data-extents path)
+        (declare (ignore length))
+        (when supported
+          (loop for (start . end) in extents sum (- end start))))
+    (error () nil)))
+
 (defun %file-size (path)
   (with-open-file (s path :element-type '(unsigned-byte 8) :if-does-not-exist :error)
     (file-length s)))

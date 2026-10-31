@@ -31,6 +31,22 @@ identity tuple and live runs must be pairwise disjoint (GH #296)."
   (or (gethash parent *claim-families*)
       (error 'unknown-claim-family :parent parent)))
 
+(defun %register-claim-family (parent unary binary temporal-p)
+  "Register PARENT's family.  Re-declaring with the same UNARY and
+BINARY names replaces silently (a flipped :TEMPORAL included); different
+names signal CLAIM-FAMILY-CONFLICT and leave the entry as it was, since
+replacing it would orphan every existing claim of the family (GH #323)."
+  (let ((old (gethash parent *claim-families*)))
+    (when (and old
+               (not (and (eq (claim-family-unary old) unary)
+                         (eq (claim-family-binary old) binary))))
+      (error 'claim-family-conflict :parent parent
+             :existing (list (claim-family-unary old)
+                             (claim-family-binary old))
+             :proposed (list unary binary))))
+  (setf (gethash parent *claim-families*)
+        (%make-claim-family parent unary binary temporal-p)))
+
 ;;; RELATION and PRODUCER are canonical strings (GH #160).  Both are in
 ;;; the DEF-UNIQUE identity tuple and compared with EQUAL, so a second
 ;;; spelling of one name (:x, "X", " x") is a second claim, never an
@@ -59,6 +75,16 @@ string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
 (GH #160)."
   (%canonical-name-p value "/"))
 
+(defun canonical-namespace-p (value)
+  "True when VALUE is a canonical NAMESPACE: a keyword whose name is
+uppercase [A-Z0-9-]+, so the identity key's downcased spelling reads
+back as the same keyword (CLAIM-IDENTITY-KEY, %IDENTITY-KEY-NAMESPACE).
+The :CHECK behind both namespace slots (GH #327)."
+  (and (keywordp value)
+       (let ((name (symbol-name value)))
+         (and (string= name (string-upcase name))
+              (canonical-relation-p (string-downcase name))))))
+
 ;; Registered at load, so the :CHECK names below resolve in any image
 ;; that has this file before a tenant's DEF-CLAIM-CLASSES expands.  A
 ;; lambda, not #'..., so a redefined predicate takes effect immediately.
@@ -66,6 +92,8 @@ string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
  'canonical-relation-p (lambda (v) (canonical-relation-p v)))
 (graph-db:register-schema-function
  'canonical-producer-p (lambda (v) (canonical-producer-p v)))
+(graph-db:register-schema-function
+ 'canonical-namespace-p (lambda (v) (canonical-namespace-p v)))
 
 (defun %extent-open-p (e)
   (bound-unknown-p (extent-end e)))
@@ -131,7 +159,8 @@ identity tuple (GH #296, design §2.2)."
 
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
-                       :accessor claim-subject-namespace)
+                       :accessor claim-subject-namespace
+                       :check canonical-namespace-p)
     (subject-key :initarg :subject-key :accessor claim-subject-key)
     ;; Canonical strings, enforced at commit on every write path (GH #160).
     (relation :initarg :relation :accessor claim-relation
@@ -151,6 +180,11 @@ identity tuple (GH #296, design §2.2)."
     (transaction-extent-sexp :initarg :transaction-extent-sexp
                              :accessor claim-transaction-extent-sexp
                              :initform nil)
+    ;; The time->version mapping for :AS-OF (GH #300): stamped at every
+    ;; create and save; replicates with the claim, so an as-of read is
+    ;; node-local by construction and no epoch is ever exposed.
+    (version-stamp :initarg :version-stamp :accessor claim-version-stamp
+                   :initform nil)
     (geometry :initarg :geometry :accessor claim-geometry :initform nil)
     ;; Registration outputs (#138).  PRECISION-M is metres, a real
     ;; quantity that flows in both directions -- a source can be finer
@@ -226,6 +260,15 @@ unstamped\" (design, Stamping; GH #148 review)."
          (extent->sexp (%open-transaction-extent (%st-now)))
          args))
 
+(defun %claim-encode-version-stamp (args)
+  "ARGS with :VERSION-STAMP defaulted to now -- the creation half of the
+time->version mapping :AS-OF walks (GH #300); SAVE's :BEFORE method is
+the update half.  A caller-supplied stamp (replication, restore) passes
+through untouched."
+  (if (%plist-key-p args :version-stamp)
+      args
+      (list* :version-stamp (%st-now) args)))
+
 (defun %claim-encode-transaction-arg (args)
   "Rewrite a claim constructor's ARGS so the transaction axis is always
 populated: :TRANSACTION-EXTENT and :RECORDED-AT are encoded to
@@ -283,12 +326,31 @@ claim (design §3.1, GH #131 finding 1)."
 
 (defparameter +claim-object-slots+
   '((object-namespace :initarg :object-namespace
-                      :accessor claim-object-namespace)
+                      :accessor claim-object-namespace
+                      :check canonical-namespace-p)
     (object-key :initarg :object-key :accessor claim-object-key))
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
-(defmacro def-claim-classes (parent graph-name &key extra-slots temporal)
+;;; The two shipped edge classes (GH #369, spec sec.3).  Direction is
+;;; claim -> endpoint.  No default store: MAKE-SUBJECT-OF / MAKE-
+;;; OBJECT-OF refuse without :GRAPH, and the wrapper always passes the
+;;; claim's own graph.  No slots, no identity, no index: the edge is a
+;;; cache of one resolution; the (namespace, key) slots stay the truth.
+(graph-db:def-edge subject-of () () nil)
+(graph-db:def-edge object-of () () nil)
+
+(defvar *link-claims-at-write* t
+  "When true (the default) every MAKE-<claim> links its endpoints in the
+same transaction (spec sec.4).  Bind to NIL around a bulk load to write
+claims key-only and LINK-CLAIM-ENDPOINTS afterwards; the sec.9
+measurement toggles it (GH #372).  Trap: a given :SUBJECT-NODE /
+:OBJECT-NODE is then still VERIFIED -- ENDPOINT-MISMATCH still fails the
+write -- but not linked; the sweep links it later.")
+
+(defmacro def-claim-classes (parent graph-name
+                             &key extra-slots temporal
+                                  (keep-revisions (1- (expt 2 32))))
   "Define PARENT and its UNARY/BINARY subclasses in GRAPH-NAME, and register
 the family.  The subsystem cannot ship these classes: DEF-VERTEX binds a node
 type to a graph name and class names are globally unique, so a shipped class
@@ -325,9 +387,16 @@ fast-fail with the better error site.
 joins both identity tuples (EXTENT-SEXP-START-KEY), an extent is required
 at construction and at commit, and live claims sharing a base tuple must
 have pairwise disjoint validity (spacetime/temporal.lisp).  Same
-declaration names, so flipping the flag re-declares rather than stacks."
-  (let* ((unary (intern (format nil "~A-UNARY" parent)))
-         (binary (intern (format nil "~A-BINARY" parent)))
+declaration names, so flipping the flag re-declares rather than stacks.
+
+Every MAKE-<NAME> also accepts :SUBJECT-NODE and :OBJECT-NODE, endpoint
+nodes the caller resolved BEFORE its transaction (RESOLVE-ENDPOINT);
+each is verified and linked, and a same-store endpoint not given is
+linked automatically (GH #369, spec sec.4).  Linking never fails the
+write; ENDPOINT-MISMATCH on a wrong node does."
+  (let* ((home (symbol-package parent))
+         (unary (intern (format nil "~A-UNARY" parent) home))
+         (binary (intern (format nil "~A-BINARY" parent) home))
          (extent-slot (when temporal '(extent-sexp)))
          (unary-slots (append '(producer subject-namespace subject-key
                                 relation)
@@ -344,9 +413,14 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (graph-db:def-vertex ,parent ()
            (,@+claim-shared-slots+ ,@extra-slots)
          ,graph-name)
-       (graph-db:def-vertex ,unary (,parent) () ,graph-name)
+       ;; :KEEP-REVISIONS on the arities retains the version chain the
+       ;; :AS-OF read walks (GH #300); default effectively unbounded --
+       ;; the ongoing-run rewrite costs tens of MB/year on the busiest
+       ;; tenant, accepted in the #300 design.
+       (graph-db:def-vertex ,unary (,parent) () ,graph-name
+         :keep-revisions ,keep-revisions)
        (graph-db:def-vertex ,binary (,parent) (,@+claim-object-slots+)
-           ,graph-name)
+           ,graph-name :keep-revisions ,keep-revisions)
        ;; The closed vocabulary, enforced on every write path -- not only at
        ;; construction, where CHECK-STANDING alone left it (GH #149).
        ;; :ONE-OF is evaluated, so this names +STANDINGS+ rather than
@@ -405,31 +479,73 @@ declaration names, so flipping the flag re-declares rather than stacks."
            ,graph-name :name claim-object)
        (graph-db:def-index ,parent (producer) ,graph-name
                            :name claim-producer)
-       (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
+       ;; (subject relation) queries ride this instead of filtering the
+       ;; whole endpoint result caller-side (GH #302).
+       (graph-db:def-index ,parent (subject-namespace subject-key
+                                    relation)
+           ,graph-name :name claim-subject-relation)
+       ;; The vocabulary listing skips to distinct relations (GH #350);
+       ;; kept as the as-of path's relation source (GH #361 R6).
+       (graph-db:def-index ,parent (relation) ,graph-name
+                           :name claim-relation)
+       ;; Counting indexes (GH #361 §3.1): the vocabulary is a lookup.
+       ;; The object index on BINARY, like CLAIM-OBJECT above.
+       ;; CLAIM-CURRENT-P is stored as a symbol and funcalled at
+       ;; maintenance, so claim-query.lisp loading later is not a
+       ;; forward reference.
+       (graph-db:def-count-index ,parent (subject-namespace subject-key)
+           ,graph-name :name claim-subject-count
+           :current-p claim-current-p)
+       (graph-db:def-count-index ,binary (object-namespace object-key)
+           ,graph-name :name claim-object-count
+           :current-p claim-current-p)
+       (graph-db:def-count-index ,parent (relation) ,graph-name
+           :name claim-relation-count :current-p claim-current-p)
+       (fmakunbound ',(intern (format nil "MAKE-~A" parent) home))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
        ,@(mapcar
           (lambda (class identity-keys)
-            (let ((ctor (intern (format nil "MAKE-~A" class))))
+            (let ((ctor (intern (format nil "MAKE-~A" class) home)))
               `(let ((%raw (fdefinition ',ctor)))
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
                          (%check-claim-identity args ',identity-keys)
-                         (let ((args (%claim-encode-extent-arg args)))
+                         ;; Endpoint nodes the caller resolved (spec
+                         ;; sec.4.2); stripped before the raw ctor.
+                         (let* ((subject-node (getf args :subject-node))
+                                (object-node (getf args :object-node))
+                                (args (%strip-endpoint-node-args
+                                       (%claim-encode-extent-arg args))))
                            ,@(when temporal
                                `((unless (getf args :extent-sexp)
                                    (error 'missing-claim-identity-component
                                           :slot :extent))))
                            (let ((c (apply %raw
-                                          (%claim-encode-transaction-arg
-                                           args))))
+                                          (%claim-encode-version-stamp
+                                           (%claim-encode-transaction-arg
+                                            args)))))
                              (check-standing (claim-standing c))
-                             c)))))))
+                             ;; Derived edges, in the same transaction
+                             ;; (GH #369, spec sec.4.1); a bulk loader
+                             ;; may defer them to the sweep, but a given
+                             ;; node is verified either way (GH #372).
+                             (%link-claim-at-write
+                              c :subject-node subject-node
+                                :object-node object-node
+                                :verify-only
+                                (not *link-claims-at-write*)))))))))
           (list unary binary)
           (list +claim-identity-slots+
                 (append +claim-identity-slots+
                         +claim-object-identity-slots+)))
-       (setf (gethash ',parent *claim-families*)
-             (%make-claim-family ',parent ',unary ',binary
-                                 ,(and temporal t)))
+       ;; The update half of the :AS-OF stamp (GH #300): every
+       ;; copy/setf/SAVE re-stamps.  Replication's direct UPDATE-NODE
+       ;; path bypasses this deliberately -- remote state keeps its
+       ;; remote stamp.
+       (defmethod graph-db:save :before ((c ,parent) &key graph)
+         (declare (ignore graph))
+         (setf (claim-version-stamp c) (%st-now)))
+       (%register-claim-family ',parent ',unary ',binary
+                               ,(and temporal t))
        ',parent))))

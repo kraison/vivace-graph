@@ -696,6 +696,13 @@ with a fresh :TIME that lies to DESCRIBE-SCHEMA's :SINCE (GH #172,
 review round 1, M-1).  ENSURE-NAMESPACE's :RECORD-P is the same rule
 for namespace rows.")
 
+(defvar *manifest-silent-types* (make-hash-table :test 'eq)
+  "Type names created with :RECORD-P NIL (CREATE-VERTEX-TYPE /
+CREATE-EDGE-TYPE, GH #381): no manifest TYPE row at creation and none
+when a store later instantiates the type, so a consumer that keeps its
+own record leaves no orphan rows.  Consulted at the one append choke
+point; cleared when the type is re-created with the default.")
+
 (defun %schema-manifest-append-if-changed (name record)
   "Append RECORD unless it is EQUAL, ignoring :TIME, to the last row
 this image wrote for NAME under the current *SYSTEM-DIRECTORY* -- a
@@ -712,7 +719,8 @@ this fix, every reopen kept retrying instead (GH #172, review round
 directory not yet seen this image is seeded from its on-disk rows
 first, so a fresh image's first call compares against the FILE, not an
 empty cache (review round 3, I-1)."
-  (when *record-manifest-rows*
+  (when (and *record-manifest-rows*
+             (not (gethash name *manifest-silent-types*)))
     (with-lock-held (*schema-manifest-lock*)
       (%seed-schema-manifest-cache)
       (let* ((key (cons name *system-directory*))

@@ -1,6 +1,11 @@
 // Tiny JSON fetch wrapper (GH #270).  Every failure -- a network
 // error or an {error, message} body -- rejects with an ApiError whose
 // .message carries the server's text verbatim.
+//
+// Paths are RELATIVE ("api/...", no leading slash): they resolve
+// against the page's URL, so the same build serves at / and mounted
+// under a host listener's prefix (GH #384; the server redirects a
+// slashless mount root so the base is always a directory).
 
 export class ApiError extends Error {
   constructor(message, { code = "network-error", status = 0 } = {}) {
@@ -35,13 +40,13 @@ async function request(path, options = {}) {
 }
 
 const graphPath = (name, tail) =>
-  `/api/graphs/${encodeURIComponent(name)}/${tail}`;
+  `api/graphs/${encodeURIComponent(name)}/${tail}`;
 
 export const api = {
   // What this server offers (GH #279): server-level, fetched once at
   // boot, before any graph exists to ask about.
-  capabilities: () => request("/api/capabilities"),
-  graphs: () => request("/api/graphs"),
+  capabilities: () => request("api/capabilities"),
+  graphs: () => request("api/graphs"),
   openGraph: (name) =>
     request(graphPath(name, "open"), { method: "POST" }),
   closeGraph: (name) =>

@@ -9,8 +9,285 @@ claim with no extent makes no validity statement and never matches."
   (let ((e (claim-extent claim)))
     (and e (not (extents-disjoint-p e probe)))))
 
+(defun %identity-key-field (x)
+  "One identity-tuple field rendered for CLAIM-IDENTITY-KEY: strings pass
+escaped (\\ then |), keywords/symbols as :lowercase-name, integers as
+decimals, anything else via PRIN1.  Keys are canonically strings here;
+the escapes make the join injective for them."
+  (flet ((esc (str)
+           (with-output-to-string (out)
+             (loop for ch across str do
+               (when (or (char= ch #\\) (char= ch #\|))
+                 (write-char #\\ out))
+               (write-char ch out)))))
+    (etypecase x
+      (string (esc x))
+      (symbol (format nil ":~(~a~)" (symbol-name x)))
+      (integer (format nil "~d" x))
+      (t (esc (prin1-to-string x))))))
+
+(defun claim-identity-key (claim)
+  "CLAIM's identity tuple as one canonical string: producer, subject
+namespace and key, relation, the object pair for a binary claim, and --
+for a temporal family -- the extent START exactly as the identity tuple
+canonicalises it (EXTENT-SEXP-START-KEY).  Equal identity tuples render
+STRING= keys; the key survives retraction, re-assertion and
+regeneration, which node ids do not (GH #303).  Fields join on |, with
+| and \\ escaped inside string fields."
+  (let* ((family (or (find-if (lambda (f)
+                                (typep claim (claim-family-parent f)))
+                              (alexandria:hash-table-values
+                               *claim-families*))
+                     ;; :PARENT is the condition's only initarg; :NAME left
+                     ;; it unbound, so the report signalled (GH #335).
+                     (error 'unknown-claim-family
+                            :parent (class-name (class-of claim)))))
+         (binary-p (typep claim (claim-family-binary family)))
+         (fields
+           (append
+            (list (%identity-key-field (claim-producer claim))
+                  (%identity-key-field (claim-subject-namespace claim))
+                  (%identity-key-field (claim-subject-key claim)))
+            (when binary-p
+              (list (%identity-key-field (claim-object-namespace claim))
+                    (%identity-key-field (claim-object-key claim))))
+            (list (%identity-key-field (claim-relation claim)))
+            (when (claim-family-temporal-p family)
+              (list (let ((*print-case* :downcase))
+                      (prin1-to-string
+                       (extent-sexp-start-key
+                        (claim-extent-sexp claim)))))))))
+    (format nil "~{~a~^|~}" fields)))
+
+(defun %split-identity-key-fields (key)
+  "KEY's fields: split on unescaped |, with \\| and \\\\ unescaped."
+  (let ((fields '()) (buf (make-string-output-stream))
+        (i 0) (n (length key)))
+    (loop while (< i n) do
+      (let ((ch (char key i)))
+        (cond ((char= ch #\\)
+               (when (= (1+ i) n)
+                 (error 'malformed-claim-identity-key :key key))
+               (write-char (char key (1+ i)) buf)
+               (incf i 2))
+              ((char= ch #\|)
+               (push (get-output-stream-string buf) fields)
+               (incf i))
+              (t (write-char ch buf) (incf i)))))
+    (push (get-output-stream-string buf) fields)
+    (nreverse fields)))
+
+(defun %identity-key-namespace (field key)
+  "FIELD as the keyword %IDENTITY-KEY-FIELD rendered, else signal.
+Validated before interning: only a canonical name ([a-z0-9-]+, the
+RELATION rule) is interned, so a caller-supplied string cannot mint an
+arbitrary keyword through this path -- KEYWORD symbols are never
+collected.  The encoder downcases symbol names, so a non-canonical
+namespace never round-trips anyway (GH #321)."
+  (let ((name (and (> (length field) 1) (char= (char field 0) #\:)
+                   (subseq field 1))))
+    (if (and name (canonical-relation-p name))
+        (intern (string-upcase name) :keyword)
+        (error 'malformed-claim-identity-key :key key))))
+
+(defun %identity-key-extent-start (field key)
+  "FIELD read back as EXTENT-SEXP-START-KEY data, *READ-EVAL* off."
+  (handler-case
+      (with-standard-io-syntax
+        (let ((*read-eval* nil)
+              (*package* (find-package :graph-db.spacetime)))
+          (read-from-string field)))
+    (error () (error 'malformed-claim-identity-key :key key))))
+
+(defun split-claim-identity-key (key)
+  "The inverse of CLAIM-IDENTITY-KEY (GH #321): (VALUES PRODUCER
+SUBJECT-NAMESPACE SUBJECT-KEY RELATION OBJECT-NAMESPACE OBJECT-KEY
+EXTENT-START), NIL for the fields a unary or non-temporal key lacks.
+Arity and temporality follow from the field count -- 4, 5, 6 or 7 --
+so the string alone suffices.  Namespaces come back as keywords, keys
+and relations as strings (an integer key encodes as its decimal string
+and decodes as one), EXTENT-START as EXTENT-SEXP-START-KEY's data.  The
+escape rule lives here and in %IDENTITY-KEY-FIELD, nowhere else.
+Signals MALFORMED-CLAIM-IDENTITY-KEY for any other shape."
+  (let* ((fields (%split-identity-key-fields key))
+         (n (length fields)))
+    (unless (<= 4 n 7)
+      (error 'malformed-claim-identity-key :key key))
+    (let* ((binary-p (>= n 6))
+           (temporal-p (oddp n))
+           (after-subject (cdddr fields))
+           (object-namespace (and binary-p
+                                  (%identity-key-namespace
+                                   (first after-subject) key)))
+           (object-key (and binary-p (second after-subject)))
+           (tail (if binary-p (cddr after-subject) after-subject)))
+      (values (first fields)
+              (%identity-key-namespace (second fields) key)
+              (third fields)
+              (first tail)
+              object-namespace
+              object-key
+              (and temporal-p
+                   (%identity-key-extent-start (second tail) key))))))
+
+(defstruct (reaped-claim (:constructor %make-reaped-claim (id)))
+  "An :AS-OF answer the store can no longer give: the claim existed at
+the asked instant, but every version stamped then is past the family's
+:KEEP-REVISIONS window and reaped.  Reported, never silently substituted
+(GH #300)."
+  id)
+
+(defun claim-commit-epoch (claim)
+  "The epoch of the transaction that committed CLAIM's version, or NIL
+for a REAPED-CLAIM (a version the store no longer holds) and for a
+version not yet committed -- an epoch is assigned at commit, so a claim
+read inside its own open transaction has none.  The number is the
+writer's own TRANSACTION-ID, comparable across stores only while they
+share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH #347)."
+  (unless (reaped-claim-p claim)
+    (let ((e (graph-db:commit-epoch claim)))
+      (and (plusp e) e))))
+
+(define-condition epoch-axis-unavailable
+    (graph-db:query-precondition-error)
+  ((graph-name :initarg :graph-name
+               :reader epoch-axis-unavailable-graph-name))
+  (:documentation "An :AS-OF-EPOCH read of a store with no system clock.
+Its epochs are a private counter, so an answer would look like the
+attached case and mean something unrelated (GH #347 recon E9).  The
+parent's REASON is filled at the signal site.  The rules subsystem
+handles QUERY-PRECONDITION-ERROR as \"no facts\"; a reader there that
+ever takes the epoch axis must let this subtype through."))
+
+(defun %refuse-epoch-axis (graph)
+  "Signal EPOCH-AXIS-UNAVAILABLE unless GRAPH is attached to a clock.
+Whether two stores share ONE clock is the consumer's precondition; a
+single-store reader cannot see the other store."
+  (unless (graph-db:graph-system-clock graph)
+    (let ((name (graph-db:graph-name graph)))
+      (error 'epoch-axis-unavailable
+             :graph-name name
+             :reason (format nil "~(~s~) has no system clock; ~
+                                  :as-of-epoch needs one"
+                             name)))))
+
+(defun %claim-effective-stamp (version)
+  "VERSION's place on the wall clock: its :AS-OF stamp, else the start of
+its (immutable) transaction extent, else NIL for a claim predating both
+axes -- treated as arbitrarily old."
+  (or (claim-version-stamp version)
+      (let ((te (claim-transaction-extent version)))
+        (when te
+          (let ((b (extent-start te)))
+            (let ((e (bound-earliest b)))
+              (unless (eq e :unbounded) e)))))))
+
+(defun %claim-as-of (graph claim at)
+  "The version of CLAIM believed AT (a TIMESTAMP), or NIL when the claim
+was not believed then (not yet created, or already retracted), or a
+REAPED-CLAIM when it existed but every version of that age is reaped.
+Walks VERTEX-HISTORY newest-first over the family's retained chain."
+  (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
+         (instant (make-instant (exact-bound at)))
+         (resolved
+           (loop for (version . nil) in history
+                 for stamp = (%claim-effective-stamp version)
+                 when (or (null stamp)
+                          (not (local-time:timestamp< at stamp)))
+                   return version)))
+    (cond
+      (resolved
+       ;; Believed at AT only while AT falls inside that version's
+       ;; transaction period: a retraction closes it, so an instant
+       ;; after the close resolves to the retracted version and drops
+       ;; here.  A NIL extent predates the axis: indeterminate, kept.
+       (let ((te (claim-transaction-extent resolved)))
+         (if (or (null te) (not (extents-disjoint-p te instant)))
+             resolved
+             nil)))
+      ((null history) nil)
+      (t
+       ;; No retained version is old enough.  The immutable transaction
+       ;; start on ANY version says whether the claim existed at AT.
+       (let ((te (claim-transaction-extent (car (first history)))))
+         (cond ((null te) (%make-reaped-claim (graph-db:id claim)))
+               ((let ((e (bound-earliest (extent-start te))))
+                  (and (not (eq e :unbounded))
+                       (local-time:timestamp< at e)))
+                nil)                    ; did not exist yet
+               (t (%make-reaped-claim (graph-db:id claim)))))))))
+
+(defun %claim-as-of-epoch (graph claim epoch)
+  "The version of CLAIM live at EPOCH -- committed at or before it and
+not retracted at or before it -- or NIL when there is none (created
+after EPOCH, or retracted by then), or a REAPED-CLAIM when versions of
+that age existed but are past the family's :KEEP-REVISIONS window.
+Walks VERTEX-HISTORY newest-first comparing each version's own commit
+epoch with <=; RESOLVE-VERSION-AT-EPOCH is a strict snapshot-start
+predicate and would drop the commit made AT EPOCH (#347 recon C2, C3).
+A retraction is a version, so CLAIM-CURRENT-P on the selected version
+is the whole retraction test (recon E4).  A claim created with an
+already-closed transaction period -- a replicated or restored belief
+retracted upstream -- reads as retracted at every epoch; there is no
+epoch-to-instant map to probe its period with."
+  (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
+         (resolved (loop for (version . e) in history
+                         when (<= e epoch) return version)))
+    (cond (resolved (and (claim-current-p resolved) resolved))
+          ((null history) nil)
+          ;; Nothing old enough.  Reaping severs the chain, so only the
+          ;; oldest retained REVISION tells created-after-EPOCH (0: it
+          ;; is the create) from reaped (> 0) -- recon C4.  REVISION is
+          ;; 32-bit and wraps; after 2^32 updates to one claim the
+          ;; discriminator reads a wrapped 0 as the create.
+          ((zerop (graph-db:revision (car (first (last history))))) nil)
+          (t (%make-reaped-claim (graph-db:id claim))))))
+
+(defun %paginate (list limit offset)
+  "LIST cut to OFFSET/LIMIT; second value T when entries existed past the
+cut (the REST envelope's one-past-the-cap rule, GH #302)."
+  (let* ((start (min (or offset 0) (length list)))
+         (rest (nthcdr start list)))
+    (if limit
+        (values (subseq rest 0 (min limit (length rest)))
+                (> (length rest) limit))
+        (values rest nil))))
+
+(defun %narrow-claims (graph claims &key current probe relation
+                                         as-of as-of-epoch limit offset)
+  "The shared tail of CLAIMS-TOUCHING and NODE-CLAIMS (GH #369): resolve
+the transaction axis (:AS-OF / :AS-OF-EPOCH), then filter currency
+(:CURRENT), validity (PROBE, an extent), and RELATION, then paginate.
+A REAPED-CLAIM survives every filter -- it is the record that a version
+existed, not a candidate to judge (GH #300)."
+  (let ((all claims))
+    (cond (as-of
+           (setf all (loop for c in all
+                           for v = (%claim-as-of graph c as-of)
+                           when v collect v)))
+          (as-of-epoch
+           (setf all (loop for c in all
+                           for v = (%claim-as-of-epoch graph c as-of-epoch)
+                           when v collect v))))
+    (when current
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c) (claim-current-p c)))
+                               all)))
+    (when probe
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c)
+                                     (%claim-validity-touches-p c probe)))
+                               all)))
+    (when relation
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c)
+                                     (equal relation (claim-relation c))))
+                               all)))
+    (%paginate all limit offset)))
+
 (defun claims-touching (graph claim-class namespace key
-                        &key (role :either) current at during)
+                        &key (role :either) current at during
+                             relation limit offset as-of as-of-epoch)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -28,22 +305,64 @@ orthogonal to :CURRENT (validity vs transaction time, GH #148), both
 exclude a claim with no extent, and both filter the candidates the
 endpoint index already bounded (GH #296, design §2.5).
 
+:AS-OF (a TIMESTAMP) answers on the TRANSACTION axis (GH #300): each
+claim is returned AS THE VERSION believed at that instant -- an in-place
+update after AS-OF is unwound to the earlier version, a claim retracted
+before AS-OF drops out, one not yet created drops out, and one whose
+versions of that age are reaped past the family's :KEEP-REVISIONS window
+appears as a REAPED-CLAIM, never as a silently-substituted newer
+version.  :AT/:DURING then filter the RESOLVED version's validity.  No
+argument or result is an epoch; the mapping is the per-version stamp in
+the claim's own data, so replicas answer from their own applied history.
+
+:AS-OF-EPOCH (an integer) answers on the same axis by commit epoch (GH
+#347): each claim is the version whose committing transaction id is the
+newest at or below it, dropped when that version is retracted, and a
+REAPED-CLAIM when older versions existed but are past :KEEP-REVISIONS
+-- told from \"created after\" by the oldest retained REVISION.  Epochs
+compare across stores only while the stores share one SYSTEM-CLOCK; a
+clockless store signals EPOCH-AXIS-UNAVAILABLE.  One of :AS-OF or
+:AS-OF-EPOCH, not both.  :CURRENT is redundant on this axis: only
+versions still believed are ever selected.
+
+:RELATION (a canonical string) restricts to one relation; on the subject
+side it rides the (subject-namespace subject-key relation) index (GH
+#302), on the object side it filters the endpoint candidates.  :LIMIT /
+:OFFSET cut the FINAL filtered result; the second return value is T when
+more claims existed past the cut (NIL without :LIMIT).
+
+Inside an open transaction the answer is what THAT transaction will
+commit (GH #324): its own retractions, updates and new claims are
+visible, so retract-then-assert on one series reads correctly before
+the commit.  :AS-OF and :AS-OF-EPOCH are the exceptions -- they answer
+committed history only; an uncommitted change is not yet history and
+has no epoch at all.
+
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
 subsystem exists to keep those two cases from being confused."
   (check-type role (member :subject :object :either))
   (check-type at (or null local-time:timestamp))
   (check-type during (or null temporal-extent))
+  (check-type as-of-epoch (or null unsigned-byte))
   (when (and at during)
     (error "Pass only one of :AT or :DURING, not both."))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((probe (cond (at (make-instant (exact-bound at)))
                       (during during)))
          (family (claim-family claim-class))
          (want (list namespace key))
          (subjects (when (member role '(:subject :either))
-                     (graph-db:index-lookup
-                      graph (claim-family-parent family)
-                      '(subject-namespace subject-key) want)))
+                     (if relation
+                         (graph-db:index-lookup
+                          graph (claim-family-parent family)
+                          '(subject-namespace subject-key relation)
+                          (list namespace key relation))
+                         (graph-db:index-lookup
+                          graph (claim-family-parent family)
+                          '(subject-namespace subject-key) want))))
          (objects (when (member role '(:object :either))
                     (graph-db:index-lookup
                      graph (claim-family-binary family)
@@ -54,13 +373,93 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
-      (when current
-        (setf all (remove-if-not #'claim-current-p all)))
-      (when probe
-        (setf all (remove-if-not (lambda (c)
-                                   (%claim-validity-touches-p c probe))
-                                 all)))
-      all)))
+      ;; No overlay of its own: INDEX-LOOKUP already answers as the
+      ;; open transaction will commit, and only committed history under
+      ;; :AS-OF / :AS-OF-EPOCH (GH #408, #411).
+      ;; The subject side already rode the relation index (GH #302); only
+      ;; the object side still needs the filter.
+      (%narrow-claims graph all
+                      :current current :probe probe
+                      :relation (and (member role '(:object :either))
+                                     relation)
+                      :as-of as-of :as-of-epoch as-of-epoch
+                      :limit limit :offset offset))))
+
+;;; Edges under claims: the adjacency reads (GH #369, spec sec.6.1).
+;;; Both see LINKED claims only; CLAIMS-TOUCHING is the complete read.
+
+(defun %linked-edge (claim graph type)
+  "CLAIM's first active outgoing TYPE edge in GRAPH, or NIL -- the one
+probe behind every \"is this endpoint linked?\" read (GH #369)."
+  (first (graph-db:outgoing-edges claim :graph graph :edge-type type)))
+
+(defun claim-endpoint (claim role &key (graph (graph-db::node-graph claim)))
+  "CLAIM's linked ROLE endpoint node -- :SUBJECT or :OBJECT -- from its
+outgoing SUBJECT-OF / OBJECT-OF edge in GRAPH (its own store), or NIL
+when that side is not linked: key-only, or a unary claim's object.  One
+adjacency probe; a reader that wants one side should not pay for two
+(GH #373).  A cross-store endpoint is read through
+LOOKUP-VERTEX-ANYWHERE, so it may be an UNRESOLVED-NODE marker while
+that store is detached.  Edges created in a still-open transaction are
+not visible until it commits (adjacency is indexed at commit apply)."
+  (check-type role (member :subject :object))
+  (let ((e (%linked-edge claim graph
+                         (if (eq role :subject) 'subject-of 'object-of))))
+    (when e
+      (graph-db:lookup-vertex-anywhere (graph-db:to e)))))
+
+(defun claim-endpoints (claim &key (graph (graph-db::node-graph claim)))
+  "CLAIM's linked endpoint nodes: (VALUES SUBJECT-NODE OBJECT-NODE) --
+CLAIM-ENDPOINT for both roles, with its contract for each (GH #369)."
+  (values (claim-endpoint claim :subject :graph graph)
+          (claim-endpoint claim :object :graph graph)))
+
+(defun node-claims (node &key (graph (graph-db::node-graph node))
+                              family (role :either) current relation
+                              at during as-of as-of-epoch limit offset)
+  "Claims linked to NODE, from its incoming SUBJECT-OF / OBJECT-OF edges
+in GRAPH -- the adjacency twin of CLAIMS-TOUCHING, with the same
+filters and the same meaning for each (GH #369, spec sec.6.1).  Linked
+claims only: a key-only claim is not here.  FAMILY (a parent class
+name) restricts to one family; default every family.
+
+GRAPH is the store holding the CLAIMS, not necessarily NODE's own --
+adjacency is indexed in the edge's store (edge.lisp, ADD-TO-VE-INDEX) --
+and defaults to NODE's store, which is the answer in a one-store
+deployment; pass the claim store when the two differ.  Inside an open
+transaction the adjacency walk sees the transaction's own edges and
+claims (GH #408), as CLAIMS-TOUCHING does (GH #324)."
+  (check-type role (member :subject :object :either))
+  (check-type at (or null local-time:timestamp))
+  (check-type during (or null temporal-extent))
+  (check-type as-of-epoch (or null unsigned-byte))
+  (when (and at during)
+    (error "Pass only one of :AT or :DURING, not both."))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
+  (let ((probe (cond (at (make-instant (exact-bound at)))
+                     (during during)))
+        (parent (and family (claim-family-parent (claim-family family))))
+        (claims '())
+        (seen (make-hash-table :test 'equalp)))
+    (flet ((collect (type)
+             (graph-db:map-edges
+              (lambda (e)
+                (let ((c (graph-db:lookup-vertex (graph-db:from e)
+                                                 :graph graph)))
+                  (when (and c
+                             (or (null parent) (typep c parent))
+                             (not (gethash (graph-db:id c) seen)))
+                    (setf (gethash (graph-db:id c) seen) t)
+                    (push c claims))))
+              graph :vertex node :direction :in :edge-type type)))
+      (when (member role '(:subject :either)) (collect 'subject-of))
+      (when (member role '(:object :either)) (collect 'object-of)))
+    (%narrow-claims graph (nreverse claims)
+                    :current current :probe probe :relation relation
+                    :as-of as-of :as-of-epoch as-of-epoch
+                    :limit limit :offset offset)))
 
 (defun claim-extent (claim)
   "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored
@@ -85,9 +484,11 @@ validation placement, not because this SETF would fail to persist."
 
 (defun claim-transaction-extent (claim)
   "CLAIM's transaction-time TEMPORAL-EXTENT, decoded, or NIL when the claim
-predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
-  (let ((s (claim-transaction-extent-sexp claim)))
-    (when s (sexp->extent s))))
+predates the axis (GH #148) or is a REAPED-CLAIM, whose versions are gone
+(GH #429).  NIL is INDETERMINATE, never the epoch."
+  (unless (reaped-claim-p claim)
+    (let ((s (claim-transaction-extent-sexp claim)))
+      (when s (sexp->extent s)))))
 
 (defun (setf claim-transaction-extent) (extent claim)
   "Store EXTENT as CLAIM's transaction extent, once.  Signals
@@ -119,9 +520,11 @@ TIMESTAMP without checking (GH #148)."
 (defun claim-current-p (claim)
   "True while CLAIM is still believed: its transaction period is open, or
 absent -- a claim predating the axis was never retracted.  NIL once
-RETRACT-CLAIM has closed the period (GH #162)."
-  (let ((e (claim-transaction-extent claim)))
-    (or (null e) (bound-unknown-p (extent-end e)))))
+RETRACT-CLAIM has closed the period (GH #162), and NIL for a REAPED-CLAIM:
+nothing is known of it but its id (GH #429)."
+  (and (not (reaped-claim-p claim))
+       (let ((e (claim-transaction-extent claim)))
+         (or (null e) (bound-unknown-p (extent-end e))))))
 
 (defun retract-claim (claim &key (at (%st-now)))
   "Close CLAIM's transaction period at AT: it was believed until now and no
@@ -151,7 +554,8 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (graph-db::*transaction* (%retract))
           (t (graph-db:with-transaction () (%retract))))))
 
-(defun claims-by-producer (graph claim-class producer)
+(defun claims-by-producer (graph claim-class producer
+                           &key limit offset as-of as-of-epoch)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's
 destructive twin, DELETE-CLAIMS-BY-PRODUCER.
@@ -165,11 +569,31 @@ NIL means PRODUCER has written nothing, which is a real answer.  An
 unregistered CLAIM-CLASS signals UNKNOWN-CLAIM-FAMILY instead, so \"no such
 family\" and \"that family, nothing produced\" stay distinguishable.
 
+:AS-OF and :AS-OF-EPOCH resolve each claim to the version believed at
+a wall-clock instant or live at a commit epoch, exactly as
+CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
+
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
-claim."
-  (let ((family (claim-family claim-class)))
-    (graph-db:index-lookup graph (claim-family-parent family)
-                           '(producer) producer)))
+claim.  :LIMIT / :OFFSET cut the result; the second return value is T
+when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
+  (check-type as-of-epoch (or null unsigned-byte))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
+  (let* ((family (claim-family claim-class))
+         (all (graph-db:index-lookup graph (claim-family-parent family)
+                                     '(producer) producer)))
+    (cond (as-of
+           (setf all (loop for c in all
+                           for v = (%claim-as-of graph c as-of)
+                           when v collect v)))
+          (as-of-epoch
+           (setf all (loop for c in all
+                           for v = (%claim-as-of-epoch graph c as-of-epoch)
+                           when v collect v))))
+    ;; Otherwise ALL is already what the open transaction will commit
+    ;; (INDEX-LOOKUP, GH #408, #411).
+    (%paginate all limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)
   "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS
@@ -186,3 +610,237 @@ rather than a scan of every claim."
              n)
       (graph-db:mark-deleted c)
       (incf n))))
+
+;;; ---------------------------------------------------------------------------
+;;; Vocabulary: what a family names (GH #350, spec 2026-09-07 §4).
+;;;
+;;; Names come from the family's ordered indexes by MAP-INDEX-PREFIXES;
+;;; every name is confirmed by resolving one live node under it (R7),
+;;; counts are index-range sizes (R2), and :CURRENT resolves the range
+;;; (R4).  Membership is live: an open WITH-AS-OF extent changes only
+;;; what a name's nodes resolve to (R6).  Inside an open transaction
+;;; every answer is what it will commit (R5, §4.4): the engine's index
+;;; and counter reads see the transaction's own writes (GH #408, #411),
+;;; so nothing here composes an overlay of its own any more.
+;;;
+;;; GH #361 §3 (spec 2026-09-08): outside an as-of extent the answer is
+;;; a read of the family's three count indexes, and no node is resolved.
+;;; The walk below stays -- it is the only mechanism that answers at an
+;;; epoch (R7) -- and runs only where no transaction can be open.
+;;; ---------------------------------------------------------------------------
+
+(defun %refuse-vocabulary-axis (as-of as-of-epoch)
+  "The listing answers live membership only (GH #350 R6)."
+  (when (or as-of as-of-epoch)
+    (error 'graph-db:query-precondition-error
+           :reason (format nil "The vocabulary listing has no :AS-OF / ~
+:AS-OF-EPOCH axis: index membership is live (GH #350, ~
+docs/time-travel.md Bounds)."))))
+
+(defun %vocabulary-sources (family role)
+  "The (CLASS SLOTS) pairs the walk reads for ROLE: the subject index on
+the parent, the object index on the binary class -- declared on
+different classes, and the parent signals for the object slots."
+  (ecase role
+    (:subject (list (list (claim-family-parent family)
+                          '(subject-namespace subject-key))))
+    (:object (list (list (claim-family-binary family)
+                         '(object-namespace object-key))))
+    (:either (append (%vocabulary-sources family :subject)
+                     (%vocabulary-sources family :object)))))
+
+(defun %vocabulary-key (slots prefix)
+  "PREFIX as MAP-INDEX and INDEX-COUNT take it: a scalar on a
+single-slot index, the tuple otherwise.  Trap: a null name on a
+single-slot index gives NIL, which MAP-INDEX reads as an unbounded
+bound -- do not pass one.  Claim identity makes a null relation
+unreachable, so the walk never builds such a prefix."
+  (if (= 1 (length slots)) (first prefix) prefix))
+
+(defun %claim-tuple (claim slots)
+  "CLAIM's values for the index SLOTS, in order.  Trap: the object
+accessors live on the binary class only, so CLAIM must be of the
+source's own class -- check TYPEP before calling."
+  (loop for slot in slots
+        collect (ecase slot
+                  (subject-namespace (claim-subject-namespace claim))
+                  (subject-key (claim-subject-key claim))
+                  (object-namespace (claim-object-namespace claim))
+                  (object-key (claim-object-key claim))
+                  (relation (claim-relation claim)))))
+
+(defun %name-admitted-p (graph class slots prefix current)
+  "T when a claim under PREFIX resolves live -- current, with CURRENT
+\(R7, R4); stops at the first.  The as-of path only (%WALK-NAMES), where
+no transaction is open."
+  (let ((key (%vocabulary-key slots prefix)))
+    (block found
+      (graph-db:map-index
+       (lambda (node)
+         (when (or (not current) (claim-current-p node))
+           (return-from found t)))
+       graph class slots :start key :end key)
+      nil)))
+
+(defun %name-count (graph class slots prefix current)
+  "Claims under PREFIX: without CURRENT the index range's size, with it
+each entry resolved (R2, R4, spec §4.4).  The as-of path only
+\(%WALK-NAMES).  Trap: the fast path counts entries, not live nodes."
+  (let ((key (%vocabulary-key slots prefix)))
+    (if (not current)
+        (graph-db:index-count graph class slots key :prefix t)
+        (let ((n 0))
+          (graph-db:map-index
+           (lambda (node) (when (claim-current-p node) (incf n)))
+           graph class slots :start key :end key)
+          n))))
+
+(defun %walk-names (graph class slots arity start position current counts)
+  "The admitted names under (CLASS SLOTS) at ARITY from START, in index
+order: the component at POSITION of each prefix, or (NAME . COUNT) with
+COUNTS.  With START the walk stops at the first prefix whose leading
+component leaves START's.  The as-of path only (%VOCABULARY-1): no
+transaction is open under an as-of extent, so the index is the whole
+answer; the hand-rolled overlay that once sat here went with GH #411."
+  (let ((names '()))
+    (labels ((tally (prefix)
+               (and counts
+                    (%name-count graph class slots prefix current)))
+             (note (prefix count)
+               (let ((name (nth position prefix)))
+                 (push (if counts (cons name count) name) names)))
+             (admit (prefix)
+               ;; With COUNTS the count decides admission -- 0 is
+               ;; exactly "nothing live under the name" -- so the range
+               ;; resolves once, not twice.  INDEX-COUNT counts entries
+               ;; rather than live nodes, so R7's confirmation still
+               ;; runs on that path (GH #350, spec §4.4).
+               (if counts
+                   (let ((n (tally prefix)))
+                     (when (and (plusp n)
+                                (or current
+                                    (%name-admitted-p graph class slots
+                                                      prefix current)))
+                       (note prefix n)))
+                   (when (%name-admitted-p graph class slots prefix
+                                           current)
+                     (note prefix nil)))))
+      (block walk
+        (graph-db:map-index-prefixes
+         (lambda (prefix)
+           (when (and start (not (equal (first prefix) (first start))))
+             (return-from walk))
+           (admit prefix))
+         graph class slots :arity arity :start start)))
+    (nreverse names)))
+
+(defun %name-lessp (a b)
+  "Index order for two names: the engine's per-component collation.
+Total for the non-null names claim identity guarantees; LESS-THAN
+orders NIL against a symbol in one direction only, so a null name
+would not sort stably."
+  (graph-db::less-than a b))
+
+(defun %merge-names (lists counts)
+  "LISTS, each in index order, as one list in index order without
+duplicates; with COUNTS the entries are (NAME . COUNT) and a name in
+several lists sums its counts."
+  (let ((all (stable-sort (apply #'append lists) #'%name-lessp
+                          :key (if counts #'car #'identity)))
+        (out '()))
+    (dolist (e all (nreverse out))
+      (let ((name (if counts (car e) e)))
+        (if (and out (equal name (if counts (car (first out)) (first out))))
+            (when counts (incf (cdr (first out)) (cdr e)))
+            (push (if counts (cons name (cdr e)) name) out))))))
+
+(defun %names-at (graph class slots depth prefix)
+  "The count index on (CLASS SLOTS) at DEPTH under PREFIX as
+\(NAME ALL CURRENT) triples -- NAME the last component, CURRENT 0 for
+an index with no predicate -- in index order (GH #361 §3.2)."
+  (let ((out '()))
+    (graph-db:map-count-index
+     (lambda (components all cur)
+       (push (list (car (last components)) all (or cur 0)) out))
+     graph class slots :depth depth :prefix prefix)
+    (nreverse out)))
+
+(defun %counted-names (graph class slots depth prefix current counts)
+  "One source's names from its count index -- which already answers as
+the open transaction will commit (GH #411) -- as names, or
+\(NAME . COUNT); under CURRENT a name whose CURRENT is 0 is dropped.
+Not sorted -- %MERGE-NAMES sorts."
+  (let ((out '()))
+    (dolist (e (%names-at graph class slots depth prefix) (nreverse out))
+      (destructuring-bind (name all cur) e
+        (let ((n (if current cur all)))
+          (when (plusp n)
+            (push (if counts (cons name n) name) out)))))))
+
+(defun %vocabulary-1 (graph class slots depth prefix current counts)
+  "One source's names at DEPTH under PREFIX: the count path, or #350's
+walk inside an as-of extent -- the only mechanism that answers at an
+epoch (GH #361 R7)."
+  (if (graph-db::%as-of-snapshot graph)
+      (%walk-names graph class slots depth prefix (1- depth) current
+                   counts)
+      (%counted-names graph class slots depth prefix current counts)))
+
+(defun %vocabulary (graph family role depth prefix current counts)
+  "The merged names of FAMILY for ROLE at DEPTH under PREFIX, in index
+order."
+  (%merge-names
+   (loop for (class slots) in (%vocabulary-sources family role)
+         collect (%vocabulary-1 graph class slots depth prefix current
+                                counts))
+   counts))
+
+(defun claim-namespaces (graph claim-class
+                         &key (role :either) current counts
+                              as-of as-of-epoch)
+  "The namespaces CLAIM-CLASS's family names as subject, object or
+either, in index order, one entry per name; with COUNTS each is
+\(NAME . COUNT), the claims under it in ROLE, summed under :EITHER.
+The default lists every name the indexes hold, retracted claims
+included; :CURRENT keeps a name only if a claim under it is current
+and counts only those.  Inside an open transaction the answer is what
+that transaction will commit (GH #324).  Trap: membership is live --
+:AS-OF and :AS-OF-EPOCH are refused, and an open WITH-AS-OF extent
+changes only what a name's claims resolve to (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%vocabulary graph family role 1 nil current counts)))
+
+(defun claim-relations (graph claim-class
+                        &key current counts as-of as-of-epoch)
+  "The relations CLAIM-CLASS's family uses, in index order, from its
+CLAIM-RELATION-COUNT index -- from CLAIM-RELATION inside an as-of
+extent (GH #361); with COUNTS, (NAME . COUNT).  Inside an open
+transaction the answer is what that transaction will commit (GH #324).
+:CURRENT and the refusals as CLAIM-NAMESPACES (GH #350)."
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    ;; One source, so no merge to do -- %MERGE-NAMES is here for the
+    ;; sort alone: a relation the open transaction introduces must land
+    ;; in index order, not after the counted ones.
+    (%merge-names
+     (list (%vocabulary-1 graph (claim-family-parent family) '(relation)
+                          1 nil current counts))
+     counts)))
+
+(defun claim-keys (graph claim-class namespace
+                   &key (role :either) current counts limit offset
+                        as-of as-of-epoch)
+  "The keys filed under NAMESPACE by CLAIM-CLASS's family in ROLE, in
+index order, one entry per key, with COUNTS as (KEY . COUNT); NIL when
+nothing is filed there.  :LIMIT / :OFFSET page the merged list; the
+second value is T when entries existed past the cut.  Inside an open
+transaction the answer is what that transaction will commit (GH #324).
+:CURRENT and the refusals as CLAIM-NAMESPACES (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%paginate (%vocabulary graph family role 2 (list namespace)
+                            current counts)
+               limit offset)))

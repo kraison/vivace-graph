@@ -186,6 +186,41 @@ every spelling the predicates refuse would otherwise be a second claim."
   (is-false (canonical-producer-p "Rule/A"))
   (is-false (canonical-producer-p "")))
 
+(test namespace-predicate-admits-only-canonical-keywords
+  "GH #327.  The identity-key encoder downcases a namespace's name and
+the splitter interns the canonical lowercase name upcased, so only a
+keyword whose name is uppercase [A-Z0-9-]+ round-trips."
+  (is-true (canonical-namespace-p :ctr-records))
+  (is-true (canonical-namespace-p :ns2))
+  (is-false (canonical-namespace-p :|Foo Bar|))
+  (is-false (canonical-namespace-p :|foo|))
+  (is-false (canonical-namespace-p :|A/B|))
+  (is-false (canonical-namespace-p "ns"))
+  (is-false (canonical-namespace-p 'ns))
+  (is-false (canonical-namespace-p nil)))
+
+(test a-non-canonical-namespace-is-refused-at-commit
+  "GH #327: the namespace slots carry the write-side rule the key
+inverse assumes; a canonical namespace still writes."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :|Foo Bar| :subject-key "s1"
+                             :relation "r" :producer "rule-a"
+                             :standing :inferred)))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ()
+        (make-ct-claim-binary :subject-namespace :ns :subject-key "s1"
+                              :relation "r" :producer "rule-a"
+                              :object-namespace :|mixed Case|
+                              :object-key "o1" :standing :inferred)))
+    (finishes
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :fine-ns :subject-key "s1"
+                             :relation "r" :producer "rule-a"
+                             :standing :inferred)))))
+
 (test a-non-canonical-relation-or-producer-is-refused-at-commit
   "The :CHECK declarations DEF-CLAIM-CLASSES emits, exercised through the
 constructor: a keyword and a case variant each abort the transaction, so
@@ -220,3 +255,68 @@ never go through MAKE-<NAME> -- here, SETF on an existing claim (GH #160)."
             (graph-db::save copy))))
       (is (equal "r" (claim-relation
                       (first (claims-touching g 'ct-claim :ns "s1"))))))))
+
+(test split-claim-identity-key-round-trips-unary-and-binary
+  "GH #321: the inverse of CLAIM-IDENTITY-KEY, with the escape rule
+exercised by keys holding both | and \\, and the split's first three
+values driving CLAIMS-TOUCHING back to the same claim."
+  (with-claim-graph (g)
+    (let (u b)
+      (with-transaction ()
+        (setq u (make-u :producer "rule-a" :subject "s|1\\x" :relation "r")
+              b (make-b :producer "rule-b" :subject "s2" :object "o|2"
+                        :relation "rel")))
+      (multiple-value-bind (producer ns key relation ons okey start)
+          (split-claim-identity-key (claim-identity-key u))
+        (is (string= "rule-a" producer))
+        (is (eq :ns ns))
+        (is (string= "s|1\\x" key))
+        (is (string= "r" relation))
+        (is (null ons)) (is (null okey)) (is (null start))
+        (is (string= (claim-identity-key u)
+                     (claim-identity-key
+                      (first (claims-touching g 'ct-claim ns key
+                                              :role :subject))))))
+      (multiple-value-bind (producer ns key relation ons okey start)
+          (split-claim-identity-key (claim-identity-key b))
+        (is (string= "rule-b" producer))
+        (is (eq :ns ns))
+        (is (string= "s2" key))
+        (is (string= "rel" relation))
+        (is (eq :ns ons))
+        (is (string= "o|2" okey))
+        (is (null start))))))
+
+(test split-claim-identity-key-refuses-other-shapes
+  "GH #321: three, eight, a dangling escape, a namespace field without
+its colon -- none is a key CLAIM-IDENTITY-KEY produced."
+  (dolist (bad '("a|b|c" "a|:b|c|d|e|f|g|h" "a|:b|c\\" "a|b|c|d"))
+    (signals malformed-claim-identity-key (split-claim-identity-key bad))))
+
+(test split-claim-identity-key-interns-only-canonical-namespaces
+  "GH #321 follow-up: a namespace field that is not [a-z0-9-]+ is
+refused BEFORE interning, so a caller string cannot grow the KEYWORD
+package -- proved by the keyword not existing afterwards."
+  (dolist (bad '("a|:Bad_NS|c|d" "a|:has space|c|d" "a|:pipe\\|x|c|d"))
+    (signals malformed-claim-identity-key (split-claim-identity-key bad)))
+  (is (null (find-symbol "BAD_NS" :keyword)))
+  (is (null (find-symbol "HAS SPACE" :keyword)))
+  ;; And the canonical case still interns, fresh image or not.
+  (is (eq :never-seen-before-ns
+          (nth-value 1 (split-claim-identity-key
+                        "a|:never-seen-before-ns|c|d")))))
+
+(test claim-identity-key-refusal-is-printable
+  "GH #335: a value matching no registered family is refused with
+UNKNOWN-CLAIM-FAMILY, and the refusal must REPORT.  A signal site passing
+an initarg the condition does not define leaves PARENT unbound, which SBCL
+accepts silently -- so the type is right and only printing fails, inside
+whichever handler formats it."
+  (let* ((c (handler-case (claim-identity-key 42)
+              (unknown-claim-family (e) e)))
+         (report (handler-case (princ-to-string c)
+                   (error (e) (format nil "report signalled ~A"
+                                      (type-of e))))))
+    (is (typep c 'unknown-claim-family))
+    (is (search "names no claim family" report))
+    (is (search "FIXNUM" report))))

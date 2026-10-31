@@ -563,17 +563,29 @@ identity), exactly (LENGTH SLOTS) long -- signalled otherwise
 
 A PARALLEL macro, not a DEF-INDEX flag: a flag would silently switch the
 null semantics a reader would assume were unchanged (GH #107)."
-  `(let ((spec (make-unique-tuple-spec
-                :owner-name ',owner-class
-                :slot-names (%normalize-slots ',slots)
-                :graph-name ',graph-name
-                :name ',name
-                :canonicalize ,(when canonicalize `',canonicalize)
-                :scope ,(or scope :local))))
-     (register-unique-tuple-spec spec)
-     (let ((g (lookup-graph ',graph-name)))
-       (when g (%ensure-unique-tuple-built g spec :strict-p t)))
-     spec))
+  `(ensure-unique ',owner-class ',slots ',graph-name
+                  :canonicalize ,(when canonicalize `',canonicalize)
+                  :scope ,(or scope :local)
+                  :name ',name))
+
+(defun ensure-unique (owner-class slots graph-name
+                      &key canonicalize (scope :local) name)
+  "Runtime twin of DEF-UNIQUE (GH #378): declare the uniqueness
+constraint on OWNER-CLASS's SLOTS tuple in GRAPH-NAME from data, building
+it now -- STRICTLY, a pre-existing duplicate signals -- if the graph is
+open.  Idempotent; returns the UNIQUE-TUPLE-SPEC.  The macro expands to
+this."
+  (let ((spec (make-unique-tuple-spec
+               :owner-name owner-class
+               :slot-names (%normalize-slots slots)
+               :graph-name graph-name
+               :name name
+               :canonicalize canonicalize
+               :scope scope)))
+    (register-unique-tuple-spec spec)
+    (let ((g (lookup-graph graph-name)))
+      (when g (%ensure-unique-tuple-built g spec :strict-p t)))
+    spec))
 
 (defmacro undef-unique (owner-class graph-name &key slots name)
   "Withdraw a DEF-UNIQUE declaration, by :NAME or by :SLOTS:
@@ -714,6 +726,115 @@ journaled.  Checks both the single-slot (:UNIQUE) and multi-slot
                        (mapcar (lambda (s) (slot-value node s))
                                (unique-index-slot-names uix))
                        (id node) intra)))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The public read (GH #415)
+;;; ---------------------------------------------------------------------------
+
+(defun %unique-index-for-read (graph class-name slot-names)
+  "The UNIQUE-INDEX a read of CLASS-NAME.SLOT-NAMES probes.  A DEF-UNIQUE
+tuple declared but not built (GH #129) gets a transient one -- owner,
+slots, canonicalizers, scope, no store -- so the transaction's own
+writes still answer (GH #416).  Signals QUERY-PRECONDITION-ERROR when
+nothing declares the constraint."
+  (let ((class (ignore-errors (find-class class-name nil))))
+    (or (and class
+             (if (= 1 (length slot-names))
+                 (let ((d (find (first slot-names)
+                                (class-unique-slots class) :key #'first)))
+                   (and d (%unique-index-for graph d)))
+                 (let ((d (find slot-names
+                                (class-unique-tuple-specs class graph)
+                                :key #'first :test #'equal)))
+                   (and d
+                        (or (%unique-tuple-index-for graph d)
+                            (destructuring-bind (slots owner spec scope) d
+                              (%make-unique-index
+                               :owner-name owner :slot-names slots
+                               :spec spec :scope scope
+                               :canonicalizers
+                               (%resolve-index-canonicalizers
+                                spec (length slots)))))))))
+        (error 'query-precondition-error
+               :reason (format nil "No unique constraint on ~S.~S in ~S"
+                               class-name slot-names (graph-name graph))))))
+
+(defun %unique-probe-key (uix value graph)
+  "The canonical key VALUE probes UIX with: the canonicalizers applied
+and, at :ORIGIN scope, this graph's own authoring origin prefixed -- the
+partition a local commit would claim in.  NIL when VALUE, or any
+component of a tuple, is null: nothing holds a null (SQL-style).  Signals
+on a tuple of the wrong arity."
+  (let* ((slots (unique-index-slot-names uix))
+         (k (if slots
+                (let ((vals (if (listp value) value (list value))))
+                  (unless (= (length vals) (length slots))
+                    (error 'query-precondition-error
+                           :reason (format nil "A probe of ~D component(s) ~
+for the unique constraint on ~S" (length vals) slots)))
+                  (loop for v in vals
+                        for c in (unique-index-canonicalizers uix)
+                        when (null v)
+                          do (return-from %unique-probe-key nil)
+                        collect (if c (funcall c v) v)))
+                (when value
+                  (let ((c (unique-index-canonicalizer uix)))
+                    (if c (funcall c value) value))))))
+    (cond ((null k) nil)
+          ((eq (unique-index-scope uix) :origin)
+           (let ((o (%origin-token (%current-authoring-origin graph))))
+             (if slots (cons o k) (list o k))))
+          (t k))))
+
+(defun %node-unique-key (uix node graph)
+  "NODE's key in UIX at its current slot values, by whichever form built
+UIX; NIL when exempt."
+  (if (unique-index-slot-names uix)
+      (%unique-tuple-key uix node graph)
+      (%unique-key uix (slot-value node (unique-index-slot-name uix))
+                   node graph)))
+
+(defun unique-lookup (graph class-name slot-name value)
+  "The live node holding VALUE under the unique constraint on
+CLASS-NAME.SLOT-NAME, or NIL.  SLOT-NAME is a :UNIQUE slot, or a
+DEF-UNIQUE slot list with VALUE its components in order.  The
+constraint's canonicalizer applies to VALUE, so the probe compares as a
+commit would; a null value, or tuple component, is nothing's value.  The
+holder may be of any class under the constraint's owner: a parent's
+constraint is one index across its subclasses.  Inside a transaction the
+answer is what it will commit (GH #408): a committed holder this
+transaction wrote is skipped, and its own live node holding VALUE is
+answered at its current slots; *READ-OWN-WRITES* NIL reads committed
+state.  Signals QUERY-PRECONDITION-ERROR when nothing declares the
+constraint; a DEF-UNIQUE declared but not built answers only the
+transaction's own writes (GH #415)."
+  (let* ((*graph* graph)
+         (slot-names (%normalize-slots slot-name))
+         (uix (%unique-index-for-read graph class-name slot-names))
+         (key (%unique-probe-key uix value graph))
+         (ov (current-overlay graph)))
+    (when key
+      (or (let ((id (and (or (unique-index-table uix)
+                             (unique-index-skip-list uix))
+                         (uix-lookup uix key))))
+            (and id
+                 (not (and ov (overlay-effective-write ov id)))
+                 (let ((node (%node-by-id id graph)))
+                   ;; The version resolved at a read snapshot must still
+                   ;; hold VALUE: membership is live, versions are not
+                   ;; (GH #345).
+                   (and node (not (deleted-p node))
+                        (funcall (or (unique-index-test uix) #'equal)
+                                 key (%node-unique-key uix node graph))
+                        node))))
+          (and ov
+               (let ((test (or (unique-index-test uix) #'equal))
+                     (owner (unique-index-owner-name uix)))
+                 (find-if (lambda (n)
+                            (and (typep n owner)
+                                 (funcall test key
+                                          (%node-unique-key uix n graph))))
+                          (overlay-live-nodes ov))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Rebuild on open (v1)
@@ -917,6 +1038,18 @@ must not trigger a spurious rebuild -- hence T from the empty loop, not NIL."
                 ;; REJECTING WRITES the current schema permits -- the very
                 ;; defect #139 reports, merely relocated from the registry to
                 ;; the sidecar.
+                (unless (%unique-spec-declared-p owner
+                                                 (%normalize-slots slot)
+                                                 graph)
+                  ;; Reclaim a withdrawn constraint's pages at the open
+                  ;; that drops its record (GH #147), as the secondary
+                  ;; index restore does.
+                  (handler-case
+                      (delete-view-index
+                       (%open-unique-skip-list graph address backend))
+                    (error (e)
+                      (warn "could not reclaim retired unique index ~
+~A.~A: ~A" owner slot e))))
                 (when (%unique-spec-declared-p owner (%normalize-slots slot)
                                                 graph)
                   (if (listp slot)

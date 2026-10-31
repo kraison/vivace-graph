@@ -20,7 +20,9 @@
              
              ;; 2. Prolog functor creation and query compilation
              (dotimes (i (floor query-count 10))
-               (let ((f (graph-db::make-functor :name (graph-db::make-functor-symbol (format nil "prof-pred-~D" i) 1))))
+               (let* ((name (graph-db::make-functor-symbol
+                             (format nil "prof-pred-~D" i) 1 :define t))
+                      (f (graph-db::make-functor :name name)))
                  (graph-db::prolog-compile f)))))
       (graph-db:close-graph graph)
       (ignore-errors (uiop:delete-directory-tree temp-dir :validate t :if-does-not-exist :ignore)))))

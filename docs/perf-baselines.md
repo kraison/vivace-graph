@@ -23,6 +23,18 @@ checkout (Quicklisp `local-projects` symlink, or push the repo dir onto
 `asdf:*central-registry*`) and verify with
 `(asdf:system-source-directory :graph-db)` before trusting a run.
 
+## The stale-fasl rule (learned 2026-09-02)
+
+**Never benchmark the incrementally-recompiled working checkout after a
+heavy edit day.** ASDF's incremental rebuilds can leave a fasl set that
+runs measurably slower than a clean build of the *same tree* — observed
+at 2.4× on `prolog-is-a-scan` (27k vs 68k ops/s, four stable samples
+each side), which burned an afternoon of bisecting before the clean
+control exposed it. It is 3.0.0's `rsync -a` stale-fasl lesson in a new
+costume. Before any measurement that will be compared or blessed: run
+from a fresh `git worktree` (its own fasl namespace), or purge
+`~/.cache/common-lisp/<impl>/<path-to-checkout>` and rebuild.
+
 ## The comparability rule
 
 Never compare across suite generations or hosts (learned in the 3.0
@@ -103,3 +115,15 @@ re-bless to adopt them.
 
 (The perf-suite vs `profiling/` harness split is documented separately —
 GH #255.)
+
+## Cases with a reason of their own
+
+- **`scan-in-tx` against `scan-committed`** (`bench-tx-scan`, GH #408).
+  The same 200 adjacency scans, first inside the transaction that wrote
+  1,000 edges, then after it commits. The gap is the own-write overlay:
+  O(pending writes) per scan in this unit. First measurement, odm, SBCL
+  2.6.6, generation 5, 2026-10-29: 1,695 ops/s in the transaction
+  against 5,263 committed (3.1×). If that ratio grows with the write set
+  in a real workload, the fix is maintained per-transaction buckets
+  behind the same overlay functions (spec 2026-10-29 §6), not a bigger
+  scan.

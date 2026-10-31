@@ -147,3 +147,155 @@ pulled multi-slot tuple."
       (is (null (index-lookup g 'pi-claim '(ns key rel)
                               (list "ops" "p1" "at")))
           "released after purge"))))
+
+;;; --- counting index on the device (GH #361) ---------------------------
+;;;
+;;; This file pins the stale/rebuild contract: BOTH peer applies bind
+;;; *ADD-TO-INDEXES-UNLESS-PRESENT-P*, so every pull marks the count
+;;; maps stale and counts nothing, and the repair is a scan rebuild --
+;;; at the next count query, or at CLOSE-GRAPH if none comes first.
+;;; A device that stopped marking stale, or a close that saved the
+;;; stale maps, turns these tests red and nothing else does.
+
+(defun pi-live-p (node)
+  "True unless PI-CLAIM-REL is \"dead\"; the count index's CURRENT-P."
+  (not (equal (pi-claim-rel node) "dead")))
+
+(def-count-index pi-claim (ns key) :graph-db-peer-index-test
+  :name pi-count :current-p pi-live-p)
+
+(test authored-pull-counts-the-node
+  "APPLY-PEER-AUTHORED-OP maintains the device's count index (#361):
+the maintenance pass marks the map stale and COUNT-INDEX-LOOKUP
+rebuilds it (spec R8)."
+  (with-pi-device (g)
+    (graph-db::apply-peer-authored-op
+     g (pi-authored-create g 'pi-claim
+                           '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                           *pi-remote-origin*))
+    (is (equal '(1 1)
+               (multiple-value-list
+                (count-index-lookup g 'pi-claim '(ns key) '("ops")))))))
+
+(test a-pulled-retraction-moves-current
+  "A TX-UPDATE over the wire whose OLD node is live and whose NEW node
+is not moves CURRENT and leaves ALL untouched (#361, spec R8)."
+  (with-pi-device (g)
+    (multiple-value-bind (op nid)
+        (pi-authored-create g 'pi-claim
+                            '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                            *pi-remote-origin*)
+      (graph-db::apply-peer-authored-op g op)
+      (let* ((old (lookup-vertex nid :graph g))
+             (new (graph-db::%copy old))
+             (op2 (progn
+                    ;; DATA is a plain slot, not a guarded persistent one
+                    ;; (PI-AUTHORED-CREATE sets it the same way); a
+                    ;; SETF through the PI-CLAIM-REL accessor signals
+                    ;; MUTATING-UNREGISTERED-NODE with no *TRANSACTION*
+                    ;; bound, which %COPY (unlike COPY) does not do.
+                    (setf (graph-db::data new)
+                          '((:ns . "ops") (:key . "e1") (:rel . "dead")))
+                    (graph-db::make-peer-op
+                     :kind :authored :op-id (graph-db::gen-op-id)
+                     :origin *pi-remote-origin* :lamport 6 :tx-id 9001
+                     :writes (list (make-instance 'graph-db::tx-update
+                                                  :node new
+                                                  :old-node old))))))
+        (graph-db::apply-peer-authored-op g op2))
+      (is (equal '(1 0)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))))))
+
+(test a-state-sync-re-pull-does-not-double-count
+  "Spec R8 (#361): APPLY-PEER-CREATE-WRITES binds *ADD-TO-INDEXES-
+UNLESS-PRESENT-P*, so re-applying the same create leaves the counter
+at one (stale flag set twice, one rebuild on the next lookup)."
+  (with-pi-device (g)
+    (let* ((tid (graph-db::node-type-id
+                 (graph-db::lookup-node-type-by-name
+                  'pi-claim :vertex :graph g)))
+           (n (graph-db::%make-vertex :class 'pi-claim :id (gen-id)
+                                      :type-id tid :revision 0)))
+      (setf (graph-db::data n)
+            '((:ns . "ops") (:key . "e1") (:rel . "at")))
+      (dotimes (i 2)
+        (graph-db::apply-peer-create-writes
+         g 7777 (list (make-instance 'graph-db::tx-create :node n))
+         *pi-remote-origin*)))
+    (is (equal '(1 1)
+               (multiple-value-list
+                (count-index-lookup g 'pi-claim '(ns key) '("ops")))))))
+
+(test purge-releases-the-counter
+  "PEER-PURGE-NODE subtracts the purged node's contribution (#361).
+The interleaved lookup rebuilds and clears the stale flag before the
+purge, so the final read reflects %COUNT-PURGE's own decrement rather
+than a rebuild-from-live-nodes that would mask its absence."
+  (with-pi-device (g)
+    (multiple-value-bind (op nid)
+        (pi-authored-create g 'pi-claim
+                            '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                            *pi-remote-origin*)
+      (graph-db::apply-peer-authored-op g op)
+      (is (equal '(1 1)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))
+          "built before the purge, stale flag now clear")
+      (graph-db::apply-peer-purge g (list nid))
+      (is (equal '(0 0)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))))))
+
+(test a-device-close-after-a-pull-persists-rebuilt-count-maps
+  "Review of GH #361 (R8): every pull marks a device's count maps stale
+and the flag is NOT persisted, so a pull, a clean close with no count
+query between them, and a reopen would restore under-counted maps
+marked built -- silently wrong until something else marked them stale.
+CLOSE-GRAPH rebuilds first.  The maps are built BEFORE the second pull,
+so a missing close-time rebuild leaves a real under-count to read back
+rather than an absent sidecar the open would rebuild anyway.  Ablation,
+recorded in the task report: without the close-time rebuild the
+reopened lookup reads 1 1, one short of what a local commit gives."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *pi-graph-name* path
+                           :peer-role :device :origin-id (id16 3)
+                           :peer-host "localhost" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (graph-db::apply-peer-authored-op
+                g (pi-authored-create
+                   g 'pi-claim
+                   '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                   *pi-remote-origin*))
+               (is (equal '(1 1)
+                          (multiple-value-list
+                           (count-index-lookup g 'pi-claim '(ns key)
+                                               '("ops"))))
+                   "the first pull's repair built the maps")
+               (graph-db::apply-peer-authored-op
+                g (pi-authored-create
+                   g 'pi-claim
+                   '((:ns . "ops") (:key . "e2") (:rel . "at"))
+                   *pi-remote-origin* :lamport 6 :tx-id 9001))
+               (is (eq t (graph-db::count-indexes-stale-p g))
+                   "the second pull marked them stale and counted none"))
+          ;; No count query after that pull: the close must repair.
+          (close-graph g :snapshot-p nil)))
+      (let ((g (open-graph *pi-graph-name* path
+                           :peer-role :device :origin-id (id16 3)
+                           :peer-host "localhost" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (equal '(2 2)
+                          (multiple-value-list
+                           (count-index-lookup g 'pi-claim '(ns key)
+                                               '("ops"))))
+                   "the reopened maps hold what a local commit would")
+               (is (null (graph-db::count-indexes-stale-p g))
+                   "and nothing was left to repair"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))

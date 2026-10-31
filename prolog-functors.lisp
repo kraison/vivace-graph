@@ -25,6 +25,46 @@ goal's argument count."
 (defun default-functor-p (symbol)
   (gethash symbol *prolog-global-functors*))
 
+;;; Cost-boundedness classification (GH #285).  %TICK preempts at goal
+;;; boundaries only, so a functor that can burn arbitrary time in ONE
+;;; atomic Lisp call is invisible to the rails.  Classify such functors
+;;; here, engine-side, so every caller -- not just the GUI whitelist --
+;;; can know; SELECT refuses them when a resource bound is in effect.
+(defvar *cost-unbounded-functors*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "NAME/ARITY functor symbols whose worst-case cost is bounded neither
+by the graph nor by the query length (GH #285).")
+
+(defun declare-functor-cost-unbounded (functor-symbol)
+  "Classify FUNCTOR-SYMBOL (a NAME/ARITY symbol, e.g. REGEX-MATCH/2) as
+cost-unbounded: %TICK cannot preempt inside it, so SELECT refuses goals
+naming it whenever :MAX-INFERENCES or :TIMEOUT is in effect, unless the
+caller passes :ALLOW-COST-UNBOUNDED T (GH #285)."
+  (setf (gethash functor-symbol *cost-unbounded-functors*) t)
+  functor-symbol)
+
+(defun functor-cost-unbounded-p (functor-symbol)
+  (values (gethash functor-symbol *cost-unbounded-functors*)))
+
+(defun cost-unbounded-predicate-names ()
+  "The classified predicates as bare name strings (sans /arity) -- the
+form surface whitelists compare against (GH #285; the GUI's category
+derives from this, single source)."
+  (let ((names '()))
+    (maphash (lambda (k v)
+               (declare (ignore v))
+               (let* ((s (symbol-name k))
+                      (slash (position #\/ s :from-end t)))
+                 (pushnew (subseq s 0 (or slash (length s))) names
+                          :test #'string=)))
+             *cost-unbounded-functors*)
+    names))
+
 (def-global-prolog-functor read/1 (exp cont)
   (require-effect :io)
   (if (unify exp (read)) (funcall cont)))
@@ -59,31 +99,34 @@ goal's argument count."
   "Checks inequality of the values of two prolog variables."
   (if (not (deref-equal ?arg1 ?arg2)) (funcall cont)))
 
+;; The four order functors compare two numbers numerically and two
+;; strings lexically (STRING<'s order); any other pair fails.  Strings
+;; are what lets a caller page an indexed route by bounding its key
+;; (GH #387, docs/guarded-query.md "Solution order").
+(defun %ordered-p (num-op string-op a b)
+  (cond ((and (numberp a) (numberp b)) (funcall num-op a b))
+        ((and (stringp a) (stringp b)) (and (funcall string-op a b) t))
+        (t nil)))
+
 (def-global-prolog-functor >/2 (?arg1 ?arg2 cont)
-  "Prolog greater than functor."
-  (if (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2))
-           (> ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog greater than: two numbers, or two strings lexically."
+  (when (%ordered-p #'> #'string> (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor </2 (?arg1 ?arg2 cont)
-  "Prolog less than functor."
-  (if (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2))
-           (< ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog less than: two numbers, or two strings lexically."
+  (when (%ordered-p #'< #'string< (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor >=/2 (?arg1 ?arg2 cont)
-  "Prolog greater than or equal to functor."
-  (if (and (numberp (var-deref ?arg1))
-           (numberp (var-deref ?arg2))
-           (>= ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog greater than or equal: two numbers, or two strings lexically."
+  (when (%ordered-p #'>= #'string>= (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor <=/2 (?arg1 ?arg2 cont)
-  "Prolog less than or equal to functor."
-  (if (and (numberp (var-deref ?arg1))
-           (numberp (var-deref ?arg2))
-           (<= ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog less than or equal: two numbers, or two strings lexically."
+  (when (%ordered-p #'<= #'string<= (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor numberp/1 (x cont)
   (when (numberp (var-deref x))
@@ -134,11 +177,14 @@ goal's argument count."
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
   "Functor that treats first arg as a regex and uses cl-ppcre:scan to check
- for the pattern in the second arg."
+ for the pattern in the second arg.  Cost-unbounded (GH #285): a
+catastrophically backtracking pattern costs ~2^n in one atomic call
+%TICK cannot preempt, so SELECT refuses it under resource bounds."
   (if (and (stringp (var-deref ?arg1))
            (stringp (var-deref ?arg2))
            (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
+(declare-functor-cost-unbounded 'regex-match/2)
 
 (def-global-prolog-functor var/1 (?arg1 cont)
   (if (unbound-var-p ?arg1) (funcall cont)))
@@ -806,21 +852,81 @@ a vertex" functor))))
                             (undo-bindings old-trail)))
                         class-name view-name)))
 
+(defun %slot-value-guarded (node slot)
+  "Two values: NODE's SLOT and T, or NIL and NIL on a read error --
+not the keyword :FAIL, which a slot may legitimately hold (GH #351).
+Guards ONLY the read: the continuation is the rest of the query and
+must keep its own errors."
+  (handler-case (values (node-slot-value node slot) t)
+    (error (c)
+      (log:error "Problem reading (node-slot-value ~A ~A): ~A"
+                 node slot c)
+      (values nil nil))))
+
+(defun %node-has-slot-p (node slot)
+  "SLOT (a symbol from any package) names a data slot of NODE's type.
+NIL, not an error, when SLOT is not a symbol at all (GH #351)."
+  (and (symbolp slot)
+       (member (symbol-name slot) (data-slots (class-of node))
+               :key #'symbol-name :test #'string=)))
+
+(defun %unify-slot (node slot var cont)
+  "The bound-node cases of NODE-SLOT-VALUE/3 (GH #351): SLOT bound
+reads it; SLOT unbound yields every data slot, keyword-named.  The
+unbound-slot arm requires NODE to be a NODE-P (DATA-SLOTS has no
+method for any other class); a non-node NODE, or a non-symbol bound
+SLOT, fails the goal rather than reading."
+  (cond ((var-p slot)
+         (when (node-p node)
+           (dolist (s (data-slots (class-of node)))
+             (let ((old-trail (fill-pointer *trail*)))
+               (multiple-value-bind (value read-p)
+                   (%slot-value-guarded node s)
+                 (when read-p
+                   (when (and (unify slot (intern (symbol-name s) :keyword))
+                              (unify var value))
+                     (funcall cont))))
+               (undo-bindings old-trail)))))
+        ((symbolp slot)
+         (multiple-value-bind (value read-p) (%slot-value-guarded node slot)
+           (when read-p
+             (when (unify var value)
+               (funcall cont)))))))
+
 (def-global-prolog-functor node-slot-value/3 (node slot var cont)
+  "NODE-SLOT-VALUE(node, slot, value) (GH #351).  NODE bound, SLOT
+bound: unifies VALUE with that data slot's reading.  NODE bound, SLOT
+unbound: one solution per data slot, SLOT keyword-named.  NODE
+unbound: a full scan of every vertex of every type -- one inference
+per vertex against :MAX-INFERENCES/:TIMEOUT, same as IS-A/2's
+both-unbound arm -- unifying NODE with each and recursing on SLOT as
+above; a vertex whose type lacks a bound SLOT is skipped, not read as
+NIL.  Trap: NODE unbound is O(every vertex), never call it unbounded
+on a free-text surface without a resource budget."
   (setq node (var-deref node)
         slot (var-deref slot)
         var (var-deref var))
-  ;; Guard ONLY the slot read -- not (funcall cont).  The continuation is the
-  ;; rest of the query; wrapping it here would swallow any error a downstream
-  ;; goal signals (e.g. a prolog-permission-error from a denied write, or a
-  ;; prolog-resource-error), silently turning it into a non-match.
-  (let ((value (handler-case (node-slot-value node slot)
-                 (error (c)
-                   (log:error "Problem reading (node-slot-value ~A ~A): ~A"
-                              node slot c)
-                   (return-from node-slot-value/3 nil)))))
-    (when (unify var value)
-      (funcall cont))))
+  (if (var-p node)
+      ;; Enumerate as IS-A/2's both-unbound arm does: per-type scans,
+      ;; each through LOOKUP-VERTEX, so a snapshot reader sees its own
+      ;; epoch.  A vertex whose type lacks a bound SLOT is skipped, not
+      ;; read as NIL (GH #351).
+      (dolist (type-id (list-vertex-types *graph*))
+        (when (lookup-node-type-by-id type-id :vertex)
+          (map-vertices
+           (lambda (vertex)
+             ;; One inference per vertex visited: UNIFY fails silently
+             ;; for most, so without this %TICK a bound scan never
+             ;; hits a goal boundary and the budget can't stop it
+             ;; (GH #351).
+             (%tick)
+             (when (or (var-p slot) (%node-has-slot-p vertex slot))
+               (let ((old-trail (fill-pointer *trail*)))
+                 (when (unify node vertex)
+                   (%unify-slot vertex slot var cont))
+                 (undo-bindings old-trail))))
+           *graph* :vertex-type type-id :include-subclasses-p nil)))
+      (%unify-slot node slot var cont)))
 
 (def-global-prolog-functor weight/2 (edge var cont)
   (setq edge (var-deref edge)

@@ -613,7 +613,8 @@ values we just set."
          (incf int (ash (logand (aref key subscript) #xFF) shift)))
     int))
 
-(defun sxhash-node (node) (sxhash (%hash (id node))))
+;; In-memory hash: the fixnum fold, not the on-disk %HASH (GH #373).
+(defun sxhash-node (node) (%fixnum-hash-bytes (id node)))
 #+sbcl (sb-ext:define-hash-table-test node-equal sxhash-node)
 (defun make-node-table (&key weakness synchronized)
   #+ccl
@@ -639,7 +640,7 @@ values we just set."
                    #+graph-db-ecl-sync-hash synchronized))
 
 (defun id-equal (x y) (equalp x y))
-(defun sxhash-id-array (id) (sxhash (%hash id)))
+(defun sxhash-id-array (id) (%fixnum-hash-bytes id))
 #+sbcl (sb-ext:define-hash-table-test id-equal sxhash-id-array)
 (defun make-id-table (&key weakness synchronized)
   #+lispworks

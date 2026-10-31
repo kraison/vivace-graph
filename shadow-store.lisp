@@ -35,48 +35,47 @@ loop (~0.8ms/MB measured, ~20x)."
     (unless (zerop (aref buffer i)) (return nil))))
 
 (defun %copy-file-sparse (source destination)
-  "Copy SOURCE to DESTINATION preserving holes: read in
-*SPARSE-COPY-CHUNK-SIZE* octet chunks; an all-zero chunk is never
-WRITE-SEQUENCEd, only skipped over via FILE-POSITION on the (freshly
-created, hence already-zero) output -- seeking past unwritten bytes on
-a fresh file leaves a hole instead of materializing them, which is the
-entire point (see %COPY-DIRECTORY-TREE's docstring for why this
-matters).  A bare seek never extends a file's on-disk length by itself
-though (that needs an actual write at or past the target offset), so if
-the copy ends in a skipped region DESTINATION would come up short --
-handled by writing SOURCE's final byte whenever the last chunk
-processed was skipped, which is a no-op when the last chunk was
-written (the write already reached the true end) and otherwise pins
-DESTINATION to SOURCE's exact length with one extra byte written (GH
-#170)."
-  (let* ((chunk-size *sparse-copy-chunk-size*)
-         (buffer (make-array chunk-size :element-type '(unsigned-byte 8)))
-         (length 0)
-         (last-chunk-skipped-p nil))
-    (with-open-file (in source :element-type '(unsigned-byte 8))
-      (setf length (file-length in))
-      (with-open-file (out destination :direction :output
-                           :element-type '(unsigned-byte 8)
-                           :if-exists :supersede :if-does-not-exist :create)
-        (loop
-          (let ((n (read-sequence buffer in)))
-            (when (zerop n) (return))
-            (cond
-              ((%all-zero-p buffer n)
-               ;; FILE-POSITION is a FUNCTION, not a SETF place: call it
-               ;; with the new position as a second argument.
-               (file-position out (+ (file-position out) n))
-               (setf last-chunk-skipped-p t))
-              (t
-               (write-sequence buffer out :end n)
-               (setf last-chunk-skipped-p nil)))))
-        ;; Pin the apparent LENGTH (see docstring): only needed when the
-        ;; copy ends in a hole -- if the last chunk was written, the
-        ;; write itself already put OUT at LENGTH.
-        (when (and last-chunk-skipped-p (plusp length))
-          (file-position out (1- length))
-          (write-byte 0 out))))
-    destination))
+  "Copy SOURCE to DESTINATION preserving holes, reading only its data
+extents (%POSIX-DATA-EXTENTS, #434): the cost is the data, not the
+apparent size, which for a fresh store is ~12GB of reservation around a
+few MB (see %COPY-DIRECTORY-TREE).  Where the filesystem has no
+SEEK_DATA the whole file is one extent.  Inside an extent the copy goes
+in *SPARSE-COPY-CHUNK-SIZE* chunks and an all-zero chunk is still
+skipped by a seek on the (fresh, hence zero) output rather than
+written.  A bare seek never extends a file, so when nothing was written
+at SOURCE's last byte -- a trailing hole, or a final chunk skipped --
+the last byte is written as 0 to pin DESTINATION to SOURCE's exact
+length (GH #170)."
+  (multiple-value-bind (extents length supported) (%posix-data-extents source)
+    (let* ((chunk-size *sparse-copy-chunk-size*)
+           (buffer (make-array chunk-size :element-type '(unsigned-byte 8)))
+           (ranges (if supported extents (list (cons 0 length))))
+           (wrote-last-byte nil))
+      (with-open-file (in source :element-type '(unsigned-byte 8))
+        (with-open-file (out destination :direction :output
+                             :element-type '(unsigned-byte 8)
+                             :if-exists :supersede :if-does-not-exist :create)
+          (loop for (start . end) in ranges
+                do (file-position in start)
+                   (file-position out start)
+                   (loop with pos = start
+                         while (< pos end)
+                         do (let ((n (read-sequence buffer in
+                                                    :end (min chunk-size
+                                                              (- end pos)))))
+                              (when (zerop n) (return))
+                              (cond ((%all-zero-p buffer n)
+                                     (file-position out (+ pos n))
+                                     (setf wrote-last-byte nil))
+                                    (t
+                                     (write-sequence buffer out :end n)
+                                     (setf wrote-last-byte
+                                           (= (+ pos n) length))))
+                              (incf pos n))))
+          (when (and (plusp length) (not wrote-last-byte))
+            (file-position out (1- length))
+            (write-byte 0 out))))
+      destination)))
 
 (defun %copy-directory-tree (source destination)
   "Recursive file copy, SOURCE to DESTINATION, preserving sparse holes

@@ -14,6 +14,13 @@
   ;; so the Prolog compiler recognizes ! in query goals as cut.
   (:shadowing-import-from #:graph-db #:!)
   (:import-from #:graph-db
+                #:rollback
+                ;; the evaluator entry point (GH #301)
+                #:validate-writes #:validation-report
+                #:validation-report-violations
+                #:validation-report-family-counts
+                #:validation-report-checked-counts
+                #:validation-report-spec-counts
                 ;; image-level epoch clock (GH #168)
                 #:*system-clock*
                 #:system-clock
@@ -243,6 +250,23 @@
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
+                #:edge-history               ; GH #115
+                #:node-history               ; GH #115
+                #:with-as-of                 ; GH #115
+                #:latest-epoch
+                #:as-of-refused
+                #:stale-revision-error
+                #:as-of-refused-reason
+                #:as-of-skipped-count
+                #:version-reaped-error
+                #:version-reaped-epoch
+                #:version-reaped-oldest-epoch
+                #:version-reaped-oldest-revision
+                ;; compaction: flags the index pcons the as-of walk
+                ;; must still visit (GH #115 spec §3.3)
+                #:compact-vertices
+                #:compact-edges
+                #:edge-exists-p
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse
@@ -252,8 +276,18 @@
                 #:map-edges
                 #:def-index
                 #:index-lookup
+                #:unique-lookup
                 #:index-range
                 #:map-index
+                #:map-index-prefixes         ; GH #350
+                #:index-count
+                ;; the counting index (GH #361)
+                #:def-count-index
+                #:undef-count-index
+                #:count-index-lookup
+                #:map-count-index
+                ;; the typed query error the index surface signals
+                #:query-precondition-error
                 #:def-unique
                 ;; schema retraction (GH #139, #140)
                 #:undef-index
@@ -265,6 +299,7 @@
                 #:def-value-constraint
                 #:undef-value-constraint
                 #:value-constraint-violation
+                #:unique-constraint-violation
                 #:check-value-constraints
                 ;; Cardinality constraints (GH #155)
                 #:def-cardinality #:undef-cardinality
@@ -278,6 +313,7 @@
                 #:djv-offender #:check-disjointness
                 ;; index-backed generator predicates (GH #102)
                 #:find-by-slot/4
+                #:find-by-unique/4
                 #:find-slot-range/5
                 #:weight
                 #:to

@@ -61,7 +61,11 @@
       (%vev-key-equal key1 key2)))
   )
 
-(defun sxhash-vev-key (k) (sxhash (%hash k)))
+;; In-memory cache hash: fold both ids, seeded by the type-id (GH #373).
+(defun sxhash-vev-key (k)
+  (%fixnum-hash-bytes (vev-key-out-id k)
+                      (%fixnum-hash-bytes (vev-key-in-id k)
+                                          (vev-key-type-id k))))
 #+sbcl (sb-ext:define-hash-table-test vev-key-equal sxhash-vev-key)
 (defun make-vev-cache ()
   #+ccl

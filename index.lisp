@@ -250,7 +250,8 @@ origin (GH #107).  This is the single input to maintenance (apply / rebuild)."
   ;; The backing ordered map: a heap skip-list / B+ tree on an on-disk graph, a
   ;; MEM-SKIP-LIST on a memory-graph -- always ordered (needed for range).  Keyed
   ;; by the flat composite (v1 ... vn id) under %INDEX-COMP-LESSP, arity-aware
-  ;; since Task 4 (GH #107).
+  ;; since Task 4 (GH #107).  NIL on the transient read-side index
+  ;; %OVERLAY-ONLY-INDEX makes (GH #416): the walkers read it as empty.
   skip-list)
 
 (defun %index-head-key (arity)
@@ -342,9 +343,10 @@ EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
 
 (defun %index-value-lessp (a b)
   "Lexicographic order for two VALUE-only component lists (no trailing id), by
-LESS-THAN per component; a strict prefix sorts before its extension.  Used by
-IX-MAP's open-ended range filter, where there is no id to anchor the
-%INDEX-COMP-LESSP last-position special case (GH #107)."
+LESS-THAN per component; a strict prefix sorts before its extension.  The
+count index's key order (count-index.lisp), where there is no id to anchor
+the %INDEX-COMP-LESSP last-position special case (GH #107).  Not a range
+bound's order: there a prefix stands for its extensions (IX-MAP, GH #413)."
   (loop for x in a
         for y in b
         do (cond ((less-than x y) (return t))
@@ -490,12 +492,14 @@ value(s)~:[~; -- pass :PREFIX T for a prefix scan~]"
 list from %INDEX-KEY: an exact match when KEY supplies SIX's full arity, or --
 with PREFIX T -- a range scan when KEY supplies fewer, matching every stored
 tuple that starts with KEY.  NIL if none.  Bounds via %INDEX-BOUNDS (GH #107)."
-  (multiple-value-bind (lo hi) (%index-bounds six key prefix)
-    (let ((cur (make-range-cursor (slot-index-skip-list six) lo hi))
-          (ids '()))
-      (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-            do (push (car (last (%sn-key node))) ids))
-      (nreverse ids))))
+  (let ((sl (slot-index-skip-list six)))
+    (when sl                      ; no map: a transient index (GH #416)
+      (multiple-value-bind (lo hi) (%index-bounds six key prefix)
+        (let ((cur (make-range-cursor sl lo hi))
+              (ids '()))
+          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+                do (push (car (last (%sn-key node))) ids))
+          (nreverse ids))))))
 
 (defun ix-put (six key id)
   "Enter node ID under canonical tuple KEY (SIX's full-arity component list).
@@ -509,46 +513,66 @@ store NIL, not the raw id byte array (which SERIALIZE cannot round-trip)."
   (remove-from-skip-list (slot-index-skip-list six) (append key (list id))))
 
 (defun ix-map (six fn &key start end)
-  "Call FN with (KEY ID) for every entry with START <= key <= END (component-
-wise, by %INDEX-VALUE-LESSP), in ascending order; KEY is the component list,
-id excluded.  Open-ended when START/END is NIL.  START/END are tuples --
-full arity, or fewer components (a range endpoint may always be a prefix, no
-:PREFIX flag needed, unlike an equality IX-LOOKUP) -- but never MORE than the
-arity, on EITHER path: %INDEX-BOUNDS is called on each given endpoint up
-front, purely for its arity signal, before branching on which path to take.
-Without this the open-ended (single-bound) path would take an over-arity
-tuple silently: %INDEX-VALUE-LESSP's own length tie-break treats a longer
-tuple as sorting after a shorter one it shares no true prefix relationship
-with, so it would just mis-filter rows out rather than error (GH #107).
+  "Call FN with (KEY ID) for every entry with START <= key <= END, in
+ascending order; KEY is the component list, id excluded.  Open-ended when
+START/END is NIL.  START/END are tuples -- full arity, or fewer components
+(a range endpoint may always be a prefix, no :PREFIX flag needed, unlike an
+equality IX-LOOKUP) -- but never MORE than the arity, which signals.
 
-Bounded ranges (both START and END given) use a range cursor (the efficient
-path), its bounds taken from the precomputed START-BOUNDS/END-BOUNDS --
-START's low bound and END's high bound -- so a short tuple pads the same way
-a prefix IX-LOOKUP does, rather than an id-position sentinel landing in a
-value-position slot.  An open end falls back to an ordered full scan + bound
-filter on the raw (unpadded) START/END, which already tolerates a short
-tuple via %INDEX-VALUE-LESSP's own length tie-break -- only the arity
-ceiling above needs the explicit check."
+A short tuple is a prefix bound on EITHER end, whether or not the other
+bound is given: START stands for its first extension and END for its
+last, so :END '(\"d\") takes every (\"d\" ...) row.  One range cursor
+on every path makes that so by construction: the bounds come from
+%INDEX-BOUNDS with PREFIX T (START's low bound, END's high bound, padded
+with the max sentinels), and a missing bound is the index's own head or
+tail sentinel key.  Before GH #413 a single bound filtered a full scan
+with %INDEX-VALUE-LESSP, under which a strict prefix sorts BEFORE its
+extensions, so the two paths disagreed on a short END (GH #107, #413)."
   (let* ((sl (slot-index-skip-list six))
-         (start-bounds (and start (multiple-value-list
-                                    (%index-bounds six start t))))
-         (end-bounds   (and end   (multiple-value-list
-                                    (%index-bounds six end t)))))
-    (if (and start end)
-        (let ((cur (make-range-cursor sl (first start-bounds)
-                                      (second end-bounds))))
-          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                do (funcall fn (butlast (%sn-key node))
-                            (car (last (%sn-key node))))))
-        ;; Open-ended: ordered full scan, filtering by whatever bound is
-        ;; present.  START-BOUNDS/END-BOUNDS above already signalled on an
-        ;; over-arity tuple; their VALUES are unused here on purpose.
-        (let ((cur (make-cursor sl)))
-          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                for k = (butlast (%sn-key node))
-                when (and (or (null start) (not (%index-value-lessp k start)))
-                          (or (null end)   (not (%index-value-lessp end k))))
-                do (funcall fn k (car (last (%sn-key node)))))))))
+         (arity (length (slot-index-slot-names six)))
+         (lo (if start
+                 (%index-bounds six start t)
+                 (%index-head-key arity)))
+         (hi (if end
+                 (nth-value 1 (%index-bounds six end t))
+                 (%index-tail-key arity)))
+         ;; No map: a transient index (GH #416).
+         (cur (and sl (make-range-cursor sl lo hi))))
+    (when cur
+      (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+            do (funcall fn (butlast (%sn-key node))
+                        (car (last (%sn-key node))))))))
+
+(defun overlay-index-members (ov six &key key prefix start end)
+  "The open transaction's own live nodes that SIX indexes, as
+\(COMPOSITE . NODE) pairs -- COMPOSITE the (v1 ... vn id) key the index
+would hold for NODE -- restricted to those whose tuple equals KEY (or
+starts with it, with PREFIX) or lies in [START, END], in the index's
+own order (GH #408, spec §4.3).  OV is a TX-OVERLAY (tx-overlay.lisp).
+The range is IX-MAP's: the composite against the padded cursor bounds
+each given bound would set, so a short END takes its extensions here
+too, with one bound or both (GH #413)."
+  (let* ((owner (slot-index-owner-name six))
+         (slots (slot-index-slot-names six))
+         (lo (and start (%index-bounds six start t)))
+         (hi (and end (nth-value 1 (%index-bounds six end t))))
+         (out '()))
+    (flet ((in-range-p (c)
+             (and (or (null lo) (not (%index-comp-lessp c lo)))
+                  (or (null hi) (not (%index-comp-lessp hi c))))))
+      (dolist (n (overlay-live-nodes ov))
+        (when (and (typep n owner) (%tuple-indexable-p n slots))
+          (let* ((k (%index-tuple-key six n))
+                 (c (and k (append k (list (id n))))))
+            (when (and k
+                       (if key
+                           (if prefix
+                               (and (<= (length key) (length k))
+                                    (equal key (subseq k 0 (length key))))
+                               (equal key k))
+                           (in-range-p c)))
+              (push (cons c n) out))))))
+    (sort out #'%index-comp-lessp :key #'car)))
 
 (defun ix-count (six)
   "Number of live entries in SIX."
@@ -774,17 +798,35 @@ must degrade to rebuild like any other unreadable sidecar, not fail OPEN-GRAPH."
                             ;; from the caller.  A stale index that answers
                             ;; queries is worse than the useless-but-correct
                             ;; one retraction was meant to remove.
-                            (when (%index-spec-declared-p owner slot-names
-                                                          graph)
-                              (setf (gethash (cons owner slot-names) reg)
-                                    (%make-slot-index
-                                     :owner-name owner :slot-names slot-names
-                                     :canonicalizers (%owner-slot-canonicalizer
-                                                      owner slot-names graph)
-                                     :skip-list (%open-secondary-skip-list
-                                                 graph address
-                                                 (length slot-names)
-                                                 backend))))))))
+                            (if (%index-spec-declared-p owner slot-names
+                                                        graph)
+                                (setf (gethash (cons owner slot-names) reg)
+                                      (%make-slot-index
+                                       :owner-name owner
+                                       :slot-names slot-names
+                                       :canonicalizers
+                                       (%owner-slot-canonicalizer
+                                        owner slot-names graph)
+                                       :skip-list
+                                       (%open-secondary-skip-list
+                                        graph address
+                                        (length slot-names)
+                                        backend)))
+                                ;; Withdrawn/re-shaped: this open is the
+                                ;; safe moment -- nothing can be mid-read
+                                ;; -- so reclaim the orphaned pages
+                                ;; instead of stranding them (GH #147).
+                                (handler-case
+                                    (let ((stale (%open-secondary-skip-list
+                                                  graph address
+                                                  (length slot-names)
+                                                  backend)))
+                                      (delete-view-index stale)
+                                      (log:info "reclaimed retired index ~
+~A.~A (GH #147)" owner slot-names))
+                                  (error (e)
+                                    (warn "could not reclaim retired ~
+index ~A.~A: ~A" owner slot-names e))))))))
                   (error (e)
                     (warn "Secondary index sidecar ~A is unreadable (~A); ~
 rebuilding from live nodes, which are authoritative."
@@ -816,6 +858,10 @@ be dropped outright, and %REQUIRE-INDEX reads that as \"declared, empty\"
   (rebuild-secondary-indexes graph)
   (install-secondary-indexes graph)
   (save-secondary-index-roots graph)
+  ;; The count maps move to the new backend with them and their roots
+  ;; are re-saved; the maps they replace retire to CLOSE-GRAPH (#361).
+  (rebuild-count-indexes graph)
+  (save-count-index-roots graph)
   graph)
 
 ;;; ---------------------------------------------------------------------------
@@ -875,15 +921,24 @@ definition.  SLOT may also be a list of slot names for a composite /
 multi-slot (tuple) index, keyed left to right (GH #107).  Re-evaluating
 an unchanged DEF-INDEX is a no-op; to adopt a changed :CANONICALIZE, force a rebuild
 with REGENERATE-SECONDARY-INDEXES."
-  `(let ((spec (make-index-spec :owner-name ',owner-class
-                                :slot-names (%normalize-slots ',slot)
-                                :graph-name ',graph-name
-                                :name ',name
-                                :canonicalize ,(when canonicalize `',canonicalize))))
-     (register-index-spec spec)
-     (let ((g (lookup-graph ',graph-name)))
-       (when g (%ensure-index-built g spec)))
-     spec))
+  `(ensure-index ',owner-class ',slot ',graph-name
+                 :canonicalize ,(when canonicalize `',canonicalize)
+                 :name ',name))
+
+(defun ensure-index (owner-class slots graph-name &key canonicalize name)
+  "Runtime twin of DEF-INDEX (GH #378): declare an ordered secondary
+index on OWNER-CLASS's SLOTS (a slot name or a list) in GRAPH-NAME from
+data, building it now if the graph is open.  Idempotent; returns the
+INDEX-SPEC.  The macro expands to this."
+  (let ((spec (make-index-spec :owner-name owner-class
+                               :slot-names (%normalize-slots slots)
+                               :graph-name graph-name
+                               :name name
+                               :canonicalize canonicalize)))
+    (register-index-spec spec)
+    (let ((g (lookup-graph graph-name)))
+      (when g (%ensure-index-built g spec)))
+    spec))
 
 (defmacro undef-index (owner-class graph-name &key slots name)
   "Withdraw a DEF-INDEX declaration, by :NAME or by :SLOTS:
@@ -897,9 +952,9 @@ from a graph without guessing, and guessing wrong is silent.
 
 Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152).
 This withdraws the DECLARATION; the index structure it built is dropped at
-the next open, when the sidecar is reconciled
-against the live schema (RESTORE-SECONDARY-INDEX-ROOTS).  Its heap pages are
-not reclaimed -- GH #147."
+the next open, when the sidecar is reconciled against the live schema
+(RESTORE-SECONDARY-INDEX-ROOTS), and its heap pages are reclaimed at that
+same open (GH #147) -- deliberately deferred, never freed mid-image."
   `(%withdrawn-p (unregister-index-spec ',owner-class ',graph-name
                                         :slot-names ',slots :name ',name)
                  :index ',owner-class ',graph-name ',name ',slots))
@@ -969,6 +1024,46 @@ result); signals only when the slot is not indexed at all (a programming error).
                                     class-name slot-name
                                     (graph-name graph)))))))
 
+(defun %overlay-only-index (graph class-name slot-name)
+  "A SLOT-INDEX for the declared index on CLASS-NAME.SLOT-NAME with no
+backing map: owner, slots and canonicalizers from the class's descriptor,
+which is all OVERLAY-INDEX-MEMBERS needs; the IX- walkers read it as
+empty.  NIL when no descriptor matches (GH #416)."
+  (let ((class (ignore-errors (find-class class-name nil)))
+        (slot-names (%normalize-slots slot-name)))
+    (when class
+      (let ((d (find slot-names
+                     (class-secondary-index-descriptors class graph)
+                     :key #'first :test #'equal)))
+        (when d
+          (%make-slot-index
+           :owner-name (second d) :slot-names (first d)
+           :canonicalizers (%resolve-index-canonicalizers
+                            (third d) (length (first d)))))))))
+
+(defun %index-for-read (graph class-name slot-name)
+  "The SLOT-INDEX a read of CLASS-NAME.SLOT-NAME walks: %REQUIRE-INDEX's,
+or -- when that is NIL (declared, nothing committed yet) and the open
+transaction has writes to show -- a transient one with no backing map,
+so the overlay half of the read still runs (GH #416).  NIL when there
+is nothing to read on either side; signals as %REQUIRE-INDEX does."
+  (or (%require-index graph class-name slot-name)
+      (and (current-overlay graph)
+           (%overlay-only-index graph class-name slot-name))))
+
+(defun %index-hit-p (six node key &optional prefix)
+  "True when NODE, as resolved -- at a read snapshot, possibly an older
+version -- still carries KEY in SIX: the whole tuple, or its first
+components under PREFIX.  Membership is released when a write is applied,
+not when the version it indexed is reaped, so an entry can name a node
+whose version at the snapshot held another value (GH #345)."
+  (let ((k (%index-tuple-key six node)))
+    (and k
+         (if prefix
+             (and (>= (length k) (length key))
+                  (equal (subseq k 0 (length key)) key))
+             (equal k key)))))
+
 (defun index-lookup (graph class-name slot-name value
                      &key (collect-p t) prefix)
   "Nodes of CLASS-NAME (and subclasses) whose indexed slot(s) equal VALUE, via
@@ -981,15 +1076,28 @@ tuple with a null component is still findable this way -- see
 ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
 (GH #107)."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => no matches
       (let ((key (%index-key six value))
-            (result '()))
+            (result '())
+            ;; GH #408: the walk skips the open transaction's own ids;
+            ;; its own matching nodes follow (spec §4.3).
+            (ov (current-overlay graph)))
         (when key
           (dolist (id (ix-lookup six key :prefix prefix))
-            (let ((node (%node-by-id id graph)))
-              (when (and node (not (deleted-p node)))
-                (if collect-p (push node result) (return-from index-lookup t))))))
+            (unless (and ov (overlay-effective-write ov id))
+              (let ((node (%node-by-id id graph)))
+                (when (and node (not (deleted-p node))
+                           (%index-hit-p six node key prefix))
+                  (if collect-p
+                      (push node result)
+                      (return-from index-lookup t))))))
+          (when ov
+            (dolist (m (overlay-index-members ov six :key key
+                                                     :prefix prefix))
+              (if collect-p
+                  (push (cdr m) result)
+                  (return-from index-lookup t)))))
         (when collect-p (nreverse result))))))
 
 (defun map-index (fn graph class-name slot-name &key start end)
@@ -997,19 +1105,39 @@ ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
 [START,END] (inclusive; open-ended when NIL), in ascending value order.  START/
 END are scalars for a single-slot index; for a multi-slot index each is a
 tuple (list of component values) -- full arity, or fewer components, which
-bound only on the components given (GH #107).  Resolves ids in GRAPH."
+bound only on the components given: a short START begins at its first
+extension and a short END ends after its last, so :END '(\"d\") includes
+every (\"d\" ...) row, with or without a START (GH #107, #413).  Resolves
+ids in GRAPH."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => nothing to map
-      (let ((skey (and start (%index-key six start)))
-            (ekey (and end   (%index-key six end))))
-        (ix-map six
-                (lambda (key id)
-                  (declare (ignore key))
-                  (let ((node (%node-by-id id graph)))
-                    (when (and node (not (deleted-p node)))
-                      (funcall fn node))))
-                :start skey :end ekey)))))
+      (let* ((skey (and start (%index-key six start)))
+             (ekey (and end   (%index-key six end)))
+             ;; GH #408: own ids are skipped in the walk and the
+             ;; transaction's own members merged in at their keys, so
+             ;; the ascending order holds (spec §4.3).
+             (ov (current-overlay graph))
+             (pending (and ov (overlay-index-members ov six :start skey
+                                                            :end ekey))))
+        (flet ((emit-own-before (composite)
+                 ;; Every pending own member sorting before COMPOSITE;
+                 ;; all of them when COMPOSITE is NIL.
+                 (loop while (and pending
+                                  (or (null composite)
+                                      (%index-comp-lessp
+                                       (car (first pending)) composite)))
+                       do (funcall fn (cdr (pop pending))))))
+          (ix-map six
+                  (lambda (key id)
+                    (unless (and ov (overlay-effective-write ov id))
+                      (let ((node (%node-by-id id graph)))
+                        (when (and node (not (deleted-p node))
+                                   (%index-hit-p six node key))
+                          (emit-own-before (append key (list id)))
+                          (funcall fn node)))))
+                  :start skey :end ekey)
+          (emit-own-before nil))))))
 
 (defun index-range (graph class-name slot-name &key start end)
   "Nodes of CLASS-NAME (and subclasses) whose SLOT-NAME is in [START,END], ascending.
@@ -1019,6 +1147,139 @@ GRAPH."
     (map-index (lambda (node) (push node result)) graph class-name slot-name
                :start start :end end)
     (nreverse result)))
+
+;;; ---------------------------------------------------------------------------
+;;; Distinct-prefix walk and counts (GH #350).
+;;;
+;;; MAP-INDEX-PREFIXES reports each distinct leading prefix once by
+;;; seek-and-skip: one range cursor per prefix, opened at the previous
+;;; prefix's high bound (%INDEX-BOUNDS with PREFIX T), which sorts past
+;;; every tuple sharing it.  Never IX-MAP's open-ended path (a full
+;;; scan).  No lock of its own -- MAKE-RANGE-CURSOR / CURSOR-NEXT own
+;;; locking per backend and nesting deadlocks on ECL (skip-list.lisp) --
+;;; so a walk is not an atomic snapshot.  Spec: docs/superpowers/specs/
+;;; 2026-09-07-claim-vocabulary-design.md §2.
+
+(defun %ix-first (six lo hi &optional ov)
+  "The first entry of SIX with LO <= key <= HI whose id has no effective
+write under OV (any entry when OV is NIL), as (COMPONENTS . ID), or NIL.
+One seek, and one step per own id skipped (GH #409)."
+  (let ((cur (and (slot-index-skip-list six)   ; no map: GH #416
+                  (make-range-cursor (slot-index-skip-list six) lo hi))))
+    (when cur
+      (loop for node = (cursor-next cur :eoc)
+            until (eql node :eoc)
+            do (let ((key (%sn-key node)))
+                 (unless (and ov (overlay-effective-write
+                                  ov (car (last key))))
+                   (return (cons (butlast key) (car (last key))))))))))
+
+(defun %ix-prefix-out (components arity)
+  "The first ARITY of COMPONENTS, +NULL-COMPONENT+ read back as NIL."
+  (loop for v in components
+        repeat arity
+        collect (if (eq v +null-component+) nil v)))
+
+(defun %ix-start-key (six start arity)
+  "START as the canonical key a walk at ARITY begins from: NIL maps to
++NULL-COMPONENT+ and canonicalizers apply (%INDEX-KEY); the head key
+when START is NIL.  Signals on more than ARITY components."
+  (let ((n (length (slot-index-slot-names six))))
+    (if (null start)
+        (%index-head-key n)
+        (let ((vals (if (listp start) start (list start))))
+          (when (> (length vals) arity)
+            (error 'query-precondition-error
+                   :reason (format nil "A :START of ~D component(s) for ~
+a prefix walk at arity ~D" (length vals) arity)))
+          (or (%index-key six (if (= n 1) (first vals) vals))
+              ;; Full arity, every component null: still a real prefix
+              ;; here, unlike an equality lookup (GH #107).
+              (make-list (length vals)
+                         :initial-element +null-component+))))))
+
+(defun map-index-prefixes (fn graph class-name slot-name
+                           &key (arity 1) start)
+  "Call FN with each distinct leading prefix of ARITY components held by
+the index on CLASS-NAME.SLOT-NAME -- a list, NIL for a null component --
+in index order, once each.  START (a value, or a tuple of at most ARITY
+components) begins at the first prefix at or after it.  One seek per
+distinct prefix, never a scan (GH #350).  Inside an open transaction
+the prefixes are those it will commit: the walk skips its own ids and
+its own nodes' prefixes are merged in, each once (GH #409).  Trap:
+membership is live and a walk is not an atomic snapshot; resolve a
+prefix's nodes when a snapshot or a deletion matters."
+  (let* ((*graph* graph)
+         (six (%index-for-read graph class-name slot-name)))
+    (when six                   ; NIL => declared but empty => no prefixes
+      (let ((n (length (slot-index-slot-names six))))
+        (unless (<= 1 arity n)
+          (error 'query-precondition-error
+                 :reason (format nil "Index on ~S has arity ~D; cannot ~
+walk prefixes of ~D" (slot-index-slot-names six) n arity)))
+        (let* ((hi (%index-tail-key n))
+               (lo (%ix-start-key six start arity))
+               ;; GH #409: the own members at or past LO, in composite
+               ;; order, merged in before each committed entry they
+               ;; precede; EMITTED collapses a prefix seen from both.
+               (ov (current-overlay graph))
+               (pending (and ov (remove-if
+                                 (lambda (m) (%index-comp-lessp (car m) lo))
+                                 (overlay-index-members ov six))))
+               (emitted nil))
+          (labels ((emit (prefix)
+                     (unless (equal prefix emitted)
+                       (setf emitted prefix)
+                       (funcall fn (%ix-prefix-out prefix arity))))
+                   (emit-own-before (composite)
+                     (loop while (and pending
+                                      (or (null composite)
+                                          (%index-comp-lessp
+                                           (car (first pending)) composite)))
+                           do (emit (subseq (car (pop pending)) 0 arity)))))
+            (loop
+              (let ((entry (%ix-first six lo hi ov)))
+                (when (null entry) (return))
+                (let ((prefix (subseq (car entry) 0 arity)))
+                  (emit-own-before (append (car entry) (list (cdr entry))))
+                  (emit prefix)
+                  ;; Hop: PREFIX's high bound sorts past every tuple
+                  ;; sharing it, so the next seek lands on the next
+                  ;; prefix.
+                  (setf lo (nth-value 1 (%index-bounds six prefix t))))))
+            (emit-own-before nil)))))))
+
+(defun index-count (graph class-name slot-name value &key prefix)
+  "Number of entries in the index on CLASS-NAME.SLOT-NAME whose tuple
+equals VALUE, or with PREFIX T starts with it; 0 when none.  Same VALUE
+and PREFIX rules as INDEX-LOOKUP.  Entries, not live nodes; inside an
+open transaction, the entries it will commit: its own ids are skipped
+in the walk and its own matching nodes added (GH #350, #409).  Trap: it
+is O(range size) -- a count of a large prefix walks every entry under
+it."
+  (let* ((*graph* graph)
+         (six (%index-for-read graph class-name slot-name)))
+    (if (null six)
+        0
+        (let ((key (%index-key six value)))
+          (if (null key)
+              0                 ; an all-null full tuple matches nothing
+              (multiple-value-bind (lo hi) (%index-bounds six key prefix)
+                (let ((cur (and (slot-index-skip-list six) ; GH #416
+                                (make-range-cursor
+                                 (slot-index-skip-list six) lo hi)))
+                      (ov (current-overlay graph))
+                      (n 0))
+                  (when cur
+                    (loop for node = (cursor-next cur :eoc)
+                          until (eql node :eoc)
+                          unless (and ov (overlay-effective-write
+                                          ov (car (last (%sn-key node)))))
+                            do (incf n)))
+                  (when ov
+                    (incf n (length (overlay-index-members
+                                     ov six :key key :prefix prefix))))
+                  n)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Prolog surface -- index-backed GENERATOR predicates (GH #102).
@@ -1067,6 +1328,20 @@ covers ?CLASS.?SLOT."
         (slot (var-deref ?slot))
         (value (var-deref ?value)))
     (dolist (node (index-lookup *graph* class slot value))
+      (let ((old-trail (fill-pointer *trail*)))
+        (when (unify node-var node)
+          (funcall cont))
+        (undo-bindings old-trail)))))
+
+(def-global-prolog-functor find-by-unique/4 (?node ?class ?slot ?value cont)
+  "Yield the node of ?CLASS (or a subclass) holding ?VALUE under the
+unique constraint on ?CLASS.?SLOT -- at most once -- via UNIQUE-LOOKUP.
+?SLOT is a slot name or a DEF-UNIQUE slot list, ?VALUE then its
+components.  Signals if nothing declares the constraint (GH #415)."
+  (let ((node-var (var-deref ?node))
+        (node (unique-lookup *graph* (var-deref ?class) (var-deref ?slot)
+                             (var-deref ?value))))
+    (when node
       (let ((old-trail (fill-pointer *trail*)))
         (when (unify node-var node)
           (funcall cont))

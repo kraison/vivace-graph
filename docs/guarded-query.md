@@ -1,0 +1,280 @@
+# graph-db/query: running untrusted query text safely
+
+`graph-db/query` (GH #322) is a web-free ASDF subsystem,
+`:depends-on (:graph-db/core)` only, holding the two reviewed ways to
+run query text an operator did not write: the JSON pattern DSL
+(package `graph-db`, `query/dsl.lisp`, GH #44/#278) and the free-text
+Prolog guard (package `graph-db.query`, `query/guard.lisp`, GH #279).
+Both used to sit above `graph-db/core`, never below it, but not in
+the same place: the DSL lived in the web system (`rest.lisp`, then
+`query-dsl.lisp`), kept out of core by one ningle line setting an
+ndjson content type; the guard lived inside `graph-db/gui`. Either
+way, any consumer that only wanted a bounded query tool -- not a GUI,
+not ningle -- had to load a web stack to reach them. A tenant that
+hands a language model a query tool depends on `graph-db/core` and
+`graph-db/spacetime` and must not pull one in (kraison/cl-llm#14 unit
+2); homing both here is what makes that possible.
+
+## Loading it
+
+```lisp
+(ql:quickload :graph-db/query)
+```
+
+Pulls in `graph-db/core` and nothing web-facing. The exported guard
+API lives in `graph-db.query`; the DSL's exports (`compile-pattern-query`,
+`run-query-goals`, `run-pattern-query`, `def-query`, and friends) stay
+in `graph-db` as before.
+
+## `run-guarded-prolog`
+
+```lisp
+(run-guarded-prolog text graph &key limit offset max-inferences timeout
+                                     (format :data))
+  => (values columns rows truncated-p)
+```
+
+Screens `text` character-by-character before the reader ever sees it,
+reads it into a per-call scratch package that uses nothing, walks and
+rebuilds the resulting forms out of canonical, whitelisted symbols, and
+runs the result through the DSL's own runner (`:effects nil`, one
+snapshot, the inference/time/row bounds) -- all before deleting the
+scratch package in an `unwind-protect`, on every exit path including a
+refusal.
+
+**Execution is interpreted, not compiled** (GH #373). `select` turns the
+goals into a Lisp lambda; `run-query-goals` evaluates that form under
+SBCL's interpreter (`sb-ext:*evaluator-mode* :interpret`) instead of the
+native compiler. A native compile cost 18–20 ms per request and was
+about 94% of a small query's time; interpreted solving runs roughly 2×
+slower than compiled solving, so the interpreter wins for any query
+whose compiled solving takes under ~20 ms — which, at the runner's
+default inference budget, is nearly all of them. Measured on the #372
+bench: a two-hop `related/3` read went from ~55 to ~700–1100 queries per
+second, and a 500-row scan from ~30 to ~50 per second. The same applies
+to the JSON pattern DSL and to `graph-db/rules`, which run through the
+same function. A compiled-form cache for hot, repeated shapes is the
+Prolog engine epic's follow-up.
+
+- **Columns** are the query's `?variables` in first-appearance order,
+  as camelCase wire strings without the `?` (`?min-age` becomes
+  `"minAge"`, via the DSL's `%query-var-field`) -- the same spelling
+  the GUI's wire format already used.
+- **Rows** are one list per solution, in solution order, shaped by
+  `format`:
+  - `:data` (the default): every cell through `%query-value->json` --
+    a node becomes its id string, everything else a string, a number,
+    `t`, or `nil`. `nil` covers both an unbound variable and an empty
+    slot; the two are not distinguished. Example:
+
+    ```lisp
+    (run-guarded-prolog
+     "(is-a ?i qt-item) (node-slot-value ?i label ?l)" graph)
+    => (values ("i" "l")
+               (("N1a2b3c..." "a") ("N4d5e6f..." "b") ("N789abc..." "c"))
+               nil)
+    ```
+  - `:raw`: the values Prolog actually bound, nodes included. For
+    in-image Lisp callers only -- nothing raw is meant to cross a wire.
+    Example:
+
+    ```lisp
+    (run-guarded-prolog "(is-a ?i qt-item)" graph :format :raw)
+    => (values ("i") ((#<vertex qt-item ...>) (#<vertex qt-item ...>)
+                       (#<vertex qt-item ...>))
+               nil)
+    ```
+
+**Budgets and truncation.** `limit` is clamped to
+`*query-default-limit*` (1000). `max-inferences` and `timeout` bind
+`*query-default-max-inferences*` and `*query-default-timeout*` for the
+call; left out, the specials' current values apply. Below the cap,
+the runner asks the DSL for one row past it: `truncated-p` is `t`
+when that extra row shows up (more solutions exist than were
+returned) and `nil` when the result set exactly fills or falls under
+the cap. At the ceiling -- `limit` omitted or `>=
+*query-default-limit*` -- there is no room for the extra row
+(`%probe`), so an exactly-full page there reads as `truncated-p` `t`
+too; only a page short of 1000 rows is `nil` at the ceiling.
+
+## Paging (GH #387)
+
+`offset` (default none) skips that many solutions before the first
+row is kept, so `limit`-sized windows at offsets 0, `limit`,
+2·`limit`, ... concatenate to the unpaged answer in its order, and
+`truncated-p` is per page: `t` while a further page exists. A
+non-positive or non-integer `offset` is no offset.
+
+```lisp
+(run-guarded-prolog text graph :limit 100)              ; page 1
+(run-guarded-prolog text graph :limit 100 :offset 100)  ; page 2
+```
+
+What this is and is not:
+
+- **The order is the engine's solution order** -- goal-execution
+  order, each route's own order within a goal -- documented per route
+  in `docs/rules.md` "Solution order" for `claim/7` (stores in scope,
+  then ascending key, then a key's claims in index order). It is
+  stable while no write lands; a write between two pages can move a
+  row across a page boundary, the ordinary offset trade-off. A caller
+  who needs a boundary a write cannot move bounds a **key** instead:
+  `</2` and `>/2` order two strings lexically since GH #387, so
+  `(> ?k "last-key-seen")` after an indexed goal restarts after that
+  key.
+- **Offset re-does the skipped work.** The skipped solutions are still
+  produced -- and still count against `max-inferences` and `timeout`,
+  which bind per call -- so a deep page of a large answer costs what
+  every page before it cost. Size the budget for the deepest page, or
+  page by key, whose cost is the discarded keys' claims rather than
+  every earlier solution.
+- **Not a snapshot cursor.** Each call runs under its own read
+  snapshot; nothing is held between pages, so nothing expires and
+  nothing needs a token. A resumable cursor -- a suspended run holding
+  its snapshot for the life of a token -- is the alternative the issue
+  named first and is not built: it means a thread per open cursor
+  holding a read pin, with an expiry policy the engine does not have
+  today. Offset plus key bounding covers the paging a service exposes
+  now; the cursor stays open as a design question on #387's thread.
+
+## The condition contract
+
+| what happened | signaled as | caller sees | logged |
+|---|---|---|---|
+| guard refusal (bad char, unregistered functor, qualified or string head, ...) | `prolog-guard-error` | `prolog-guard-error-reason`, names the token, client-safe | no |
+| engine's own reviewed conditions (`prolog-error` family, `query-param-error`) | passed through unchanged | the original condition and report | no |
+| a goal refused as cost-unbounded (`prolog-cost-unbounded-error`, a `prolog-error`; GH #285) | passed through unchanged | the report names the functor and says the budget cannot bound it -- handle it before the generic `prolog-error` clause, or it reads as a malformed goal (GH #389) | no |
+| ill-typed goal arguments | `prolog-ill-typed-error` | fixed text, "ill-typed query" | yes, "ill-typed query" label |
+| anything else -- an engine defect | `prolog-server-fault` | fixed text, "internal error" | yes, "UNEXPECTED SERVER FAULT" label |
+
+`prolog-ill-typed-error` and `prolog-server-fault` deliberately carry no
+detail: the conditions they stand in for can report engine internals --
+a store's keyword name, a generic-function name, an ANSI section
+reference -- to a client that is, on the free-text surface, otherwise
+unauthenticated. The detail goes to the log, never to the caller.
+
+## Head resolution (GH #322, second finding)
+
+A goal's head resolves by lookup before it interns anything: an
+already-registered functor in the head symbol's own package first,
+then in `graph-db`, where the engine's built-ins are registered under
+their literal name -- which is why a CL-inherited head like `>`, `atom`,
+or `write` (whose home package is always `common-lisp`, never
+`graph-db`) still finds the engine's functor. This is what lets one
+goal list name a global functor and a schema's own edge functor
+together, since each now resolves in its own home instead of a single
+shared `*package*` binding. Only `<-` (`add-clause`) skips both lookups
+and interns straight into `*package*`, via a `:define t` argument, so a
+schema-package clause defines its own functor rather than silently
+landing on an existing `graph-db` functor of the same name; the guard's
+rebuilt heads (`graph-db::is-a`, `schema::follows`, ...) each take the
+lookup path.
+
+This has a trade: with `:define t` the definition itself still lands
+in `*package*` as before, but a *call* whose head is a
+`common-lisp` symbol that collides with a `graph-db` global functor's
+literal name (`write`, `atom`, `not`, `>`, ...) resolves to the
+engine's functor rather than a same-named clause the user package
+defined -- the right choice, since those CL-inherited heads are
+exactly what the lookup exists to serve.
+
+## `schema-type-names`
+
+```lisp
+(schema-type-names graph parent)
+  => (name-symbol ...)
+```
+
+The vertex or edge class names (`parent` one of `:vertex` or `:edge`)
+registered in `graph`'s schema, sorted by name. Used to build the
+guard's own schema-name table (`%schema-name-table`) and, since #322,
+called qualified by `gui/api.lisp` for the same purpose the GUI's
+`/api/graphs/:name/types` route always served.
+
+## `guard-query-text` (GH #331)
+
+```lisp
+(guard-query-text text graph)
+  => (values vars goals)
+```
+
+The compile half of `run-guarded-prolog`, for a caller that keeps the
+goals instead of running them once: `text` screened, read and guarded
+against `graph` exactly as above, with `vars` in first-appearance
+order. Refusals signal `prolog-guard-error`, the same contract.
+
+The scratch package the read interned into is **deleted before this
+returns**, so every `?variable` comes back uninterned. They stay `eq`
+across the goals, which is all the engine asks of a variable
+(`graph-db::variable-p` is name-based), and they cannot collide with
+anything the caller's own package holds. `graph-db/rules` compiles a
+rule's head and body through this, as one text so a variable shared
+between them reads as one symbol (`docs/rules.md`).
+
+## What the guard admits
+
+The whitelist, the exclusions, and the control-word list are derived
+from the live image, not hand-listed here -- see `query/guard.lisp`'s
+header and the block comments above `*prolog-excluded-predicates*`,
+`*prolog-goal-argument-control*`, and `*prolog-cost-unbounded-predicates*`
+for exactly what is admitted and why each exclusion exists.
+
+**Defence in depth, not the front line.** The GUI Prolog handler still
+has a `cost-unbounded-goal` arm (`prolog-cost-unbounded-error`), but it
+is normally unreachable through the guard: the whitelist already
+refuses an engine-homed cost-unbounded name by name before the goal
+ever runs, and a schema-homed name of the same spelling now runs the
+schema's own functor instead of the engine's excluded one. The arm
+exists for the case neither of those covers, not as the mechanism that
+enforces the exclusion.
+
+Two things a new caller reliably gets wrong first:
+
+- **Type and slot names are bare, never keyword-spelled.** Write
+  `(is-a ?x qt-item)`, not `(is-a ?x :qt-item)`. The character screen
+  refuses every `:` outright, before the reader runs -- a
+  keyword-spelled type name is a refusal, not a match.
+- **Package-qualified anything is refused for the same reason:** the
+  screen refuses `:` textually so that `READ` can never intern into
+  `graph-db` or a schema package from client text.
+
+Three things `node-slot-value/3` does that the bare functor list does
+not say (GH #351):
+
+- **A keyword-valued slot is filtered by a string.** The screen admits
+  no keyword spelling, so `(node-slot-value ?i kind "widget")` matches
+  a slot holding `:widget`, case-insensitively; so does `(= ?k
+  "WIDGET")` after binding. Two strings stay case-sensitive.
+- **An unbound node enumerates.** `(node-slot-value ?i label "b")`
+  alone finds every vertex whose type declares `label` with that
+  value; no `is-a` needed. This is a full scan of every vertex of
+  every type, one inference charged per vertex visited against
+  `:max-inferences`/`:timeout`, same as `is-a/2`'s both-unbound arm.
+  A vertex whose type lacks the slot is skipped, never read as null;
+  by contrast, a vertex bound earlier in the query (by `is-a`, say)
+  whose type lacks the slot still reads that slot as null -- only the
+  enumeration skips.
+- **An unbound slot lists the slots.** `(node-slot-value ?i ?s ?v)`
+  yields one row per data slot of the vertex's type, `?s` the slot
+  name as a keyword and `?v` its value or null.
+
+## Callers
+
+`graph-db/rules` is a caller of `guard-query-text`: `compile-rule`
+guards a stored rule's text with it, so rule text is screened by
+exactly the rules client free text is (`docs/rules.md`, GH #331).
+
+The GUI's free-text Prolog workbench (`gui/prolog.lisp`, behind
+`START-GUI`'s `:allow-prolog` flag) is a caller: it calls
+`run-guarded-prolog` with the request's limit and `:data`, and wraps
+the result in its JSON envelope. The REST `/graph/:graph-name/query`
+route is a caller of the DSL side of this subsystem, running the JSON
+pattern DSL (`run-pattern-query`) rather than free-text Prolog -- it
+does not go through `run-guarded-prolog`.
+
+## Consumers outside this repo
+
+kraison/cl-llm's `cl-llm/agent/prolog` query tool re-homes onto
+`graph-db/query` (filed at landing); kraison/blackboard slice 1's
+`select` and slice 3's structure tier build directly on
+`run-guarded-prolog` and `schema-type-names`.

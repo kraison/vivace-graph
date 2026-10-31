@@ -207,51 +207,66 @@ name, location, open/closed -- no stats."
 ;; CLOSE-GRAPH itself is untouched.
 (defvar *gui-rw-lock* (graph-db::make-rw-lock))
 
+(defvar *read-only* nil
+  "True when THIS REQUEST must refuse the open/close verbs.  Bound
+around each request by the app MAKE-GUI-APP builds, from its
+:READ-ONLY (GH #384).")
+
+(defmacro with-write-verb (() &body body)
+  "Run BODY, a management verb, unless this request is read-only: then
+answer 403 read-only instead (GH #384)."
+  `(if *read-only*
+       (gui-error 403 "read-only"
+                  "This GUI is read-only; open and close are refused")
+       (progn ,@body)))
+
 (def-gui-handler api-open-graph (params)
-  (let ((wire (param params :name)))
-    (graph-db::with-write-lock (*gui-rw-lock*)
-      (let ((open (find-open-graph wire)))
-        (if open
-            (%json-response (list (cons :name wire) (cons :open t)
-                                  (cons :status "already-open")))
-            (let ((entry (find-roster-entry wire)))
-              (cond
-                ((null entry)
-                 (gui-error 404 "unknown-graph"
-                            (format nil "Unknown graph ~A" wire)))
-                ((null (roster-entry-location entry))
-                 (gui-error 404 "no-recorded-location"
-                            (format nil "No recorded location for ~
+  (with-write-verb ()
+    (let ((wire (param params :name)))
+      (graph-db::with-write-lock (*gui-rw-lock*)
+        (let ((open (find-open-graph wire)))
+          (if open
+              (%json-response (list (cons :name wire) (cons :open t)
+                                    (cons :status "already-open")))
+              (let ((entry (find-roster-entry wire)))
+                (cond
+                  ((null entry)
+                   (gui-error 404 "unknown-graph"
+                              (format nil "Unknown graph ~A" wire)))
+                  ((null (roster-entry-location entry))
+                   (gui-error 404 "no-recorded-location"
+                              (format nil "No recorded location for ~
 graph ~A; the GUI opens stores only at their roster location" wire)))
-                ((not (uiop:directory-exists-p
-                       (roster-entry-location entry)))
-                 (gui-error 404 "location-missing"
-                            (format nil "Recorded location ~A for ~
+                  ((not (uiop:directory-exists-p
+                         (roster-entry-location entry)))
+                   (gui-error 404 "location-missing"
+                              (format nil "Recorded location ~A for ~
 graph ~A no longer exists"
-                                    (roster-entry-location entry)
-                                    wire)))
-                (t
-                 ;; Strictly at the recorded location -- no free-form
-                 ;; paths.  A dirty store signals STORE-NOT-CLOSED-
-                 ;; CLEANLY-ERROR, which DEF-GUI-HANDLER maps to 409.
-                 (graph-db:open-graph (roster-entry-name entry)
-                                      (roster-entry-location entry))
-                 (%json-response
-                  (list (cons :name wire) (cons :open t)
-                        (cons :status "opened")))))))))))
+                                      (roster-entry-location entry)
+                                      wire)))
+                  (t
+                   ;; Strictly at the recorded location -- no free-form
+                   ;; paths.  A dirty store signals STORE-NOT-CLOSED-
+                   ;; CLEANLY-ERROR, which DEF-GUI-HANDLER maps to 409.
+                   (graph-db:open-graph (roster-entry-name entry)
+                                        (roster-entry-location entry))
+                   (%json-response
+                    (list (cons :name wire) (cons :open t)
+                          (cons :status "opened"))))))))))))
 
 (def-gui-handler api-close-graph (params)
-  (let ((wire (param params :name)))
-    (graph-db::with-write-lock (*gui-rw-lock*)
-      (let ((graph (find-open-graph wire)))
-        (if graph
-            (progn
-              (graph-db:close-graph graph)
-              (%json-response (list (cons :name wire)
-                                    (cons :open (%bool nil))
-                                    (cons :status "closed"))))
-            (gui-error 409 "not-open"
-                       (format nil "Graph ~A is not open" wire)))))))
+  (with-write-verb ()
+    (let ((wire (param params :name)))
+      (graph-db::with-write-lock (*gui-rw-lock*)
+        (let ((graph (find-open-graph wire)))
+          (if graph
+              (progn
+                (graph-db:close-graph graph)
+                (%json-response (list (cons :name wire)
+                                      (cons :open (%bool nil))
+                                      (cons :status "closed"))))
+              (gui-error 409 "not-open"
+                         (format nil "Graph ~A is not open" wire))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Read endpoints.  Each resolves its graph per request; a closed or
@@ -270,16 +285,8 @@ close cannot unmap the store mid-read (GH #269)."
                       (format nil "Graph ~A is not open"
                               (param ,params :name)))))))
 
-(defun %schema-type-names (graph parent)
-  "Node-type names (class symbols) registered for PARENT (:vertex or
-:edge) in GRAPH's schema, sorted by name."
-  (let ((names '()))
-    (maphash (lambda (key meta)
-               (when (numberp key)
-                 (push (graph-db::node-type-name meta) names)))
-             (gethash parent (graph-db::schema-type-table
-                             (graph-db::schema graph))))
-    (sort names #'string< :key #'symbol-name)))
+;; SCHEMA-TYPE-NAMES moved to GRAPH-DB.QUERY (GH #322); called
+;; qualified below.
 
 (defun %wire-symbol (symbol)
   "SYMBOL as its wire spelling: the engine's own name, downcased kebab
@@ -309,18 +316,23 @@ sweep of each table."
 (defun %on-disk-size (graph)
   "Total bytes of the files under GRAPH's directory; unreadable files
 count zero."
-  (let ((total 0))
+  (let ((apparent 0) (allocated 0))
     (fad:walk-directory
      (graph-db::location graph)
      (lambda (file)
-       (incf total
-             (or (ignore-errors
-                  (with-open-file (s file :element-type
-                                       '(unsigned-byte 8))
-                    (file-length s)))
-                 0)))
+       (let ((size (or (ignore-errors
+                        (with-open-file (s file :element-type
+                                             '(unsigned-byte 8))
+                          (file-length s)))
+                       0)))
+         (incf apparent size)
+         ;; Sparse mmap stores: GiB apparent for MiB of data (GH #274).
+         (incf allocated (or (ignore-errors
+                              (graph-db::%posix-allocated-size
+                               (namestring file)))
+                             size))))
      :directories nil)
-    total))
+    (values allocated apparent)))
 
 (defun %schema-summary (graph parent)
   "[{name, slots:[...]}] for PARENT's node types."
@@ -340,7 +352,7 @@ count zero."
                                     (and meta
                                          (graph-db::node-type-slots
                                           meta)))))))))
-          (%schema-type-names graph parent)))
+          (graph-db.query:schema-type-names graph parent)))
 
 (defun %index-inventory (graph)
   "DEF-INDEX specs + spatial indexes registered for GRAPH."
@@ -393,7 +405,14 @@ count zero."
                                            (%wire-symbol (cdr pair))))))
                             (graph-db::list-views graph))))
              (cons :indexes (%arr (%index-inventory graph)))
-             (cons :on-disk-bytes (%on-disk-size graph))
+             ;; :ON-DISK-BYTES is the ALLOCATED size since GH #274 --
+             ;; the honest operator number for sparse mmap stores;
+             ;; :APPARENT-BYTES keeps the old sum.
+             (multiple-value-bind (allocated apparent)
+                 (%on-disk-size graph)
+               (cons :on-disk-bytes allocated))
+             (cons :apparent-bytes
+                   (nth-value 1 (%on-disk-size graph)))
              (cons :schema
                    (%obj
                     (list (cons :vertex-types
@@ -406,11 +425,13 @@ count zero."
   (with-gui-graph (graph params)
     (%json-response
      (list (cons :vertex-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :vertex))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :vertex))))
            (cons :edge-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :edge))))))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :edge))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Node sample, inspection, neighborhood
@@ -540,7 +561,7 @@ are domain identifiers a query author types, not protocol (GH #277)."
 ;;; ---------------------------------------------------------------------
 ;;; Query workbench (GH #278).  The body is the same structured DSL
 ;;; rest.lisp's /graph/:g/query route accepts, compiled and run by the
-;;; SHARED implementation in query-dsl.lisp -- read-only, snapshot-
+;;; SHARED implementation in query/dsl.lisp -- read-only, snapshot-
 ;;; isolated and capped, exactly as REST gets it.  Nothing here parses
 ;;; or reads user text into symbols beyond what that compiler does.
 ;;; ---------------------------------------------------------------------
@@ -611,27 +632,40 @@ lose the spelling the DSL chose for each result variable."
                   (cons (car cell) (%json-value (cdr cell))))
                 row)))
 
-(defun %query-envelope (json-string cap probe)
+(defun %query-envelope-from-rows (columns rows cap truncated)
   "The workbench result envelope -- {columns, rows, rowCount, limit,
-truncated} -- for RUN-QUERY-GOALS' JSON-STRING, run under PROBE rows
-and answered under CAP.  Shared by the builder endpoint and the
-free-text Prolog one so one results table renders both (GH #278, #279)."
+truncated} -- built directly from already-JSON-shaped ROWS (one list
+of cells per COLUMNS, positional).  Shared by %QUERY-ENVELOPE and the
+free-text Prolog endpoint, so one results table renders both (GH #278,
+#279, #322)."
+  (%json-response
+   (list
+    (cons :columns (%arr columns))
+    (cons :rows (%arr (mapcar (lambda (row)
+                                (%query-row-json (mapcar #'cons columns row)))
+                              rows)))
+    (cons :row-count (length rows))
+    (cons :limit cap)
+    (cons :truncated (%bool truncated)))))
+
+(defun %query-envelope (json-string cap probe)
+  "The workbench result envelope for RUN-QUERY-GOALS' JSON-STRING, run
+under PROBE rows and answered under CAP.  Decodes the string, then
+shares %QUERY-ENVELOPE-FROM-ROWS' response building with the free-text
+Prolog endpoint (GH #278, #279, #322)."
   (let* ((rows (%decode-query-rows json-string))
          (n (length rows))
          ;; The probe row proves there was more; it is never shown.
          ;; Without room for it, >= is the best the runner's own clamp
          ;; allows.
          (truncated (if (> probe cap) (> n cap) (>= n cap)))
-         (shown (if (> n cap) (subseq rows 0 cap) rows)))
-    (%json-response
-     (list
-      ;; QUERY-ROW->ALIST builds every row in select order, so the
-      ;; first row names the columns.
-      (cons :columns (%arr (mapcar #'car (first shown))))
-      (cons :rows (%arr (mapcar #'%query-row-json shown)))
-      (cons :row-count (length shown))
-      (cons :limit cap)
-      (cons :truncated (%bool truncated))))))
+         (shown (if (> n cap) (subseq rows 0 cap) rows))
+         ;; QUERY-ROW->ALIST builds every row in select order, so the
+         ;; first row names the columns.
+         (columns (mapcar #'car (first shown))))
+    (%query-envelope-from-rows
+     columns (mapcar (lambda (row) (mapcar #'cdr row)) shown)
+     cap truncated)))
 
 ;; The whole query runs under WITH-GUI-GRAPH's read side, so a slow one
 ;; delays open/close for up to the DSL's *QUERY-DEFAULT-TIMEOUT*.  That

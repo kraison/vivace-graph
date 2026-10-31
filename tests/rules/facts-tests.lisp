@@ -1,0 +1,756 @@
+;;;; tests/rules/facts-tests.lisp -- claims as Prolog facts (spec §4,
+;;;; GH #330).
+
+(in-package #:graph-db/rules-test)
+
+(in-suite rules-suite)
+
+;; Every goal that must take an index route runs under a budget.  Without
+;; one the family walk is legal (R7) and answers the same rows, so a route
+;; that silently degraded to it would pass; with one the walk refuses, so
+;; only the route can pass.  Under the guard a budget is always in effect,
+;; which is what makes that degradation a user-visible refusal.
+
+(test claim-generates-from-the-subject-relation-index
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?o)
+                  (claim ?c rt-claim "host" "h1" "runs" "app" ?o))))
+      (is (equal '("db" "web")
+                 (sort (mapcar #'first rows) #'string<))))))
+
+;; The subject index is the route only while the relation is unbound; a
+;; bound one takes the row above.  Both answer the same rows -- the
+;; subject index is a prefix of the subject-relation one and
+;; %UNIFY-CLAIM filters the relation either way -- so this guards route
+;; SELECTION, not correctness: it is red only if the subject-index
+;; clause itself goes, when the goal falls to the walk and the budget
+;; refuses it (docs/rules.md).
+(test claim-generates-from-the-subject-index
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?r ?o)
+                  (claim ?c rt-claim "host" "h1" ?r ?ons ?o))))
+      (is (equal '(("runs" "db") ("runs" "web"))
+                 (sort (copy-list rows) #'string< :key #'second))))))
+
+(test claim-generates-from-the-object-index
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?s)
+                  (claim ?c rt-claim "host" ?s "runs" "app" "web"))))
+      (is (equal '("h1" "h2")
+                 (sort (mapcar #'first rows) #'string<))))))
+
+(test a-unary-claim-binds-a-nil-object-pair
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?r ?ons ?okey)
+                  (claim ?c rt-claim "host" "h2" ?r ?ons ?okey))))
+      (is (= 2 (length rows)))
+      (is (member '("reachable" nil nil) rows :test #'equal))
+      (is (member '("runs" "app" "web") rows :test #'equal)))))
+
+(test an-unknown-namespace-yields-nothing-and-interns-nothing
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000) (?o)
+                (claim ?c rt-claim "never-recorded" "x" ?r ?ons ?o))))
+    (is (null (find-symbol "NEVER-RECORDED" :keyword)))))
+
+;; A bound namespace argument that names no keyword answers empty whatever
+;; its type: "HOST" is not :HOST's wire form, "APP" not :APP's, and 5 is
+;; no namespace at all.  Each reaches CLAIM/7 through the guard, where
+;; falling through to the walk would refuse rather than answer.
+(test an-unresolvable-namespace-answers-empty-rather-than-refusing
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000) (?o)
+                (claim ?c rt-claim "HOST" ?skey ?r ?ons ?o))))
+    (is (null (select (:max-inferences 1000) (?o)
+                (claim ?c rt-claim 5 ?skey ?r ?ons ?o))))
+    (is (null (select (:max-inferences 1000) (?s)
+                (claim ?c rt-claim ?sns ?s ?r "APP" ?o))))))
+
+(test an-unregistered-family-is-ill-typed
+  (with-rules-graph (g)
+    (signals unknown-claim-family
+      (select () (?o)
+        (claim ?c no-such-family "host" "h1" ?r ?ons ?o)))))
+
+(test nothing-bound-is-refused-under-a-bound-and-walks-without-one
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim ?a ?b ?r ?d ?e)))
+    (is (= 4 (select-count (?c) (claim ?c rt-claim ?a ?b ?r ?d ?e))))))
+
+(test allow-cost-unbounded-accepts-an-unrouted-goal
+  "GH #334: the escape hatch reaches a run-time refusal now that SELECT
+binds *ALLOW-COST-UNBOUNDED*.  A caller who says the walk is affordable
+gets the walk under a budget, the same answer an unbudgeted query gives."
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (length (select (:max-inferences 1000
+                              :allow-cost-unbounded t)
+                             (?c)
+                             (claim ?c rt-claim ?a ?b ?r ?d ?e)))))
+    ;; The shapes that route nowhere for want of an index prefix, not
+    ;; for want of bindings, take the hatch too.
+    ;; Three: h1 runs web, h1 runs db, h2 runs web.  The unary
+    ;; "reachable" claim on h2 is filtered out by the bound relation.
+    (is (= 3 (length (select (:max-inferences 1000
+                              :allow-cost-unbounded t)
+                             (?c)
+                             (claim ?c rt-claim "host" ?k "runs" ?a ?b)))))
+    ;; Control: without the option the same goals still refuse, so the
+    ;; option is what changed the answer, not the budget.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim ?a ?b ?r ?d ?e)))))
+
+;; The refusal is a property of the goal's shape, not of the
+;; nothing-bound shape alone.  The namespace is the leading slot of both
+;; endpoint indexes and an index is usable only from a prefix, so
+;; neither half of a subject pair routes on its own (docs/rules.md).
+(test an-unrouted-goal-is-refused-under-a-bound
+  (with-rules-graph (g)
+    (seed g)
+    ;; A namespace without its key routed nowhere until GH #389; it is
+    ;; the vocabulary route now, and answers under the same budget.
+    (is (= 4 (select (:count t :max-inferences 1000) (?c)
+               (claim ?c rt-claim "host" ?k ?r ?a ?b))))
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim ?ns "h1" ?r ?a ?b)))
+    ;; Control: the same pair bound together routes and answers under
+    ;; the very same budget.
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim ?c rt-claim "host" "h1" ?r ?a ?b))))))
+
+;; R17: a keyword namespace argument selects the right candidates through
+;; the index, so a string-only unification would answer nothing at all.
+(test a-keyword-namespace-answers-like-its-string
+  (with-rules-graph (g)
+    (seed g)
+    (let ((strings (select (:max-inferences 1000) (?o)
+                     (claim ?c rt-claim "host" "h1" "runs" "app" ?o)))
+          (keywords (select (:max-inferences 1000) (?o)
+                      (claim ?c rt-claim :host "h1" "runs" :app ?o))))
+      (is (equal '("db" "web")
+                 (sort (mapcar #'first strings) #'string<)))
+      (is (equal strings keywords)))))
+
+;; The filters below ride routes CLAIM/7's own tests already prove, so
+;; they run unbudgeted (R21).  CLAIM-PRODUCER/2's generator IS a route,
+;; so its two generating goals carry a budget: without one an unbound ?C
+;; would leave the family walk legal for the goal that follows.
+
+(test claim-current-filters-a-retracted-claim
+  (with-rules-graph (g)
+    (seed g)
+    (let ((c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c))
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b))))
+    (is (= 1 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                (claim-current ?c))))
+    ;; Which one survives, not just how many: a negated test keeps one too.
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-current ?c))))))
+
+(test claim-valid-at-uses-the-validity-extent
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("1")
+               (select-flat (?v) (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c "2026-02-15T00:00:00Z"))))
+    (is (equal '("2")
+               (select-flat (?v) (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c "2026-06-15T00:00:00Z"))))
+    ;; A claim with no extent never matches.
+    (is (null (select-flat (?c) (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                                (claim-valid-at ?c "2026-02-15T00:00:00Z"))))
+    ;; A malformed instant signals since GH #388 (it failed silently
+    ;; before): a-malformed-instant-is-an-error-a-caller-can-see.
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-at ?c "not-a-timestamp")))
+    ;; %INSTANT-ARG's timestamp branch: a Lisp caller passes a
+    ;; LOCAL-TIME timestamp, not the wire string, and gets the same row.
+    (is (equal '("1")
+               (select-flat (?v) (lisp ?at (ts 2026 2 15))
+                                 (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c ?at))))))
+
+;; Spec §11: the functor and CLAIMS-TOUCHING :AT must answer the same
+;; claims for the same instant.  They share %CLAIM-VALIDITY-TOUCHES-P,
+;; and this is the assertion that goes red if someone inlines it back.
+;; The pinned ("1") is what keeps the agreement from holding vacuously
+;; on two empty results.  Sorted, because the two sides build their
+;; lists in different orders and only membership was ever the
+;; requirement.
+(test claim-valid-at-agrees-with-claims-touching
+  (with-rules-graph (g)
+    (seed g)
+    (let ((via-goal (select-flat (?k) (claim ?c rtt-claim "app" "web"
+                                             "version" "ver" ?k)
+                                      (claim-valid-at
+                                       ?c "2026-02-15T00:00:00Z")))
+          (via-query (mapcar #'claim-object-key
+                             (claims-touching g 'rtt-claim :app "web"
+                                              :role :subject
+                                              :at (ts 2026 2 15)))))
+      (is (equal '("1") via-goal))
+      (is (equal (sort (copy-list via-goal) #'string<)
+                 (sort (copy-list via-query) #'string<))))))
+
+;; Spec §11's other half, which had no differential test: CLAIM-CURRENT/1
+;; and CLAIMS-TOUCHING :CURRENT must keep the same claims.  Both call
+;; CLAIM-CURRENT-P today; this goes red if one of them stops.  ("runs")
+;; is pinned first so the agreement cannot hold on two empty lists.
+(test claim-current-agrees-with-claims-touching
+  (with-rules-graph (g)
+    (seed g)
+    (let ((c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c))
+    (let ((via-goal (select-flat (?r) (claim ?c rt-claim "host" "h2"
+                                             ?r ?a ?b)
+                                      (claim-current ?c)))
+          (via-query (mapcar #'claim-relation
+                             (claims-touching g 'rt-claim :host "h2"
+                                              :role :subject :current t))))
+      (is (equal '("runs") via-goal))
+      (is (equal (sort (copy-list via-goal) #'string<)
+                 (sort (copy-list via-query) #'string<))))))
+
+(test claim-producer-generates-from-the-producer-index
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))
+    ;; R6: scan-a wrote 2 rt-claims and 2 rtt-claims; the family goal
+    ;; keeps the 2 rt-claims, which is what proves %UNIFY-CLAIM's
+    ;; parent-class gate.
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-a")
+               (claim ?c rt-claim ?s ?k ?r ?a ?b))))
+    (is (equal '("scan-a")
+               (select-flat (?p) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-producer ?c ?p))))))
+
+;; R22: %PRODUCER-CANDIDATES walks the image-wide family registry, so it
+;; meets families this graph's schema does not carry.  RTF-CLAIM is one
+;; (suite.lisp); the SIGNALS is the probe that the lookup really does
+;; raise here, so the count below runs through the HANDLER-CASE rather
+;; than past it.
+(test the-producer-generator-skips-a-family-this-graph-lacks
+  (with-rules-graph (g)
+    (seed g)
+    (is (claim-family 'rtf-claim))
+    (signals graph-db:query-precondition-error
+      (graph-db:index-lookup g 'rtf-claim
+                             graph-db::+claim-producer-index-slots+
+                             "scan-a"))
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))))
+
+;; Neither argument bound is unroutable, and an unroutable generator
+;; that answers zero rows in silence is the one thing CLAIM/7 already
+;; refuses to be.  Under a bound it refuses the same way; with no bound
+;; there is no producer walk to offer, so it still just fails.
+(test allow-cost-unbounded-quiets-the-producer-refusal
+  "GH #334: with neither argument bound CLAIM-PRODUCER/2 has no route, so
+the escape hatch cannot buy a walk -- it buys the silence an unbudgeted
+query already gets, rather than a refusal the caller opted out of."
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000 :allow-cost-unbounded t)
+                      (?c ?p) (claim-producer ?c ?p))))
+    ;; Control: without the option, still a refusal.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))))
+
+(test claim-producer-with-neither-argument-bound
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c) (claim-producer ?c ?p)))
+    (is (zerop (select-count (?c) (claim-producer ?c ?p))))))
+
+;; The interface contract for all six filters: a bound non-node ?C fails
+;; the goal, and none of them signals -- reaching the end of the test is
+;; the "never signals" half.  The last line is A1's shape: %CLAIM-ARG is
+;; NIL for a bound non-node, so without the unbound-?C gate the
+;; generator ran a whole cross-family lookup here and then unified
+;; nothing.  That gate changes cost, not answers, so this pins the
+;; contract; it does not prove the gate.
+(test a-non-node-c-fails-every-filter
+  (with-rules-graph (g)
+    (seed g)
+    (is (zerop (select-count () (claim-current "x"))))
+    (is (zerop (select-count ()
+                             (claim-valid-at "x" "2026-02-15T00:00:00Z"))))
+    (is (zerop (select-count () (claim-standing "x" ?s))))
+    (is (zerop (select-count () (claim-relation "x" ?r))))
+    (is (zerop (select-count () (claim-rule-version "x" ?v))))
+    (is (zerop (select-count () (claim-producer "x" ?p))))
+    (is (zerop (select-count () (claim-producer "x" "scan-a"))))))
+
+;; The bound-second-argument half of each filter's docstring -- the mode
+;; an S2 rule body writes.  Every pair names both the row the filter
+;; keeps and the row it must drop, so a filter that stopped filtering
+;; fails the second assertion of its pair rather than passing both.
+(test the-filters-filter-on-a-bound-second-argument
+  (with-rules-graph (g)
+    (seed g)
+    ;; h2 carries two claims: "reachable" is :inferred, "runs" :observed.
+    (is (equal '("reachable")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-standing ?c "inferred"))))
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-standing ?c "observed"))))
+    ;; h1 carries two "runs" claims and nothing else.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                (claim-relation ?c "runs"))))
+    (is (zerop (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                  (claim-relation ?c "reachable"))))
+    ;; No rule wrote these, so NIL is the value that filters them IN.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                (claim-rule-version ?c nil))))
+    (is (zerop (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                  (claim-rule-version ?c "v1"))))
+    ;; Both arguments bound is CLAIM-PRODUCER/2's filter half; the two
+    ;; claims on the object route split between the producers.
+    (is (equal '("h1")
+               (select-flat (?k) (claim ?c rt-claim "host" ?k "runs"
+                                        "app" "web")
+                                 (claim-producer ?c "scan-a"))))
+    (is (equal '("h2")
+               (select-flat (?k) (claim ?c rt-claim "host" ?k "runs"
+                                        "app" "web")
+                                 (claim-producer ?c "scan-b"))))))
+
+(test the-slot-filters
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("inferred")
+               (select-flat (?s) (claim ?c rt-claim "host" "h2"
+                                        "reachable" ?a ?b)
+                                 (claim-standing ?c ?s))))
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-relation ?c ?r))))
+    (is (equal '(nil)
+               (select-flat (?v) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-rule-version ?c ?v))))))
+
+;; The same functors from free text.  The guard needs no edit to admit
+;; them -- it enumerates the live registry per call -- so what this pins
+;; is that the names resolve there, that a keyword namespace is a
+;; refusal rather than a match, and that an unregistered family is
+;; client input rather than an engine fault (spec §4).
+(test the-guard-admits-the-claim-functors
+  (with-rules-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rt-claim \"host\" \"h1\" \"runs\" \"app\" ?o)
+          (claim-producer ?c ?p)"
+         g)
+      (is (equal '("c" "o" "p") columns))
+      (is (= 2 (length rows)))
+      (is (every (lambda (row) (string= "scan-a" (third row))) rows)))
+    ;; A keyword namespace is refused before READ runs, so it is never a
+    ;; match -- which is why namespaces cross as strings (spec §4).
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rt-claim :host \"h1\" ?r ?a ?b)" g))
+    ;; RT-CLAIM-UNARY is a vertex type of this graph, so the guard admits
+    ;; it; only the parent is a claim family, so CLAIM-FAMILY signals at
+    ;; run time and %ILL-TYPED-CONDITION-P must classify it (GH #330).
+    (signals graph-db.query:prolog-ill-typed-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rt-claim-unary \"host\" \"h1\" ?r ?a ?b)" g))))
+
+;; S1's deferred gate ("Deferred out of S1"): a ?C bound to NIL is a
+;; bound non-node and fails the goal, not the generator's unbound case.
+;; Both answer zero rows, so the refusal is what separates them -- with
+;; ?C bound to NIL there is nothing to refuse.
+(test a-nil-c-is-bound-not-unbound
+  (with-rules-graph (g)
+    (seed g)
+    (is (zerop (select (:count t :max-inferences 1000) ()
+                 (claim-producer nil "scan-a"))))
+    (is (zerop (select (:count t :max-inferences 1000) (?p)
+                 (claim-producer nil ?p))))
+    ;; Control: ?C really unbound is the unroutable case, and with a
+    ;; producer name it really generates.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))))
+
+(test rule-delta-generates-the-bound-delta-and-nothing-else
+  "GH #333: the fixpoint's internal generator.  Unbound *RULE-DELTA*
+answers nothing; bound, it yields exactly the listed claims of the
+named relation, and filters a bound ?c by membership."
+  (with-rules-graph (g)
+    (seed g)
+    (let* ((runs (claims-touching g 'rt-claim :host "h1" :role :subject
+                                  :relation "runs"))
+           (web (find "web" runs :key #'claim-object-key :test #'string=))
+           (table (make-hash-table :test 'equal)))
+      (is (= 2 (length runs)))
+      (setf (gethash "runs" table) (list web))
+      (is (null (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+      (let ((graph-db:*rule-delta* table))
+        (is (equal (list web)
+                   (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+        (is (null (select-flat (?c) (graph-db::rule-delta ?c "other"))))
+        ;; A bound ?c is a membership test: web is in the delta, db not.
+        (is (= 1 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "web")
+                   (graph-db::rule-delta ?c "runs"))))
+        (is (= 0 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "db")
+                   (graph-db::rule-delta ?c "runs"))))
+        ;; Composes with claim/7 as a filter: the delta claim's endpoints.
+        (is (equal '("web")
+                   (select-flat (?a)
+                     (graph-db::rule-delta ?c "runs")
+                     (claim ?c rt-claim "host" "h1" "runs" "app" ?a))))))))
+
+(test the-exclusion-is-scoped-to-the-producers-own-relation
+  "M3 (GH #333): *CLAIM-EXCLUDE-PRODUCERS* holds (producer . relation)
+pairs, so a fixpoint round that must not answer from its producer's
+\"runs\" claims still reads that same producer's claims of every OTHER
+relation -- the DERIVATION records a body may join on among them.
+SEED gives \"scan-a\" two \"runs\" claims and two \"version\" ones."
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (select-count (?c) (claim-producer ?c "scan-a"))))
+    (let ((graph-db:*claim-exclude-producers*
+            (list (cons "scan-a" "runs"))))
+      ;; The generator drops the excluded relation and keeps the rest.
+      (is (equal '("version" "version")
+                 (select-flat (?r)
+                   (claim-producer ?c "scan-a")
+                   (claim-relation ?c ?r))))
+      ;; So does the subject-relation route.
+      (is (null (select-flat (?a)
+                  (claim ?p rt-claim "host" "h1" "runs" "app" ?a))))
+      (is (equal '("1" "2")
+                 (sort (select-flat (?v)
+                         (claim ?p rtt-claim "app" "web" "version"
+                                "ver" ?v))
+                       #'string<))))
+    ;; Control: unbound, the same three reads answer in full.
+    (is (equal '("db" "web")
+               (sort (select-flat (?a)
+                       (claim ?p rt-claim "host" "h1" "runs" "app" ?a))
+                     #'string<)))))
+
+;;; ---------------------------------------------------------------------
+;;; The vocabulary routes: a namespace bound without its key (GH #389).
+;;; Every goal runs under a budget, so the walk would refuse and only
+;;; the route can answer (see the file header).
+;;; ---------------------------------------------------------------------
+
+(test a-bound-subject-namespace-generates-key-by-key
+  "Subject namespace bound, key unbound: every claim about a subject in
+the namespace, keys in ascending index order, each key's claims
+together -- the documented solution order (docs/rules.md)."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?k ?r ?o)
+                  (claim ?c rt-claim "host" ?k ?r ?ons ?o))))
+      (is (= 4 (length rows)))
+      (is (equal '("h1" "h1" "h2" "h2") (mapcar #'first rows)))
+      (is (member '("h2" "reachable" nil) rows :test #'equal))
+      (is (equal '("db" "web")
+                 (sort (loop for (k r o) in rows
+                             when (string= k "h1") collect o)
+                       #'string<))))))
+
+(test a-bound-subject-namespace-and-relation-generate-key-by-key
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?k ?o)
+                  (claim ?c rt-claim "host" ?k "runs" "app" ?o))))
+      (is (= 3 (length rows)))
+      (is (equal '("h1" "h1" "h2") (mapcar #'first rows))))))
+
+(test a-bound-object-namespace-generates-key-by-key
+  "The mirror: object namespace bound, key unbound, from the object
+index -- binary claims only, since a unary claim has no object."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?s ?o)
+                  (claim ?c rt-claim ?sns ?s ?r "app" ?o))))
+      (is (= 3 (length rows)))
+      (is (equal '("db" "web" "web") (mapcar #'second rows)))
+      (is (equal '("h1" "h1" "h2")
+                 (sort (mapcar #'first rows) #'string<))))))
+
+(test both-namespaces-bound-without-keys-take-the-subject-route
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("h1" "db") ("h1" "web") ("h2" "web"))
+               (sort (select (:max-inferences 1000) (?s ?o)
+                       (claim ?c rt-claim "host" ?s "runs" "app" ?o))
+                     #'string< :key #'second)))))
+
+(test an-unresolvable-namespace-without-a-key-is-still-the-empty-path
+  "The empty fast path precedes the vocabulary routes: a name no claim
+was recorded under answers nothing and interns nothing."
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000) (?k)
+                (claim ?c rt-claim "never-here" ?k ?r ?ons ?o))))
+    (is (null (find-symbol "NEVER-HERE" :keyword)))))
+
+(test a-bound-key-without-its-namespace-still-has-no-route
+  "docs/rules.md: the namespace leads both endpoint indexes, so a key
+alone falls to the walk and refuses under a budget -- unchanged by
+GH #389."
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?ns)
+        (claim ?c rt-claim ?ns "h1" ?r ?ons ?o)))))
+
+(test the-vocabulary-route-answers-through-the-guard
+  (with-rules-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rt-claim \"host\" ?k \"runs\" ?ons ?o)" g)
+      (is (equal '("c" "k" "ons" "o") columns))
+      (is (= 3 (length rows))))))
+
+;;; ---------------------------------------------------------------------
+;;; The extent as facts: CLAIM-VALID-FROM/2, CLAIM-VALID-TO/2,
+;;; CLAIM-RECORDED-AT/2, and the instant comparisons (GH #388).
+;;; ---------------------------------------------------------------------
+
+(test claim-valid-from-and-to-answer-instant-strings
+  "Both ends of web's version 1 as RFC 3339 UTC strings at nanosecond
+precision -- the one spelling, 30 characters -- and a claim with no
+extent fails both."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("2026-01-01T00:00:00.000000000Z"
+                  "2026-03-31T00:00:00.000000000Z"))
+               (select (:max-inferences 1000) (?from ?to)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" "1")
+                 (claim-valid-from ?c ?from)
+                 (claim-valid-to ?c ?to))))
+    (is (null (select-flat (?from)
+                (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                (claim-valid-from ?c ?from))))
+    (is (null (select-flat (?to)
+                (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                (claim-valid-to ?c ?to))))
+    ;; The strings sort lexically in time order: version 1 before 2.
+    (is (equal '(("1" "2026-01-01T00:00:00.000000000Z")
+                 ("2" "2026-04-01T00:00:00.000000000Z"))
+               (sort (select (:max-inferences 1000) (?v ?from)
+                       (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                       (claim-valid-from ?c ?from))
+                     #'string< :key #'second)))))
+
+(test an-open-end-answers-nil-and-a-fuzzy-edge-its-envelope
+  (with-rules-graph (g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rtt-claim-binary
+       :graph g :subject-namespace :app :subject-key "api"
+       :relation "version" :object-namespace :ver :object-key "9"
+       :producer "scan-a" :standing :observed
+       :extent (make-interval (make-bound (ts 2026 1 1) (ts 2026 1 31))
+                              (unknown-bound)
+                              :semantics :validity :standing :asserted)))
+    (is (equal '(("2026-01-01T00:00:00.000000000Z" nil))
+               (select (:max-inferences 1000) (?from ?to)
+                 (claim ?c rtt-claim "app" "api" "version" "ver" "9")
+                 (claim-valid-from ?c ?from)
+                 (claim-valid-to ?c ?to))))
+    ;; NIL is a solution, so a bound NIL selects the open-ended claims.
+    (is (equal '("9")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "api" "version" "ver" ?v)
+                 (claim-valid-to ?c nil))))))
+
+(test the-instant-comparisons-compare-by-value
+  "INSTANT</2 and friends parse both sides, so a client's short spelling
+compares correctly against the functors' long one -- which a lexical
+</2 would get wrong at the 20th character."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant< ?from "2026-02-01T00:00:00Z"))))
+    (is (equal '("2")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant>= ?from "2026-04-01T00:00:00Z"))))
+    (is (equal '("1" "2")
+               (sort (select-flat (?v)
+                       (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                       (claim-valid-to ?c ?to)
+                       (instant> ?to "2026-03-30T00:00:00Z"))
+                     #'string<)))
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-to ?c ?to)
+                 (instant<= ?to "2026-03-31T00:00:00Z"))))
+    ;; Same instant, two spellings.
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant= ?from "2026-01-01T00:00:00Z"))))
+    ;; A NIL side -- an open end -- fails, it does not signal.
+    (is (null (select-flat (?x) (= ?x 1)
+                                (instant< nil "2026-01-01T00:00:00Z"))))))
+
+(test a-malformed-instant-is-an-error-a-caller-can-see
+  "GH #388 reverses GH #330's silent failure: a string that does not
+parse, or a non-string, signals QUERY-PRECONDITION-ERROR, which the
+guarded runner answers as ill-typed rather than as zero rows."
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-at ?c "not-a-timestamp")))
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-from ?c ?from)
+                        (instant< ?from "yesterday")))
+    (signals graph-db:query-precondition-error
+      (select-flat (?x) (= ?x 1) (instant< 5 "2026-01-01T00:00:00Z")))
+    (signals graph-db.query:prolog-ill-typed-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rtt-claim \"app\" \"web\" \"version\" \"ver\" ?v)
+        (claim-valid-at ?c \"not-a-timestamp\")"
+       g))
+    ;; The instant functors are admitted by the guard, as every
+    ;; registered functor is.
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rtt-claim \"app\" \"web\" \"version\" \"ver\" ?v)
+          (claim-valid-from ?c ?from) (instant< ?from \"2026-02-01\")"
+         g)
+      (is (equal '("c" "v" "from") columns))
+      (is (equal '("1") (mapcar #'second rows))))))
+
+(test claim-recorded-at-answers-the-transaction-start
+  "The start of the transaction extent, in the extent functors' one
+spelling, so a change feed is a CLAIM-RECORDED-AT / INSTANT> pair.  The
+NIL arm -- a claim predating the transaction-time axis (GH #148) -- has
+no fixture: every store this suite makes carries the axis."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((ats (select-flat (?at)
+                 (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                 (claim-recorded-at ?c ?at))))
+      (is (= 2 (length ats)))
+      (is (every (lambda (at) (and (stringp at) (= 30 (length at)))) ats))
+      ;; Recorded just now, so after the fixture's own dates, and the
+      ;; same answer through the value comparison.
+      (is (every (lambda (at) (string> at "2026-09-01")) ats))
+      (is (equal '("db" "web")
+                 (sort (select-flat (?o)
+                         (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                         (claim-recorded-at ?c ?at)
+                         (instant> ?at "2026-09-01T00:00:00Z"))
+                       #'string<)))
+      (is (null (select-flat (?o)
+                  (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                  (claim-recorded-at ?c ?at)
+                  (instant< ?at "2026-09-01T00:00:00Z")))))))
+
+;; GH #391: a retraction writes nothing new, so a change feed cursored
+;; on CLAIM-RECORDED-AT/2 cannot see it.  CLAIM-RETRACTED-AT/2 binds the
+;; transaction END in the same spelling; CLAIM-TOUCHED-AT/2 the later of
+;; the two, the single cursor a feed wants.  The retraction is stamped a
+;; second past the cursor so the order is fixed, not a race on NOW.  The
+;; cursor comes from %ST-NOW, the engine's monotonic clock: on a
+;; whole-second clock (ECL) LOCAL-TIME:NOW sits BEFORE the seed's stamps,
+;; which %ST-NOW moved past it by nanoseconds (GH #308, #429).
+(defvar *cursor* nil "The feed cursor, special so LISP/2 can read it.")
+
+(test claim-retracted-at-answers-the-transaction-end
+  (with-rules-graph (g)
+    (seed g)
+    ;; Open: NIL is a solution, and selects every open claim.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                (claim-retracted-at ?c nil))))
+    (let ((*cursor* (graph-db.spacetime::%st-now))
+          (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c :at (local-time:timestamp+ *cursor* 1 :sec))
+      (is (= 1 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-retracted-at ?c nil))))
+      (let ((ats (select-flat (?at)
+                   (claim ?c rt-claim "host" "h2" "reachable" ?a ?b)
+                   (claim-retracted-at ?c ?at))))
+        (is (= 1 (length ats)))
+        (is (and (stringp (first ats)) (= 30 (length (first ats))))))
+      ;; The feed: retracted after the cursor is exactly the retraction,
+      ;; and the recorded-at feed on the same cursor sees nothing -- the
+      ;; blind spot the functor exists for.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-retracted-at ?c ?at)
+                                   (lisp ?cur *cursor*)
+                                   (instant> ?at ?cur))))
+      (is (null (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-recorded-at ?c ?at)
+                                  (lisp ?cur *cursor*)
+                                  (instant> ?at ?cur)))))))
+
+(test claim-touched-at-is-the-later-of-recorded-and-retracted
+  (with-rules-graph (g)
+    (seed g)
+    (let ((*cursor* (graph-db.spacetime::%st-now))
+          (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      ;; Open: touched-at is recorded-at, for every claim.
+      (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-touched-at ?c ?t)
+                                  (claim-recorded-at ?c ?at)
+                                  (instant= ?t ?at))))
+      (retract-claim c :at (local-time:timestamp+ *cursor* 1 :sec))
+      ;; Closed: touched-at is retracted-at; the open one is unchanged.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (claim-retracted-at ?c ?at)
+                                   (instant= ?t ?at))))
+      (is (equal '("runs")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (claim-retracted-at ?c nil)
+                                   (claim-recorded-at ?c ?at)
+                                   (instant= ?t ?at))))
+      ;; One cursor, one goal, both kinds of change.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (lisp ?cur *cursor*)
+                                   (instant> ?t ?cur)))))))

@@ -329,6 +329,9 @@ schema summary for the known fixture."
                   :key (lambda (v) (jref v :name)) :test #'string=))
         (is (listp (jref json :indexes)))
         (is (plusp (jref json :on-disk-bytes)))
+        ;; GH #274: allocated <= apparent, both present.
+        (is (plusp (jref json :apparent-bytes)))
+        (is (<= (jref json :on-disk-bytes) (jref json :apparent-bytes)))
         (let* ((schema (jref json :schema))
                (person (find "gui-person" (jref schema :vertex-types)
                              :key (lambda (v) (jref v :name))
@@ -1028,7 +1031,9 @@ be refused -- the screen refuses syntax, not text (GH #279)."
                        (node-slot-value ?p name \"#.(cl:print 1)\")")
         (is (= 200 status))
         (is (= 0 (jref json :row-count))
-            "the literal matched something; it should match nothing"))
+            "the literal matched something; it should match nothing")
+        ;; A zero-row answer still names its columns (#322), not [].
+        (is (equal '("p") (jref json :columns))))
       ;; ...and one that DOES match, so the literal really is compared.
       (multiple-value-bind (json status)
           (run-prolog "(is-a ?p gui-person)
@@ -1351,6 +1356,7 @@ thing under test."
     "catch/3"
     "fail/0"
     "find-by-slot/4"
+    "find-by-unique/4"
     "find-intersects/3"
     "find-near/5"
     "find-nearest/5"
@@ -1489,22 +1495,44 @@ accumulate names that no longer exist and quietly stop meaning ~
 anything.~%~%~A"
           (length removed) removed (%inventory-guidance)))
 
+(defparameter *reviewed-spacetime-functor-inventory*
+  '("claimed/4"
+    "object-of/2"
+    "object-of/3"
+    "related/3"
+    "subject-of/2"
+    "subject-of/3")
+  "The functors graph-db/spacetime registers on top of the engine's:
+RELATED/3 and CLAIMED/4 (spacetime/functors.lisp, GH #367) and the
+edge functors DEF-EDGE generates for its two linking edge classes
+(claim.lisp).  Reviewed as the list above is: each takes nodes, a
+relation string or a claim, never a goal, so none reaches %SOLVE.
+Expected only in an image that has loaded spacetime: this suite does
+not, a service image running it may (GH #379).")
+
+(defun %expected-functor-inventory ()
+  "The reviewed inventory for THIS image: the engine's list, plus the
+spacetime list when that system is loaded."
+  (if (find-package "GRAPH-DB.SPACETIME")
+      (append *reviewed-functor-inventory*
+              *reviewed-spacetime-functor-inventory*)
+      *reviewed-functor-inventory*))
+
 (test prolog-functor-inventory-is-pinned
   "⚠ TRIPWIRE, not a behaviour test.  The guard's whitelist grows with
 the engine automatically; its exclusion lists do not.  This fails the
 moment the set of registered functors changes, so a newly added
 meta-calling predicate cannot reach free text unreviewed (GH #279)."
   (let* ((actual (registered-functor-inventory))
-         (added (sort (set-difference actual *reviewed-functor-inventory*
-                                      :test #'string=)
+         (expected (%expected-functor-inventory))
+         (added (sort (set-difference actual expected :test #'string=)
                       #'string<))
-         (removed (sort (set-difference *reviewed-functor-inventory*
-                                        actual :test #'string=)
+         (removed (sort (set-difference expected actual :test #'string=)
                         #'string<)))
     (is (null added) "~A" (%added-functor-message added))
     (is (null removed) "~A" (%removed-functor-message removed))
     ;; A passing run still says what it checked.
-    (is (= (length *reviewed-functor-inventory*) (length actual)))))
+    (is (= (length expected) (length actual)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Cost-unbounded predicates, and the error contract's own leaks
@@ -1791,9 +1819,20 @@ shape of GH #172, where DEF-EDGE installs NAME/2 and NAME/3 into
 nothing, so a symbol interned here is genuinely foreign, exactly as a
 real operator schema's would be.")
 
+(defvar *foreign-schema-functor-fired-p* nil
+  "Set by WITH-FOREIGN-SCHEMA-FUNCTOR's stub when the schema-homed
+functor actually runs.  A plain global, mutated with SETF rather than
+bound with LET: the GUI server answers on its own worker thread, which
+does not see a dynamic binding made on the test's thread (GH #322,
+review round 2).")
+
 (defmacro with-foreign-schema-functor ((name arity) &body body)
   "Register NAME/ARITY in *PROLOG-GLOBAL-FUNCTORS* homed in
-*FOREIGN-SCHEMA-PACKAGE*, run BODY, then remove it.
+*FOREIGN-SCHEMA-PACKAGE*, run BODY, then remove it.  Resets
+*FOREIGN-SCHEMA-FUNCTOR-FIRED-P* to NIL first; the stub sets it T when
+called (it never calls its continuation, so the goal still fails) --
+direct proof, inside BODY, of whether resolution reached the schema's
+own functor rather than GRAPH-DB's.
 
 Registered and removed inside one test, so
 PROLOG-FUNCTOR-INVENTORY-IS-PINNED -- which pins the registry's key set
@@ -1801,10 +1840,14 @@ PROLOG-FUNCTOR-INVENTORY-IS-PINNED -- which pins the registry's key set
   (let ((key (gensym "KEY")))
     `(let ((,key (intern (format nil "~A/~D" (string-upcase ,name) ,arity)
                          *foreign-schema-package*)))
+       (setf *foreign-schema-functor-fired-p* nil)
        (unwind-protect
             (progn
               (setf (gethash ,key graph-db::*prolog-global-functors*)
-                    (lambda (&rest args) (declare (ignore args)) nil))
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (setf *foreign-schema-functor-fired-p* t)
+                      nil))
               ,@body)
          (remhash ,key graph-db::*prolog-global-functors*)))))
 
@@ -1826,17 +1869,29 @@ now asks the same question the compiler will (GH #279)."
         ;; The data-driven shape the exclusion exists for, refused too.
         (is-true
          (refused-p "(is-a ?p gui-person) (node-slot-value ?p name ?g)
-                     (call ?g ?x)")))
-      ;; ...and the home-scoping it must NOT undo.  REGEX-MATCH is on the
-      ;; same exclusion list but is not compiler-macro-backed, so a
-      ;; schema that owns the name keeps it: admitted, not refused.
+                     (call ?g ?x)"))
+        ;; Refused before the engine ever calls it -- the schema's own
+        ;; CALL/2 never ran, direct proof this is a routing refusal.
+        (is-false *foreign-schema-functor-fired-p*
+                  "the excluded name still reached the schema's own ~
+functor"))
+      ;; ...and the home-scoping stays intact at THIS layer: a schema
+      ;; that owns the name is admitted past the whitelist, and (GH
+      ;; #322) now resolves in ITS OWN package -- the schema's stub
+      ;; runs, not the engine's REGEX-MATCH/2, so the ReDoS the
+      ;; exclusion category exists for never reaches the engine's real
+      ;; implementation.  *FOREIGN-SCHEMA-FUNCTOR-FIRED-P* is the
+      ;; direct proof of which functor ran.
       (with-foreign-schema-functor ("REGEX-MATCH" 2)
-        (multiple-value-bind (json status)
-            (run-prolog "(is-a ?p gui-person) (regex-match \"a\" \"b\")")
-          (is (= 200 status)
-              "a schema-homed REGEX-MATCH/2 was refused; the routing ~
-test undid the home-scoping (got ~A)" status)
-          (is (= 0 (jref json :row-count)))))
+        (let ((status (nth-value
+                       1 (run-prolog
+                          "(is-a ?p gui-person) (regex-match \"a\" \"b\")"))))
+          (is (= 200 status))
+          ;; Direct proof, not just the shape of a non-refusal: the
+          ;; schema's own stub is what actually ran, not a refusal and
+          ;; not the engine's REGEX-MATCH/2.
+          (is-true *foreign-schema-functor-fired-p*
+                   "the schema's own functor never ran")))
       ;; Without that registration the engine's own one is still out.
       (is-true (refused-p "(regex-match \"a\" \"b\")"))
       ;; ...and the fixture's real edge functor is untouched.
@@ -1938,9 +1993,10 @@ trustworthy (GH #279)."
     (nreverse acc)))
 
 (defun %vendor-scripts-main-loads ()
-  "The /vendor/*.js files main.js loads, as bare filenames."
+  "The vendor/*.js files main.js loads, as bare filenames (the path is
+prefix-relative since GH #384, so no leading slash)."
   (mapcar (lambda (path) (subseq path (1+ (position #\/ path :from-end t))))
-          (%matches "/vendor/[A-Za-z0-9._-]+\\.js"
+          (%matches "[\"'`]vendor/[A-Za-z0-9._-]+\\.js"
                     (%static-file "js/main.js"))))
 
 (defun %codemirror-entry-points ()
@@ -2111,3 +2167,223 @@ surfaces share."
         (is (= kw (package-symbol-count :keyword))
             "KEYWORD gained ~D symbol(s)"
             (- (package-symbol-count :keyword) kw))))))
+
+;;; ---------------------------------------------------------------------
+;;; Mounting under a host listener (GH #384).  MAKE-GUI-APP is the app
+;;; without the server; a host mounts it under a prefix of its own
+;;; clack listener.  Every path -- static, index.html's asset URLs, the
+;;; SPA's API calls -- must then resolve under that prefix.
+;;; ---------------------------------------------------------------------
+
+(defun gui-graph-named (json wire)
+  "The roster entry named WIRE out of a decoded /api/graphs body."
+  (find wire (jref json :graphs)
+        :key (lambda (g) (jref g :name)) :test #'string=))
+
+(test mounted-app-serves-under-the-prefix
+  "Mounted at /gui, the page, an asset and the API answer under the
+prefix; everything outside it -- the same paths at the site root
+included -- is the host's."
+  (with-gui-fixture ()
+    (with-mounted-gui ()
+      (multiple-value-bind (json status ctype raw) (gui-request "/gui/")
+        (declare (ignore json))
+        (is (= 200 status))
+        (is (eql 0 (search "text/html" ctype)))
+        (is (search "VivaceGraph GUI" raw)))
+      (multiple-value-bind (json status ctype)
+          (gui-request "/gui/css/gui.css")
+        (declare (ignore json))
+        (is (= 200 status))
+        (is (eql 0 (search "text/css" ctype))))
+      (multiple-value-bind (json status) (gui-request "/gui/api/graphs")
+        (is (= 200 status))
+        (is-true (gui-graph-named json "gui-test-graph")))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/stats")
+        (is (= 200 status))
+        (is (= 4 (jref json :vertex-count))))
+      (dolist (path '("/" "/css/gui.css" "/api/graphs" "/guide"))
+        (multiple-value-bind (json status ctype raw) (gui-request path)
+          (declare (ignore json ctype))
+          (is (= 200 status))
+          (is (string= *host-body* raw)
+              "~A reached the GUI instead of the host" path))))))
+
+(test mounted-root-redirects-to-a-trailing-slash
+  "The bare mount root is sent to itself with a trailing slash, query
+string kept: the page's relative asset and API URLs resolve under the
+mount only from a directory URL.  The standalone / never redirects."
+  (with-mounted-gui ()
+    (multiple-value-bind (json status ctype raw headers)
+        (gui-request "/gui" :redirect nil)
+      (declare (ignore json ctype raw))
+      (is (= 301 status))
+      (is (equal "/gui/" (cdr (assoc :location headers)))))
+    (multiple-value-bind (json status ctype raw headers)
+        (gui-request "/gui?graph=x" :redirect nil)
+      (declare (ignore json ctype raw))
+      (is (= 301 status))
+      (is (equal "/gui/?graph=x" (cdr (assoc :location headers)))))
+    ;; Following it lands on the page.
+    (multiple-value-bind (json status ctype raw) (gui-request "/gui")
+      (declare (ignore json ctype))
+      (is (= 200 status))
+      (is (search "VivaceGraph GUI" raw))))
+  (with-gui-server ()
+    (multiple-value-bind (json status ctype raw)
+        (gui-request "/" :redirect nil)
+      (declare (ignore json ctype))
+      (is (= 200 status))
+      (is (search "VivaceGraph GUI" raw)))))
+
+(test mount-redirect-never-names-a-host
+  "GH #386: a request in absolute form -- GET http://evil.example/gui --
+is redirected to the PATH /gui/, never to the host the request line
+named.  hunchentoot strips the authority from its script name but
+leaves the request URI raw, which is where the redirect was built from:
+an open redirect for every proxy hop.  drakma sends absolute form when
+the GUI is its proxy."
+  (with-mounted-gui ()
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/" (cdr (assoc :location headers)))
+          "Location was ~S" (cdr (assoc :location headers))))
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui?graph=x"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/?graph=x" (cdr (assoc :location headers)))))))
+
+(test read-only-is-a-dispatch-rail
+  "GH #386: on a read-only GUI every request that is not GET or HEAD is
+refused at dispatch -- 403 read-only, the same body the verbs answer --
+unless it is on the read list: the query and Prolog endpoints, POSTs
+that never write.  So a mutating route added without WITH-WRITE-VERB is
+still refused.  An unrouted POST is 404 when the GUI is not read-only."
+  (with-gui-fixture ()
+    (with-mounted-gui (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/query"
+                       :method :post
+                       :content "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"gui-person\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 200 status) "the read list admits the query endpoint")
+        (is (null (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/prolog"
+                       :method :post :content "{\"query\":\"\"}")
+        (is (= 403 status))
+        (is (string= "prolog-disabled" (jref json :error))
+            "the read list admits the Prolog endpoint; its own flag refuses")))
+    (with-mounted-gui ()
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (declare (ignore json))
+        (is (= 404 status) "not read-only: an unrouted POST is a 404")))
+    (with-gui-server (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error)))))))
+
+(test frontend-urls-are-prefix-relative
+  "No frontend source names an asset or API path from the site root:
+under a mount an absolute /api/... or /js/... reaches the host, not
+the GUI.  Read out of the sources, so a new absolute path fails here
+before anyone mounts the app."
+  (let ((root (asdf:system-relative-pathname :graph-db/gui
+                                             "gui/static/")))
+    (dolist (file (cons "index.html"
+                        (mapcar (lambda (p)
+                                  (format nil "js/~A.js"
+                                          (pathname-name p)))
+                                (directory (merge-pathnames "js/*.js"
+                                                            root)))))
+      (let ((hits (%matches "[\"'`]/(?:api|css|js|vendor)/"
+                            (%static-file file))))
+        (is (null hits) "~A names site-root paths: ~S" file hits)))))
+
+(test read-only-refuses-the-management-verbs
+  "READ-ONLY: close and open answer 403 read-only from the ENDPOINT
+before touching the graph -- it stays open -- reads still answer, and
+/api/capabilities reports readOnly so the roster can drop its verbs.
+Both entry points carry the flag; the default reports false."
+  (with-gui-fixture ()
+    (with-mounted-gui (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/close"
+                       :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/open"
+                       :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/stats")
+        (is (= 200 status))
+        (is (= 4 (jref json :vertex-count))))
+      (multiple-value-bind (json status ctype raw)
+          (gui-request "/gui/api/capabilities")
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is-true (jref json :read-only))
+        (is-true (search "\"readOnly\":true" raw)
+                 "capabilities did not spell readOnly camelCase")))
+    (with-gui-server (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/api/graphs/gui-test-graph/close" :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error)))))
+    (with-gui-server ()
+      (multiple-value-bind (json status) (gui-request "/api/capabilities")
+        (is (= 200 status))
+        (is-false (jref json :read-only))))))
+
+(test allow-prolog-function-gates-per-request
+  "ALLOW-PROLOG as a function of the clack ENV is decided per request:
+on one app, a visitor carrying the header sees the capability and runs
+a query; one without is refused, at the endpoint."
+  (with-gui-fixture ()
+    (with-mounted-gui (:allow-prolog
+                       (lambda (env)
+                         (gethash "x-gui-operator" (getf env :headers))))
+      (let ((operator '(("X-Gui-Operator" . "yes")))
+            (path "/gui/api/graphs/gui-test-graph/prolog"))
+        (multiple-value-bind (json status)
+            (gui-request "/gui/api/capabilities" :headers operator)
+          (is (= 200 status))
+          (is-true (jref json :allow-prolog))
+          (is-true (jref (jref json :prolog) :functors)))
+        (multiple-value-bind (json status)
+            (gui-request "/gui/api/capabilities")
+          (is (= 200 status))
+          (is-false (jref json :allow-prolog))
+          (is-false (jref json :prolog)))
+        (multiple-value-bind (json status)
+            (gui-request path :method :post :headers operator
+                              :content (prolog-body *legit-query*))
+          (is (= 200 status))
+          (is (= 2 (jref json :row-count)))
+          (is (equal '("Alice" "Bob") (rows-of json :n))))
+        (multiple-value-bind (json status)
+            (gui-request path :method :post
+                              :content (prolog-body *legit-query*))
+          (is (= 403 status))
+          (is (string= "prolog-disabled" (jref json :error))))))))

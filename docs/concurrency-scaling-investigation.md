@@ -68,6 +68,24 @@ Fix #1 relieves the commit-lock component, but the rw-lock convoy remains and
 even 16 threads intermittently trips one concurrency-suite timeout on CCL.
 Re-measure and lift after the rw-lock work.
 
+### Tried and reverted: CCL on `rw-lock.lisp` (2026-06-04)
+
+Moving CCL off its native `ccl:make-read-write-lock` onto the custom lock
+was tried and reverted the same day. `rw-lock-suite` passed, but
+`concurrent-stress` got worse: 8 of 15 failing, against about 4 of 12 on
+the native lock. The cause is `acquire-write-lock` allocating a wake
+semaphore per writer on every call, cheap on SBCL and costly on CCL.
+Separately, the main CCL convoy was in the transaction-manager and
+type-index locks, not the rw-lock. A #118 fix that moves CCL to
+`rw-lock.lisp` therefore needs a pooled waker first.
+
+What landed instead (2026-10-31, #118): CCL keeps its native lock, and
+the shim adds a queued-writer count that new readers wait on before
+taking the read side. The scanners of `%scan-race-round` re-enter back
+to back and the native lock admits them over a waiting writer; with the
+gate the reader count drains within one scan and the writer proceeds.
+A thread that already holds the lock on either side skips the gate.
+
 ---
 
 ## 1. Verdict (answers the three hypotheses)

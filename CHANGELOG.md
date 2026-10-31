@@ -9,6 +9,940 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
+## [4.1.0] - 2026-10-31
+
+### Added
+
+- **`tests/load-examples.sh`, and a CI lane that runs it** (#417): each
+  loadable example is loaded in a fresh image with a private scratch
+  directory, and any unhandled condition fails the run. Both examples
+  take their scratch root from `GRAPH_DB_EXAMPLE_ROOT` when set, else
+  `/var/tmp/` as before, so two users on one host (a developer and the
+  CI runner) never collide. CLAUDE.md's "smoke-tested by loading them in
+  a fresh image" now names the gate that exists.
+
+- **Two tests pin that a view added to a graph with data is backfilled**
+  (#402): defined against the open graph, or registered while the graph
+  is closed and reconciled at the next open. The manual's views chapter
+  now says so, and names the one way to get an empty view: a `def-view`
+  whose graph name is not the name the graph is open under.
+
+- **`reset-vector-segment`: drop a `:vector-index` slot's segment so the
+  next write recreates it at its own dimension** (#365). An emptied
+  segment kept its dimension on disk and across a reopen, so re-embedding
+  with a model of another width had no supported route. The reset
+  refuses with `vector-segment-in-use` while any live node of the owner
+  holds a vector, runs under the transaction manager's lock, and closes
+  the old segment the #54 way, so a scan in flight finishes first.
+
+- **`unique-lookup`: a public read of unique-index membership, and
+  `find-by-unique/4` in Prolog** (#415). The live node holding a value
+  under a `:unique` slot or a `def-unique` tuple, or NIL, with the
+  canonicalizer applied to the probe and the null-exempt rule kept; a
+  subclass resolves to its owner's index; an undeclared slot signals
+  `query-precondition-error`. It reads as the transaction will commit
+  from day one: a committed holder the transaction wrote is skipped and
+  its own live node holding the value is answered at its current slots,
+  whether or not the index is built. `examples/example.lisp` shows both
+  reads, and a transaction reading its own writes (#408).
+
+- **`tests/run-suite.sh SUITE`: one suite in a fresh image** (#407).
+  It binds the system directory and type registry the way `run-tests`
+  does, where a bare `fiveam:run!` fails with `SYSTEM-DIRECTORY-REQUIRED`;
+  it is fenced to the checkout it lives in, and exits 0, 1 or 2.
+
+- **`docs/codebase-notes.md`: the core idioms and the efficient choice
+  for common accesses, with costs** (#407). `codebase-notes-suite`
+  fails when a name the note gives stops resolving or a path it gives
+  is gone.
+
+- **`DEF-SOURCE`'s `:registry` accepts a list of region classes** (#394):
+  a `:registration` facet's `:registry` may now be a class name or a
+  non-empty proper list of class names — the scope `REGISTER-GEOMETRY`
+  already takes and `REGISTER-NODE` hands it unchanged. `:ALL` is
+  refused: a registry must be named.
+
+- **A retraction is visible to a change-feed cursor** (#391):
+  `claim-retracted-at/2` binds the transaction extent's end in the
+  same 30-character spelling as `claim-recorded-at/2`, NIL as a
+  solution while open; `claim-touched-at/2` binds the later of the
+  two, so one cursor sees records and retractions alike and the
+  periodic full re-read a reader kept only to notice retractions goes
+  away. `docs/rules.md` also says beside `claim-valid-at/2` that "held
+  now" needs `claim-current/1` as well. An index on the touched-at
+  instant, so the cursor goal costs what changed rather than what
+  exists, is #392.
+
+- **`claim/7` routes a bound namespace without its key** (#389): the
+  keys under the namespace come from the vocabulary index (#350) and
+  each key's claims from the subject or object index, in ascending
+  key order, so "every claim about namespace N" (with or without a
+  relation) is an indexed, budget-preemptible route instead of a
+  family walk refused as cost-unbounded. Both endpoint sides.
+  `docs/rules.md` "Routes" and "Solution order".
+
+- **The claim extent as facts** (#388): `claim-valid-from/2`,
+  `claim-valid-to/2` and `claim-recorded-at/2` bind RFC 3339 UTC
+  strings at nanosecond precision (one spelling, so they order
+  lexically and cross a wire); an open end answers NIL as a solution.
+  `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2` and
+  `instant=/2` compare instants by value in any RFC 3339 spelling.
+  `docs/rules.md` says beside `claim-current/1` that it does not mean
+  "currently valid".
+
+- **Paging in the guarded runner** (#387): `run-guarded-prolog` takes
+  `:offset`, so `:limit`-sized windows page one solution order, and
+  the order is documented per `claim/7` route. `</2`, `>/2`, `<=/2`
+  and `>=/2` order two strings lexically, so a caller can also page an
+  indexed route by bounding the last key seen. Not a snapshot cursor;
+  `docs/guarded-query.md` "Paging" has the trade-off.
+
+### Changed
+
+- **`tests/README.md` records the test-writing traps** (#398): a spliced
+  body breaks a leading `declare` (wrap it in `locally`), a piped SBCL
+  loses the suite's exit status, and ECL's `random` is deterministic per
+  process.
+
+- **Ten engine facts moved from a private notes store into the docs**
+  (#403): the release flow (`docs/ci.md`, "Cutting a release"); the B+
+  tree's standing (manual Chapter 3 and the experiment doc's Verdict);
+  the functor rule never to wrap `(funcall cont)` in a handler
+  (Chapter 7); type-ids per kind, list-valued supers and the three
+  shapes of an alist entry on the peer wire (Chapter 16); the node cache
+  keyed by id alone (`lookup-vertex` in the API reference);
+  `migrate-graph` as a logical copy of a current-format store
+  (Chapters 11 and the docstring); running on ECL and CCL
+  (`tests/README.md`); and the reverted 2026-06-04 CCL rw-lock trial
+  (`docs/concurrency-scaling-investigation.md`). `docs/ci.md` no longer
+  names the runner host.
+
+- **Manual Chapter 5 states the transaction contract in five rules**
+  (#401): one `with-transaction` is the atomic unit and nesting does not
+  flatten; validation is write-set driven, so phantoms and write skew
+  pass unless the parent is written; a transaction reads what it will
+  commit, with views and the untyped scans committed-only; a read
+  snapshot nests by inheriting and is the consistent read; a committed
+  write is durable without a snapshot. `docs/codebase-notes.md` points
+  at it.
+
+- **A malformed instant is an error, not an empty answer** (#388):
+  `claim-valid-at/2` (and the new instant functors) signal
+  `query-precondition-error` -- `prolog-ill-typed-error` through the
+  guarded runner -- for a string that does not parse or a non-string,
+  where the goal used to fail silently.
+
+- **GUI mountable under a host application's listener** (#384):
+  `graph-db.gui:make-gui-app` returns the clack app `start-gui` serves
+  (API routes, static tree with the body-size refusal, `index.html` at
+  the root) without starting a server, so a host that already runs a
+  clack listener in the image mounts it under a prefix with
+  `(lack:builder (:mount "/gui" (make-gui-app)) host-app)`. The
+  frontend's asset and API URLs are prefix-relative and a slashless
+  mount root redirects to the trailing-slash form. `:allow-prolog`
+  also accepts a function of the clack request environment, decided
+  per request; `:read-only t` refuses the open/close verbs with `403
+  read-only` and reports `readOnly` in `/api/capabilities`, which the
+  roster reads to drop its verbs. `gui-static-root` is exported.
+  `start-gui` gains `:read-only`.
+
+- **Edges under claims** (#367, U1 #369): a claim gains a derived
+  `subject-of` / `object-of` edge to each endpoint that resolves in its
+  own store, linked in the constructor (same-store sources through the
+  index plus the transaction's own creates; anywhere else through the
+  caller-resolved `:subject-node` / `:object-node`, verified). New reads
+  `claim-endpoints`, `node-claims`, and the Prolog goals `related/3`
+  (current) and `claimed/4` (history); conditions `endpoint-link-skipped`
+  (warning) and `endpoint-mismatch`. The key slots remain the identity
+  and `claims-touching` the complete read; no store format change.
+  Cross-store traversal continuation is deferred (#368).
+  `docs/superpowers/specs/2026-09-12-edges-under-claims-design.md`.
+
+- **Linking sweep and backfill** (#367, U2 #372): `link-claim-endpoints`
+  links every claim whose endpoint now resolves — across stores through
+  `resolve-endpoint`, under a snapshot, then one short write
+  transaction; idempotent, and serialized per graph; `:since` a commit
+  epoch; `:limit` bounds both the work and the scan, and the `more-p`
+  return says a claim with a missing edge exists beyond the window, not
+  that progress remains — loop while `more-p` *and* `linked` is nonzero.
+  Never prunes (`compact-edges` reclaims), never signals (its counts are
+  the report); nothing runs on open. `*link-claims-at-write*` (default
+  T) lets a bulk load defer linking to the sweep; a caller-given
+  `:subject-node` / `:object-node` is still verified under that binding
+  — `endpoint-mismatch` still refuses the write — only left unlinked.
+  `bench-claim-linking` in the perf suite records the spec's §9 numbers;
+  measured at bench scale, write-time linking costs ~60% of claim-write
+  throughput and the two-hop edge read is ~2.5× *slower* than the index
+  read (suspected per-edge endpoint validation, #373) — details and the
+  hypothesis on #372.
+
+- **`claim-endpoint`** (#373): `(claim-endpoint claim role)` reads ONE
+  linked endpoint (`:subject` or `:object`) with one adjacency probe;
+  `claim-endpoints` is now defined on top of it. A two-hop read that
+  wants only the object no longer pays for the subject's edge as well.
+
+- **`register-source`** (#378): the runtime twin of `def-source`'s
+  registration — `(register-source class facets &key graph-name)` takes a
+  class built with `create-vertex-type` and the seven facets as a plist,
+  and does what the macro's expansion does after its `def-vertex`: the
+  identity index, the named `source-identity-key` constraint, the
+  contract and the namespace registration; idempotent; nothing persisted
+  (the consumer replays its own record, as #172 R5 splits it).
+  `graph-name` defaults to the class's default store;
+  `source-store-unknown` when there is none and none is given.
+- **`ensure-index` / `ensure-unique`** (#378): runtime twins of
+  `def-index` and `def-unique`, declaring an index or a uniqueness
+  constraint from data and building it if the graph is open; the two
+  macros now expand to them.
+
+- **`unregister-source`** (#381): the inverse of `register-source` —
+  the class leaves its namespace (`resolve-endpoint` stops answering for
+  it) and its contract is dropped; idempotent; the class, its index,
+  its constraint and its records stay.
+- **`:record-p` on `create-vertex-type` / `create-edge-type`** (#381,
+  default T), mirroring `ensure-namespace`: NIL writes no manifest TYPE
+  row at creation and none when a store later instantiates the type,
+  so a consumer that keeps its own record and never runs
+  `materialize-schema` leaves no orphan type rows. Re-creating with the
+  default records again.
+
+- **Counting index** (#361): `def-count-index` declares a per-prefix
+  counter pair `(all . current)` maintained at commit apply, replication
+  and purge, persisted through its own sidecar and rebuilt after a
+  re-applying apply -- at the next query, at the next open after a
+  crash-recovery replay, and at `close-graph` while the maps are still
+  stale, so a device that pulls and closes with no count query between
+  them never persists under-counted maps; `count-index-lookup` and
+  `map-count-index` read it without resolving a node. Every claim family
+  now declares three
+  (`claim-subject-count`, `claim-object-count`, `claim-relation-count`),
+  so `claim-namespaces`, `claim-keys` and `claim-relations` are lookups
+  outside an as-of extent (inside one they keep #350's walk). No node
+  format change; existing families build the maps on next open.
+  `docs/general-index-design.md` §6b.
+
+- **Claim-family vocabulary** (#350): `claim-namespaces`,
+  `claim-relations` and `claim-keys` list what a family names, in
+  index order, with opt-in counts, `:current`, paging on keys, and the
+  open transaction's own writes overlaid; refused on the epoch axes
+  (membership is live). Built on two new engine primitives,
+  `map-index-prefixes` (a seek-and-skip walk of distinct leading
+  prefixes) and `index-count`, and a fifth index every family declares,
+  `claim-relation`. No storage format change; existing families build
+  the new index on next open. `docs/general-index-design.md` §6a, the
+  manual's spacetime chapter.
+
+- **Node-local time travel** (#115, Phase C-3): `with-as-of`, `:as-of`
+  on `lookup-vertex`/`lookup-edge`/`map-vertices`/`map-edges` and on
+  `select`, `latest-epoch`, `edge-history` and `node-history`. An as-of
+  read is a read-only snapshot started at E+1, so it answers the version
+  whose commit epoch is the newest at or below E, and membership --
+  typed scans, adjacency, the generated functors -- is reconstructed by
+  walking index tombstones. A version reaped past `:keep-revisions` is
+  reported as `version-reaped-error` (or skipped and counted under
+  `:if-reaped :skip`), never substituted; absent is told from reaped by
+  the oldest retained revision. Refused with `as-of-refused` for a
+  future epoch, inside a read-write transaction, inside a snapshot at
+  another epoch, for the untyped scan and on a memory graph. Epochs are
+  node-local (#116). No storage format change. `docs/time-travel.md`.
+
+- **`claims-touching`/`claims-by-producer` `:as-of-epoch`** (#347): a
+  second resolution axis alongside `:as-of`, answering by *commit
+  epoch* rather than by wall clock -- each claim comes back as the
+  version live at that commit epoch (inclusive comparison: the version
+  whose committing transaction id is newest at or below it), told from
+  "created after the epoch" versus reaped past `:keep-revisions` by
+  the oldest retained version's `revision`. New export
+  `graph-db.spacetime:claim-commit-epoch` reads a version's commit
+  epoch off the newly exported `graph-db:commit-epoch`. Epochs compare
+  across stores only while they share one `system-clock`; a clockless
+  store refuses the axis with `epoch-axis-unavailable`, a
+  `query-precondition-error` subtype, while `:as-of` on the same store
+  keeps answering. Two bounds, documented rather than fixed: index
+  membership is not snapshot-versioned (#345), so a claim deleted
+  after the epoch is not returned; and a claim born with an
+  already-closed transaction period -- a replicated or restored belief
+  retracted upstream -- reads as retracted at every epoch.
+
+- **`graph-db/rules`, claims as Prolog facts** (#304, #330): a new
+  subsystem, `:depends-on (:graph-db/spacetime :graph-db/query)`,
+  registering seven global Prolog functors -- `claim/7`,
+  `claim-current/1`, `claim-valid-at/2`, `claim-producer/2`,
+  `claim-standing/2`, `claim-relation/2` and `claim-rule-version/2` --
+  so a `select`, or a guarded free-text query, reads claims as facts.
+  `claim/7` generates from the subject, subject-relation and object
+  indexes and `claim-producer/2` from the producer index; a goal with
+  no index route is refused as cost-unbounded under a resource bound
+  (#285), which on the guarded surface is always. Namespaces cross as
+  strings, a unary claim binds its object pair to NIL, and a family
+  name no `def-claim-classes` registered now reports as
+  `prolog-ill-typed-error` rather than as an internal fault. CI gains
+  a `rules` lane; `docs/rules.md`. The rule record and `run-rule` are
+  the next slice (#331).
+
+- **`graph-db/rules`, rules as versioned producers** (#304, #331):
+  `def-rules-schema` gives a store the `rule` record (`def-source`,
+  identity `:rule`/`name`, one record per name) and the `derivation`
+  provenance family; `def-rule` is the in-image escape hatch.
+  `compile-rule` reads a rule's head and body through the guard's own
+  screen, reader and whitelist (new export
+  `graph-db.query:guard-query-text`), checks the head as one `claim/7`
+  pattern, moves `claim-producer` generators first, and refuses
+  recursion over every rule in scope with the cycle named; a `rule`
+  write that does not compile is refused at commit
+  (`rule-compile-error`). `run-rule` derives afresh and reconciles the
+  result with the rule's previous derivation in one validated
+  transaction under the query rails, each derived claim `producer
+  rule/<name>`, `rule-version`, `standing :inferred`, its validity the
+  intersection of its premises' (`extent-intersection`,
+  cl-temporal-extent 0.3.0), one `derived-from` claim per premise; a
+  claim kept from the previous derivation follows the current one --
+  its `rule-version` and its validity extent both -- and a refusal
+  unwinds the whole run, with the `rule-report` naming it.
+  `run-rules` runs every enabled rule in dependency order;
+  `premises-of` and `dependents-of` read provenance back.
+  `docs/rules.md`.
+
+- **`graph-db/rules`, a rule reads a scope of stores and writes its
+  own** (#304, #332): `run-rule` and `run-rules` take `:scope`, the
+  open stores the body may read -- the rule's own store first, a store
+  named twice read once -- and `claim/7`'s indexed routes and family
+  walk, and `claim-producer/2`'s generator, answer the union of them,
+  still committed state -- a *foreign* store whose schema lacks the
+  family contributing nothing rather than refusing, as any store does
+  under `claim-producer/2`, while the rule's own store still refuses an
+  ill-typed `claim/7` goal as slice 1 had it. The rule writes its own
+  store alone. With another store in scope the body is evaluated
+  *before* the write transaction, under one composed read snapshot per
+  store, because a read-write transaction refuses every read of another
+  store (#53); under a shared system clock (#168) those snapshots take
+  their epochs from one counter, and the run is not serialised against
+  a premise committed after them. A premise from another store is
+  recorded in its `derived-from` record's `method` -- the downcased
+  store name, `nil` for the rule's own -- and `premises-of` now takes a
+  `:scope`, resolving each premise in the store its record names and
+  dropping one whose store is out of scope. A Lisp caller can bind
+  `graph-db::*claim-scope*` around a raw `select` for the same reads,
+  outside a transaction; `run-rule` and `premises-of` refuse a foreign
+  scope inside one outright, as an operator error rather than a report.
+  `docs/rules.md`.
+
+- **Recursive rules** (#333, Phase 3 unit 1 of #122): a rule may read
+  its own head relation. `compile-rule` computes strata (SCCs of the
+  relation dependency graph) instead of refusing a cycle, and refuses
+  only unstratified negation and an unbound relation; `run-rules`
+  runs a recursive stratum to a semi-naive fixpoint -- rounds over the
+  previous round's new claims through the internal `rule-delta/2`
+  generator, withheld from free text -- and sweeps once at the
+  fixpoint. A round's `claim/7` reads exclude the stratum's own
+  producers, round 0 included, so the fixpoint recomputes the
+  derivation from scratch rather than reading a previous run's own
+  output as a premise; what that exclusion removes, an index of the
+  run's own derivation so far restores to every recursive goal, not
+  only the one the delta feeds. Round 0's delta is seeded with the
+  stratum's **base facts** -- every current claim of a stratum relation
+  whose producer is none of the stratum's -- so an observed claim of a
+  derived relation is a premise like any other rather than invisible to
+  a recursive goal, which reads the delta where its body reads the
+  relation. The strata order counts a relation read under a `not`, so a
+  negating stratum runs after the one deriving what it negates.
+  `rule-report` gains `rounds` and `stratum`; `*rules-max-rounds*` caps
+  a stratum. Single-store strata are one transaction; cross-store
+  strata commit per round.
+
+- **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
+  the JSON pattern DSL moves out of the `graph-db` web system and the
+  free-text Prolog guard moves out of `graph-db/gui`, both into a
+  subsystem depending only on `graph-db/core`, so a consumer wanting a
+  bounded query tool no longer pulls in a web stack. The exported
+  `run-guarded-prolog` screens, reads, guards and runs free text
+  against a graph, returning `(values columns rows truncated-p)` in
+  JSON-shaped `:data` form or in-image `:raw` form; see
+  `docs/guarded-query.md`. The `/query` and `def-query` REST routes,
+  the DSL's only ndjson callers, now set the
+  `application/x-ndjson` content type themselves once their query has
+  produced its text. The GUI Prolog endpoint now reports `columns` for
+  a zero-row answer too, instead of `[]`.
+
+- **A transaction reads its own claim writes** (#324): `claims-touching`
+  and `claims-by-producer` overlay the open transaction's write set --
+  the commit view validation already uses -- so retract-then-assert on
+  one series inside one `with-transaction` no longer re-finds the
+  retracted claim as current. `:as-of` still answers committed history
+  only.
+
+- **`split-claim-identity-key`** (#321): the inverse of
+  `claim-identity-key`, so a consumer that stores keys and resolves
+  them later gets producer, subject, relation, object and extent start
+  back without re-implementing the escape rule. Arity and temporality
+  follow from the field count; a string the encoder cannot have
+  produced signals `malformed-claim-identity-key`, including a
+  namespace field that is not canonical (`[a-z0-9-]+`), which is
+  refused before anything is interned.
+
+- **`validate-transaction`, and `writes` exported** (#320): a consumer
+  that stages writes in its own transaction can ask the #301 evaluator
+  about them -- `(validate-transaction graph)` over the ambient
+  transaction, or `(validate-writes graph (writes tx))` -- and commit or
+  roll back on the report, without reaching for an internal symbol.
+
+- **B+ tree cursors stopped consing a page per level and per crossing**
+  (#97): `%bpt-read-page` reuses a caller buffer; a descent threads one
+  buffer down the internal levels and a leaf crossing reuses the
+  crossed-from page. Measured on short scans (the dominant spatial
+  pattern): 10.6 → 6.4 KB consed and 13 → 11 µs per 0–3-row scan. The
+  remaining consing is the cursor-owned leaf page plus per-probe key
+  decodes — the latter stays on the issue.
+
+- **Scan-and-write transactions can opt out of the retry cliff** (#92):
+  every node a `map-vertices`/`map-edges` scan visited joined the
+  read-set, so a scanning transaction conflicted with any concurrent
+  writer touching anything it scanned — measured at a 100%
+  fall-back-to-global-lock rate for the scan-and-write ETL shape.
+  `:record-reads nil` (explicit at the call site, by design) keeps the
+  scan's visits out of the read-set: MVCC snapshot consistency and
+  write validation are unchanged, serializability against the scanned
+  corpus is knowingly waived. Defaults unchanged. The coarser-fallback
+  and attempt-cap options stay open on the issue.
+
+- **`vector-search` takes a `:filter` inside the top-K scan** (#293): a
+  bounded query fills k with in-bounds hits instead of post-filtering an
+  unbounded top-K below k. The filter sees only the candidate's node id
+  — gated before the vector is even read — so the segment's
+  no-materialisation property survives. The second return value now
+  disambiguates NIL: `:ok`, `:no-such-class`,
+  `:not-a-vector-index-slot` (the typo case), or `:no-segment-yet`.
+
+- **The edge-occupancy hint finally has a consumer** (#244): the v5
+  untagged-id scan (`resolve-node-graph`, `active-edge-p`,
+  `compact-edges`) now tries the stores `edge-type-stores` names FIRST,
+  with every other open store still following — pure ordering, so a
+  stale or incomplete hint costs lookups, never an answer. Restricting
+  disproof to the hinted set would need a completeness marker the hint
+  does not carry; noted on the issue.
+
+- **Spatial scope resolution is memoized** (#64): resolving a named
+  scope walked `generic-function-methods`/`subtypep` per query — and
+  `find-nearest-k` re-walked per widening, up to ~16 times per call.
+  The class-derived half (declared-p + index keys) is now memoized,
+  invalidated whole on every type (re)definition via
+  `*node-type-definition-hooks*`; type tags stay per-query, since they
+  depend on per-graph registrations and a stale set would silently drop
+  results.
+
+- **GUI stats report allocated bytes, not apparent** (#274): sparse
+  mmap stores showed GiB for MiB of data. `onDiskBytes` is now the
+  allocated sum (`SEEK_DATA`/`SEEK_HOLE` extent hops in the POSIX
+  layer, falling back per file where unsupported); `apparentBytes`
+  carries the old number.
+
+- **A withdrawn index's heap pages are reclaimed at the next open**
+  (#147): the sidecar reconcile that drops a withdrawn or re-shaped
+  declaration's record — secondary and unique alike — now frees the
+  structure it is dropping, at the one moment nothing can be mid-read.
+  Mid-image withdrawal still defers to that open, deliberately.
+
+- **Cost-unbounded functors are classified engine-side, and a
+  resource-bounded `select` refuses them** (#285). `%tick` preempts at
+  goal boundaries only, so a functor burning arbitrary time in one
+  atomic call (`regex-match/2`'s catastrophic backtracking) runs past
+  `:timeout`/`:max-inferences` unaborted. `declare-functor-cost-unbounded`
+  classifies such functors; a `select` with either bound in effect
+  refuses goals naming one (`prolog-cost-unbounded-error`, instant,
+  any nesting) unless `:allow-cost-unbounded t` accepts the uncovered
+  bound. The GUI's #279 category now derives from this registry
+  (`cost-unbounded-predicate-names`) — single source. The async
+  watchdog non-option stays a non-option, documented.
+
+- **`claims-touching`/`claims-by-producer` `:as-of`** (#300, re-targeted
+  to the spacetime layer): answer on the transaction axis — each claim
+  returned as the version believed at the asked instant, in-place
+  updates unwound, retractions honored, composed with `:at`/`:during`
+  over the resolved version's validity. The time→version mapping is a
+  per-version wall-clock stamp in the claim's own data (`version-stamp`,
+  written at every create and save), and `def-claim-classes` now
+  declares `:keep-revisions` for the family (default effectively
+  unbounded; option to override). A version past the retention window is
+  reported as a `reaped-claim`, never silently substituted; a claim
+  swept by `delete-claims-by-producer` is invisible to `:as-of`. No
+  public argument or result is an epoch.
+
+- **`validate-writes`** (#301, closing the #109 epic's evaluator): run
+  the six constraint families over a proposed write set — value, unique,
+  cardinality, domain/range, and every subsystem commit validator
+  (membership and extent disjointness) — through the commit view,
+  without committing. Returns one `validation-report` carrying every
+  family's own violation structs tagged with the refused write, plus
+  per-family checked and spec counts, so "no violations, N specs
+  checked" and "nothing to check" stay distinguishable. A second entry
+  to the same collectors `%commit` runs, so the two cannot disagree.
+
+- **`claim-identity-key`** (#303): a claim's identity tuple — producer,
+  subject, object for a binary claim, relation, and the canonical extent
+  start for a temporal family — as one canonical string, so external
+  references name claims by identity instead of node id. Equal tuples
+  render `string=` keys; `|`-joined with escaping.
+- **`claims-touching` and `claims-by-producer` paginate** (#302):
+  `:limit`/`:offset` and a second `truncated` return value (one past the
+  cap, like the REST envelope). `claims-touching` also gains
+  `:relation`, riding a new `(subject-namespace subject-key relation)`
+  index every claim family now declares (`claim-subject-relation`), so a
+  one-relation read of a busy endpoint touches only that relation's rows.
+
+- **`graph-db/spacetime` now requires cl-temporal-extent 0.3.0**
+  (`extent-intersection`, kraison/cl-temporal-extent#5), which
+  `graph-db/rules` uses to intersect a derived claim's premises.
+
+- **Pull requests run the main suite's fast tier** (#340): timing all
+  143 children of `graph-db-suite` found three of them -- the
+  `system-restore`, `detach` and `type-id-width` suites, which build
+  real on-disk stores -- are 71% of its wall clock for 8% of its
+  checks. A pull request now runs `graph-db/fast-test`, the same suite
+  minus those three (~10 minutes, 92% of the checks); a push to
+  `experiment` still runs `graph-db` in full and remains the gate
+  promotion waits on. The list is `*slow-suites*` in
+  `tests/suite.lisp`, next to the suites rather than in the workflow,
+  and `run-tests` refuses a name that is not a child of
+  `graph-db-suite` so a rename cannot silently exclude nothing.
+  `docs/ci.md` has the numbers and the trade.
+
+- **Read/write statistics are sampled** (#373): `record-graph-read` and
+  `record-graph-write` now cost one fixnum increment per call and touch
+  the wall clock and the per-second histogram once every
+  `+stats-sample+` (64) calls, adding 64 to the current second's bucket.
+  Profiling the #372 edge-read bench showed the old per-lookup
+  `get-universal-time` plus synchronized-hash update was about half of
+  an adjacency read's time and a fifth of an index read's. `graph-stats`
+  keeps its shape; totals are exact to within one sample per graph, and
+  a graph read fewer than 64 times reports no reads.
+
+- **In-memory id tables hash with a fixnum fold** (#373): the node cache,
+  the ve/vev adjacency caches, `make-id-table` (the transaction read set
+  and local cache, replication and peer-streaming sets) and `sxhash-node`
+  no longer hash a 16-byte id through `%hash`, which folds it into a
+  128-bit bignum on every call. A consing-free 62-bit multiply-add fold
+  replaces it for those tables only: a cache hit measured 1811 ns → 196
+  ns in isolation. `%hash` itself is unchanged, because the on-disk
+  linear hash places buckets with it; replacing that is #375 (a
+  storage-format change, next major).
+
+- **The query runner interprets instead of compiling** (#373):
+  `run-query-goals` — behind `run-guarded-prolog`, the JSON pattern DSL
+  and `graph-db/rules` — evaluates the `select` form under SBCL's
+  interpreter. A native compile per request cost 18–20 ms and was ~94%
+  of a small query; interpreted solving is ~2× slower than compiled,
+  so the interpreter wins below ~20 ms of solving, i.e. nearly every
+  bounded query. Two-hop `related/3`: ~55 → ~700–1100 queries/s; a
+  500-row scan ~30 → ~50/s. SBCL only; other implementations are
+  unchanged.
+
+### Fixed
+
+- **tests(spacetime): the retraction test takes its as-of reference
+  from the engine's monotonic stamp** (#447). `local-time:now` is a
+  whole second on ECL, so the claim could be stamped a nanosecond
+  after `then` and the as-of read answered nothing; seen on ECL arm64.
+
+- **GUI: the read-only rail drains the request body before answering**
+  (#446). An answer from the dispatcher left the body unread, so the
+  close was a TCP reset; a macOS client then saw the reset in place of
+  the 403, and `read-only-is-a-dispatch-rail` was flaky on arm64. Linux
+  delivers the queued reply before the error and never showed it.
+
+- **Shadow copies read only the data** (#434). `%copy-file-sparse` read
+  every apparent byte of a store file to find its holes, ~12 GB per
+  fresh store, at 1.8 ms/MB on SBCL and 8.5 ms/MB on CCL; the detach
+  and system-restore suites spent about 1.5 h of CCL's main lane there.
+  The copy now walks the filesystem's data extents (`SEEK_DATA` /
+  `SEEK_HOLE`, `%posix-data-extents` in posix.lisp, shared with
+  `%posix-allocated-size`) and falls back to the chunk scan where the
+  probe is unsupported. A 1 GiB sparse file with 1 MiB of data copies
+  in about 10 ms on both instead of 1.9 s and 8.7 s. Its tests assert
+  what every filesystem agrees on, not ext4's run layout: APFS reports
+  16 KiB runs and allocates small gaps (#442).
+
+- **`%posix-allocated-size` returns a size** (#438). `SEEK_DATA` past the
+  last extent is ENXIO, which the walk mistook for a filesystem without
+  the probe and answered NIL, so the GUI's store size fell back to the
+  apparent size (gigabytes for a fresh store). ENXIO now ends the walk;
+  only EINVAL answers NIL. Its test asserted nothing on NIL; on Linux
+  it now requires a number, and checks a dense and an empty file.
+
+- **tests: three CCL arms** (#437). The infinity literal, redefining
+  `truename` under CCL's kernel guard, and the sparse-file real-usage
+  helper (now the engine's `%posix-allocated-size` outside SBCL/ECL).
+
+- **Sidecar reader counts a torn tail once on CCL** (#436). It noted the
+  position before `read`, but CCL's `read` leaves the newline after a
+  form where SBCL's eats it, so the recovery's `read-line` consumed an
+  empty line and the torn record was counted and warned twice. The
+  position is now taken after skipping whitespace.
+
+- **`check-value-constraints` no longer carries a stray `UNCHECKED`
+  reference** (#435). Unescaped quotes in its docstring ended it early
+  and left the word as a bare symbol in the body; SBCL and ECL dropped
+  the unused read, CCL signalled `UNBOUND-VARIABLE` on every audit.
+
+- **tests(detach): the two drain tests no longer join their worker
+  twice** (#433). CCL's `join-process` blocks forever on a second join
+  of a finished thread (the termination semaphore is consumed by the
+  first), so the CCL main lane hung after the four passing checks of
+  `detach-drains-in-flight-readers-first`. The cleanup join is now
+  guarded by `thread-alive-p`, as every engine caller already is.
+
+- **The #387 string-bound paging test compares its solutions sorted**:
+  they arrive in type-index order, which is hash order, and CCL's changed
+  with the fixnum-wide fold (#424).
+
+- **CCL: a timed `with-lock` waits instead of signalling** (#432).
+  `do-grab-lock-with-timeout` passed `(list lock)` where
+  `process-wait-with-timeout` takes the predicate's arguments as
+  `&rest`, so `try-lock` got a list and every timed wait, the peer
+  writer's `receive-message` first, died with a type error. The first
+  full CCL main lane (#118) reached it.
+
+- **GUI roster on CCL: open answers 409 for a dirty store and 404
+  location-missing for a vanished one** (#315) instead of
+  no-recorded-location for both. CCL file streams are private to the
+  thread that opened them; `journal-records` flushes the system clock's
+  journal from the request thread, the flush signalled, the roster read
+  swallowed it and saw no attach records. The journal is opened with
+  `:sharing :lock` on CCL, as the replication log already was.
+
+- **CCL: a writer no longer starves behind back-to-back readers**
+  (#118). CCL's native `make-read-write-lock` admits new readers while a
+  writer waits, so three segment scanners re-entering the read side kept
+  `segment-put` out indefinitely and the main suite never terminated
+  there (3.0.0 through 4.0.1). The CCL shim in `utilities.lisp` now
+  counts queued writers and gates new readers while one waits, the FIFO
+  `rw-lock.lisp` gives the other implementations; a thread already
+  holding the lock on either side is not gated. `acquire-write-lock`
+  still ignores `:wait-p` on CCL, as before.
+
+- **A float literal with an absurd exponent is refused on the raw query
+  text** (#315): SBCL's reader signals on `1e999999` and ECL reads
+  infinity, both already refused, but CCL clamps it to the largest float
+  and the non-finite screen cannot tell it from a real one, so the GUI
+  answered 200. `%screen-exponent-text` runs after the character screen
+  and refuses an exponent past 400 outside strings, names and comments,
+  with the same "could not be read" message everywhere.
+
+- **The skip-list node cache's get-or-install is atomic on CCL and
+  LispWorks too** (#425, #406): `with-sl-cache-lock` was a mutex on ECL
+  and a no-op elsewhere, and a CCL `:shared` table only serializes single
+  operations, so two threads missing at once still built two objects for
+  one node (6 of 300 rounds in the #406 test on CCL). The mutex now
+  guards every implementation whose table cannot lock itself.
+
+- **The algorithms distance test compares by value** (#426): CCL hands
+  the weights back as doubles, and `equal` on a double and a single is
+  false.
+
+- **A `reaped-claim` answers NIL to `claim-current-p` and
+  `claim-transaction-extent`** (#429) instead of a no-applicable-method
+  error, so a caller that skips the `reaped-claim-p` guard gets the
+  documented unknown. The #324 as-of test and the two #391 feed-cursor
+  tests take their stamps from `%st-now`, the engine's monotonic clock:
+  on a whole-second clock (ECL, #308) `local-time:now` sits at or before
+  the stamps the engine moved past it by nanoseconds.
+
+- **`%desired` is declaimed `notinline`** (#430, #428): the rules scope
+  test's transaction probe swaps it, and ECL compiled its same-file
+  callers past the swap (three ECL failures in
+  `the-scope-decides-where-the-body-is-evaluated`).
+
+- **The count-index build and per-node probes fire on ECL** (#428):
+  `%count-node` and `%build-count-index-for-spec` are declaimed
+  `notinline`, so a test's FDEFINITION swap reaches their same-file
+  callers, as `mmap.lisp` already does. Four ECL failures, the counters
+  themselves were right.
+
+- **`rebuild-vector-segment` replaces the live segment file with
+  rename(2)** (#427). It used `cl:rename-file` over an existing target,
+  which ECL and CCL refuse (nine ECL segment tests; the trap #313 fixed in
+  the system clock). Now `%posix-rename`, as there.
+
+- **The in-memory id fold is as wide as a fixnum on the running
+  implementation** (#424, #425, #373). `%fixnum-hash-bytes` masked to 62
+  bits, SBCL's fixnum width; CCL's is 60 and ECL's 61, so on both the fold
+  returned bignums for most ids, and a CCL custom-hash table misses a key
+  whose code is a bignum. The node cache and the transaction's tables
+  missed, a retried transaction read a superseded version (#424), and the
+  skip list installed two objects for one node (#425). The mask is now
+  `(integer-length most-positive-fixnum)` bits; SBCL's values and its
+  consing-free arithmetic are unchanged.
+
+- **Claim namespaces carry a canonical `:check`** (#327).
+  `canonical-namespace-p`, exported beside the relation and producer
+  predicates, admits a keyword whose name is uppercase `[A-Z0-9-]+`,
+  the only spelling the identity key's downcased encoding reads back as
+  the same keyword; both namespace slots check it at commit. Stored
+  claims are unaffected.
+
+- **The GUI suite's functor tripwire knows spacetime's two functors**
+  (#379): `related/3` and `claimed/4` are expected exactly when the
+  spacetime package is loaded, so a service image running the suite
+  alongside spacetime no longer trips it and the plain image is
+  unchanged.
+
+- **`register-node` leaves an unchanged claim alone** (#395). The
+  update branch copied and saved the existing claim on every pass, so a
+  nightly re-registration minted a new version and commit epoch for
+  every subject and an epoch watermark saw everything as changed.
+  `%update-registration-claim` returns the claim unsaved when it is
+  current and every value this scan would write is already there, and
+  re-reads it inside its own transaction before writing, so a
+  concurrent registration of one subject is an OCC retry rather than a
+  stale copy the commit now refuses (#355).
+
+- **The Prolog engine resolves functors under any `*print-case*` or
+  `*print-base*`** (#342). `make-functor-symbol` spelled `NAME/ARITY`
+  through `~A`, so a caller with `:downcase` bound minted `claim/7`
+  where `CLAIM/7` was registered and every goal evaluated at request
+  time (rules, the guarded runner, the query DSL) was refused as an
+  unknown functor. The name is now built from `symbol-name` and a
+  decimal arity, in `make-functor-symbol` and `new-interned-symbol`
+  alike.
+
+- **A view no longer resolves its nodes through `lookup-<class>` by
+  name** (#399). `def-view` recorded that symbol and `map-view` called
+  it per entry, so an application function of the same name silently
+  took the view over and was handed raw ids. `map-view` now reads
+  through `lookup-vertex` or `lookup-edge` by the view's class; the
+  recorded symbol stays in the persisted view record, inert, so no
+  existing view rebuilds. `:include-deleted-p` on `map-view` works as
+  documented as a result: the generated helper had hidden deleted nodes
+  before the flag could see them.
+
+- **GUI mount: the trailing-slash redirect never names a host, and
+  `:read-only` is a dispatch rail** (#386). The 301 for a bare mount
+  root was built from the raw request URI, so an absolute-form request
+  (`GET http://evil.example/gui`, the shape proxies send) answered
+  `Location: http://evil.example/gui/`, an open redirect; the scheme
+  and authority are now stripped the way hunchentoot strips them from
+  its script name. `:read-only` used to be `with-write-verb` on the two
+  management handlers; `%gui-dispatch` now refuses every request that
+  is not GET, HEAD or the query and Prolog POSTs with the same
+  `403 read-only`, so a mutating route added without the macro is
+  refused all the same.
+
+- **A write's base is the version the transaction sees, never the object
+  copied** (#355). `copy` and `mark-deleted` registered the object they
+  were handed as the update's old node, and the apply archived it over
+  the live head: from an as-of result, a history entry or a node read
+  before the transaction began (`mark-deleted`'s own idiom), the live
+  data block and head leaked, every version in between dropped out of
+  the chain and the revision went backwards. `%transaction-pre-image`
+  now looks the id up inside the transaction, so every such save is a
+  proper new revision (saving a copy of an as-of result restores it) and
+  a concurrent commit is an OCC retry. `validate-live-heads` stays as a
+  safety net at commit, signalling `stale-revision-error` (now with the
+  stale and live revision and epoch) before anything is applied.
+
+- **Skip list: one cached object per address; writers no longer
+  livelock** (#406). Two threads missing the node cache for one address
+  both built a node object and both installed it, so a splice through
+  one left the other's forward pointers stale; a writer walking the
+  stale one found the removed node, failed validation (or
+  `ok-to-delete-p`) and retried the same walk forever. The cache now
+  keeps the first object, and add and remove re-read their
+  predecessors' pointers before judging, so a writer heals from any
+  stale array. Found and fixed first in vivace-cabinet (3c97bd8).
+
+- **A snapshot no longer depends on the caller's printer or reader
+  state** (#354). `write-backup-plist` printed under whatever
+  `*print-level*`, `*print-length*`, `*print-base*` and
+  `*read-default-float-format*` the caller had bound, so a snapshot
+  taken over SWANK by a client with print limits wrote `#` and `...`
+  into the recovery file and reported success, and a double-float
+  default demoted every double on replay. Writer and reader now run
+  under `with-standard-io-syntax`, keeping only the caller's package
+  (and the restore readtable on the way in).
+
+- **Vector segments: a rebuild or close cannot unmap a segment a scan
+  still holds, and a rebuild never empties the table** (#54).
+  `close-vector-segment` takes the segment's write lock, so a scan in
+  flight finishes first; `segment-scan`, `segment-get` and
+  `segment-score-subset` signal the new `segment-closed` on an object
+  closed under them instead of reading unmapped memory, and
+  `vector-search` re-fetches the live segment once. `rebuild-vector-
+  segment` builds the replacement at a temporary path, renames and
+  registers it, then closes the old one. In the test, a search loop
+  during rebuilds used to fault the image; it now always answers.
+
+- **B+ tree: an update holds one lock; a cursor crosses leaves by key**
+  (#319). `update-in-skip-list` took the write lock twice, for its
+  remove and its add, and a concurrent reader found the key absent in
+  between (2,591 misses in 5,000 updates in the test); it now holds the
+  lock across both. A cursor followed the sibling link copied with its
+  page, which a merge could free and a later allocation reuse: it then
+  read another part of the tree and skipped keys. It now re-seeks from
+  the root past the last key it emitted at every crossing. The audit's
+  claim that the tree's read-write lock is not reentrant was wrong: the
+  write side re-enters for its holder on every implementation.
+
+- **B+ tree: a full page splits by bytes, not by entry count** (#404).
+  Split at the middle entry, a page of small entries could not take
+  large ones: the larger half did not fit, the encode returned NIL, the
+  write signalled a type error and the new right page leaked. The split
+  index is now where the accumulated cell bytes reach half, and both
+  halves are checked to encode before either is written.
+
+- **B+ tree: removing a key together with its value matches** (#405).
+  The stored value was compared serialized, with `equal`, which never
+  matches two octet vectors, so the value-qualified
+  `remove-from-skip-list` was a no-op on this backend. The stored value
+  is deserialized and compared with the tree's `value-equal`, as the
+  skip list compares values. Latent: nothing in the engine calls that
+  form on a B+ tree.
+
+- **An index-backed read under a snapshot never answers a node under a
+  value its version lacks** (#345). Index membership is released when a
+  write is applied, not when the version it indexed is reaped, so a
+  read snapshot could find a node under its new value and resolve the
+  old version. `index-lookup`, `map-index` and `unique-lookup` now check
+  the resolved version against the key. The other half, a node no
+  longer found under the value it had at the snapshot, is documented
+  (`docs/time-travel.md`) and is phase C-1's versioned membership
+  (#113).
+
+- **Index reads on a declared index no commit has built yet see the
+  transaction's own writes** (#416). `index-lookup`, `map-index` /
+  `index-range`, `index-count` and `map-index-prefixes` returned their
+  empty answer before consulting the overlay when the index existed only
+  as a declaration, so in a fresh graph the transaction that created the
+  first nodes of a class could not find them by an indexed slot. Found by
+  the rules suite once spacetime's own overlay went (#411): a second
+  `%derive` in one transaction re-made its provenance records and commit
+  refused the duplicate. The read now walks a transient index with no
+  backing map, so the overlay half runs and the committed half is empty.
+
+- **Spatial and vector-segment queries see the transaction's own
+  writes** (#410). Inside `with-transaction`, `find-nodes-within`,
+  `find-nodes-intersecting`, `find-nodes-near`, `find-nearest-k` and
+  their Prolog functors find a node the transaction created with a
+  geometry, find a moved one at its new location only, drop a deleted
+  one, and answer a node updated in place once: the index walk skips an
+  id the transaction wrote and its own live nodes are tested at their
+  current geometry. `vector-search` likewise skips own ids in the scan,
+  scores the transaction's own vectors and returns the K best of both;
+  `:filter` applies to own hits too, and with no segment built yet own
+  hits alone answer `:ok`. Unique-index membership has no public read,
+  so #408's committed-only list is down to views and the untyped scans.
+
+- **The count index sees the transaction's own writes, and spacetime's
+  hand-rolled overlays are gone** (#411, #358 part 1). Inside
+  `with-transaction`, `count-index-lookup` and `map-count-index` answer
+  the committed counters plus the apply pass's arithmetic over the
+  transaction's writes (`overlay-count-delta`), a name whose count falls
+  to 0 dropped and a new one merged in order. With every index read now
+  answering as the transaction will commit, spacetime's three second
+  implementations of that rule, `%overlay-transaction` under
+  `claims-touching` / `claims-by-producer`, `%created-under` under the
+  as-of vocabulary walk and `%vocabulary-delta` under the counted one,
+  are deleted; cardinality's `%overlay-edge-delta` stays, because the
+  commit view's validators read with the overlay off by design. #358
+  part 1 is pinned by a test: a committed claim whose identity slot a
+  transaction changes is listed and counted under the new name, not the
+  old, which the engine's re-derived-key rule (#408) already answered.
+
+- **`index-count` and `map-index-prefixes` see the transaction's own
+  writes** (#409). Inside `with-transaction` the count is of the entries
+  the transaction will commit (an own create adds one, a moved key
+  leaves its old value and arrives under the new, a delete leaves), and
+  the prefix walk lists each prefix it will commit once, in index order,
+  skipping a prefix whose only rows it deleted or moved away. Same rule
+  as #408: the committed walk skips own ids, the overlay supplies the
+  own members. The count index's `count-index-lookup` and
+  `map-count-index` stay committed-only until #411, where spacetime's
+  own delta over them retires in the same step.
+
+- **A short `:end` tuple on `index-range` / `map-index` includes its
+  extensions with one bound as it did with two** (#413). On a multi-slot
+  index, `:end '("d")` alone dropped the `("d" ...)` rows that
+  `:start '("a") :end '("d")` returned: the single-bound path filtered a
+  full scan with the bare tuple order, under which a prefix sorts before
+  its extensions. `ix-map` now takes one range cursor on every path, the
+  index's head or tail sentinel key standing in for a missing bound, so a
+  short tuple is a prefix bound at either end whether or not the other is
+  given, and a single-bound walk seeks instead of scanning. The
+  transaction overlay follows the same bounds.
+
+- **A read inside `with-transaction` sees the transaction's own
+  writes** (#408). Lookups, the typed and adjacency `map-vertices` /
+  `map-edges`, `edge-exists-p`, `index-lookup`, `map-index` and
+  `index-range` return the transaction's creates, saves and deletes on
+  top of its snapshot; a moved index key is found under the new value.
+  `copy` and `mark-deleted` of a node the transaction already saved chain
+  to the committed pre-image. `*read-own-writes*` (default `t`) is bound
+  nil under the commit view's validators and `validate-writes`. Still
+  committed-only: views (#7), the untyped scans, `index-count`,
+  `map-index-prefixes`, spatial and vector membership. A scan inside a
+  transaction costs O(pending writes) extra (`docs/perf-baselines.md`).
+
+- **`node-slot-value/3` enumerates, bounded, and fails cleanly on
+  ill-typed terms** (#351): an unbound node now enumerates -- a full
+  scan of every vertex of every type, one inference charged per vertex
+  against `:max-inferences`/`:timeout`, same as `is-a/2`'s
+  both-unbound arm -- and an unbound slot lists a bound node's data
+  slots. A non-symbol slot term, or a bound non-node value with an
+  unbound slot, now fails the goal instead of signalling an uncaught
+  `TYPE-ERROR` or `NO-APPLICABLE-METHOD` (a guard-classified 500). A
+  string now unifies with a keyword of the same name,
+  case-insensitively (a keyword-valued slot has no keyword spelling on
+  the guarded surface, so a string stands in for one); `==/2` and
+  `setof`/`bagof` share `prolog-equal` with `=/2`, so they see the same
+  equality.
+
+- **`graph-db/rules`' refusals now honour `:allow-cost-unbounded`**
+  (#334, follow-up to #330): `claim/7`'s family walk and
+  `claim-producer/2`'s neither-bound case refuse from their own bodies,
+  per goal rather than per functor, and could not see the option until
+  `select` began binding `*allow-cost-unbounded*`. Both now read it, so
+  a caller who accepts the cost gets the walk under a budget instead of
+  a refusal whose own report told them to pass an option that did
+  nothing. For `claim-producer/2` the option buys the empty answer, not
+  a walk -- that goal has none to buy.
+
+- **`:allow-cost-unbounded` reached nothing at run time** (#334):
+  `select` read the option as a literal at macroexpansion and handed it
+  straight to the static refusal, so no running code could see it.
+  `declare-functor-cost-unbounded` classifies a whole functor, but a
+  functor can be cheap or unbounded *per goal* -- cheap with an argument
+  bound to an indexed value, unbounded with nothing bound -- and such a
+  functor must refuse from its own body, where the caller's escape hatch
+  was invisible; the condition's own report told the caller to pass an
+  option that could not work. `select` now binds the exported
+  `*allow-cost-unbounded*` for the query's dynamic extent, and
+  `%refuse-cost-unbounded` reads it, so the static refusal and a
+  functor's run-time one answer to one value.
+
+- **`claim-identity-key`'s refusal could not be printed** (#335): the
+  signal site passed `:name`, an initarg `unknown-claim-family` does not
+  define, so SBCL accepted it silently and left `parent` unbound. The
+  condition was of the right type -- `handler-case` and `typep` both
+  worked -- and only *reporting* it signalled `unbound-slot`, inside
+  whichever handler formatted it. It now passes `:parent`, and a test
+  asserts the report rather than only the type; that branch had no test,
+  which is how a wrong initarg survived.
+
+- **A goal's head resolved through one shared `*package*` binding**
+  (#322, second finding): `make-functor-symbol` now looks up an
+  already-registered functor first -- the head's own package, then
+  `graph-db`, where CL-inherited heads like `>` are registered -- and
+  interns only when neither hits, so a goal list spanning two packages
+  (the engine's globals and a schema's edge functors) compiles as one
+  query. `<-` definitions are unaffected: `add-clause` passes a new
+  `:define t` argument that skips both lookups and interns straight
+  into `*package*`, exactly as before.
+
+- **`def-claim-classes` derived its class names in `*package*`** (#323):
+  a declaration read from another package minted a second
+  `<parent>-binary` there and silently overwrote the family registry,
+  orphaning every existing claim of the family. Names now derive in the
+  parent symbol's package, and registering a family whose classes
+  differ from the registered ones signals `claim-family-conflict`.
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

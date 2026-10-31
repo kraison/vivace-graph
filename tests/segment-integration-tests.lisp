@@ -1159,3 +1159,243 @@ leaving the file on disk, then write again through the normal commit path."
                    "the newly written vector must also be present")))
         (ignore-errors (close-graph g :snapshot-p nil))
         (collect-garbage)))))
+
+(test vector-search-filter-fills-k-and-disambiguates-nil
+  "GH #293: a candidate filter runs INSIDE the top-K scan, so a bounded
+:k fills with in-bounds hits that ranked below the unfiltered top; and
+vector-search's second value distinguishes the NIL cases."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               ;; Group A dominates unfiltered similarity to the probe.
+               (dotimes (i 4)
+                 (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))
+               ;; Group B: far from the probe, loses the unfiltered top.
+               (dotimes (i 3)
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 -9.0))))
+             (let* ((probe (%si-embedding 8 1.0))
+                    (b-ids '()))
+               (map-vertices
+                (lambda (v)
+                  (when (string= "b" (slot-value v 'title))
+                    (push (graph-db:id v) b-ids)))
+                g :vertex-type 'si-doc)
+               (is (= 3 (length b-ids)))
+               ;; Unfiltered top-3: all group A.
+               (multiple-value-bind (top reason)
+                   (vector-search g 'si-doc 'embedding probe 3)
+                 (is (eq :ok reason))
+                 (is (= 3 (length top)))
+                 (is (notany (lambda (hit)
+                               (member (cdr hit) b-ids :test #'equalp))
+                             top)))
+               ;; Filtered: k fills with the B hits a post-filter loses.
+               (multiple-value-bind (top reason)
+                   (vector-search g 'si-doc 'embedding probe 3
+                                  :filter (lambda (id)
+                                            (member id b-ids
+                                                    :test #'equalp)))
+                 (is (eq :ok reason))
+                 (is (= 3 (length top)))
+                 (is (every (lambda (hit)
+                              (member (cdr hit) b-ids :test #'equalp))
+                            top)))
+               ;; The NIL cases, told apart.
+               (is (eq :no-such-class
+                       (nth-value 1 (vector-search g 'si-no-such-class
+                                                   'embedding probe 3))))
+               (is (eq :not-a-vector-index-slot
+                       (nth-value 1 (vector-search g 'si-doc 'title
+                                                   probe 3))))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+;;; ---- GH #410: the transaction overlay ----------------------------------
+
+(defun %si-vec (&rest floats)
+  "An 8-long single-float vector from FLOATS, zero-padded."
+  (let ((v (make-array 8 :element-type 'single-float :initial-element 0.0)))
+    (loop for f in floats for i from 0
+          do (setf (aref v i) (coerce f 'single-float)))
+    v))
+
+(test vector-search-sees-own-writes
+  "GH #410: inside the transaction VECTOR-SEARCH ranks the node it created
+by its vector, the node whose vector it changed by the new one, drops the
+node it deleted, and applies :FILTER to its own hits too; the same once
+committed.  Scores against (1 0 ...): d1 1.0, own 0.995, d2 0.447, d3
+0.196, the changed d1 0."
+  (with-test-graph (g)
+    (let ((q (%si-vec 1.0)) d1 d2 d3 own)
+      (flet ((ids (k &optional filter)
+               (mapcar #'cdr (vector-search g 'si-doc 'embedding q k
+                                            :filter filter))))
+        (with-transaction ()
+          (setq d1 (id (make-si-doc :title "d1" :embedding (%si-vec 1.0)))
+                d2 (id (make-si-doc :title "d2"
+                                    :embedding (%si-vec 0.5 1.0)))
+                d3 (id (make-si-doc :title "d3"
+                                    :embedding (%si-vec 0.2 0.0 1.0)))))
+        (is (equalp (list d1 d2) (ids 2)) "committed: d1 then d2")
+        (with-transaction ()
+          (setq own (id (make-si-doc :title "o"
+                                     :embedding (%si-vec 1.0 0.1))))
+          (is (equalp (list d1 own) (ids 2))
+              "a created node ranks by its vector")
+          (let ((c (copy (lookup-vertex d1))))
+            (setf (slot-value c 'embedding) (%si-vec 0.0 0.0 0.0 1.0))
+            (save c))
+          (is (equalp (list own d2) (ids 2))
+              "a changed vector ranks by its new value")
+          (is (equalp (list d2) (ids 1 (lambda (id) (not (equalp id own)))))
+              "the filter applies to own hits too")
+          (mark-deleted (lookup-vertex own))
+          (is (equalp (list d2 d3) (ids 2)) "a deleted node is gone"))
+        (is (equalp (list d2 d3) (ids 2)) "the same once committed")))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #54: a segment's lifetime, not only its lookup, is protected.
+;;;
+;;; REBUILD-VECTOR-SEGMENT and CLOSE-GRAPH unmapped a segment a concurrent
+;;; scan could still hold, and rebuild emptied the table for its whole
+;;; sweep.  CLOSE-VECTOR-SEGMENT now takes the segment's write lock (a scan
+;;; holds the read side), the read entry points signal SEGMENT-CLOSED on a
+;;; closed object and VECTOR-SEARCH re-fetches once, and rebuild swaps a
+;;; finished replacement in before closing the old one.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-si-graph ((g &key (docs 20)) &body body)
+  "A fresh integration graph with DOCS si-docs of dimension 8, *GRAPH* bound."
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000)))
+         (unwind-protect
+              (let ((*graph* ,g))
+                (with-transaction ()
+                  (dotimes (i ,docs)
+                    (make-si-doc :title (format nil "d~D" i)
+                                 :embedding (%si-embedding 8 (* 1.0 i)))))
+                ,@body)
+           (close-graph ,g :snapshot-p nil)
+           (collect-garbage))))))
+
+(test rebuild-waits-for-a-scan-in-flight
+  "GH #54: a rebuild cannot unmap a segment a scan still holds.  A thread
+holds the old segment's read side for half a second; the rebuild's close
+must wait for it, and the old object is closed afterwards."
+  (with-si-graph (g)
+    (let* ((old (%si-segment g 'embedding))
+           (released nil)
+           (holder (bt:make-thread
+                    (lambda ()
+                      (graph-db::with-read-lock ((graph-db::segment-lock old))
+                        (sleep 0.5)
+                        (setq released t)))
+                    :name "si-scan-holder")))
+      (sleep 0.1)
+      (graph-db::rebuild-vector-segment g 'si-doc 'embedding)
+      (is-true released
+               "the rebuild finished while a scan still held the segment")
+      (bt:join-thread holder)
+      (is (null (graph-db::segment-mmap old)) "the old segment is closed")
+      (is (not (eq old (%si-segment g 'embedding))) "a fresh one is live"))))
+
+(test vector-search-never-sees-no-segment-during-a-rebuild
+  "GH #54: the table is never empty mid-rebuild.  A thread runs
+VECTOR-SEARCH in a loop through five rebuilds and must always get :OK
+with a full answer."
+  (with-si-graph (g)
+    (let* ((stop nil) (bad 0) (searches 0)
+           (q (%si-embedding 8 3.0))
+           (searcher (bt:make-thread
+                      (lambda ()
+                        (let ((*graph* g))
+                          (loop until stop
+                                do (multiple-value-bind (hits status)
+                                       (vector-search g 'si-doc 'embedding q 3)
+                                     (incf searches)
+                                     (unless (and (eq status :ok)
+                                                  (= 3 (length hits)))
+                                       (incf bad))))))
+                      :name "si-searcher")))
+      (dotimes (i 5)
+        (graph-db::rebuild-vector-segment g 'si-doc 'embedding))
+      (setq stop t)
+      (bt:join-thread searcher)
+      (is (plusp searches) "the searcher ran")
+      (is (zerop bad) "~D of ~D searches did not answer :OK with 3 hits"
+          bad searches))))
+
+(test a-read-on-a-closed-segment-signals-segment-closed
+  "GH #54: a reader that still holds an object a rebuild closed gets
+SEGMENT-CLOSED from every read entry point, never a read of unmapped
+memory."
+  (with-si-graph (g)
+    (let ((old (%si-segment g 'embedding))
+          (q (%si-embedding 8 3.0))
+          (id (id (first (map-vertices #'identity g :collect-p t
+                                       :vertex-type 'si-doc)))))
+      (graph-db::rebuild-vector-segment g 'si-doc 'embedding)
+      (signals graph-db:segment-closed (segment-scan old q 3))
+      (signals graph-db:segment-closed (graph-db::segment-get old id))
+      (signals graph-db:segment-closed
+        (segment-score-subset old q (list id)))
+      (multiple-value-bind (hits status)
+          (vector-search g 'si-doc 'embedding q 3)
+        (is (eq :ok status))
+        (is (= 3 (length hits)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #365: RESET-VECTOR-SEGMENT, the supported way to change a dimension.
+;;; ---------------------------------------------------------------------------
+
+(test reset-vector-segment-lets-a-new-dimension-in
+  "GH #365: an emptied segment keeps its dimension, so a write of another
+length is refused; after RESET-VECTOR-SEGMENT the next write creates the
+segment at its own dimension, and that survives a reopen.  Reset while a
+node still holds a vector is refused; reset with no segment answers NIL."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          id)
+      (unwind-protect
+           (let ((*graph* g))
+             (is (null (graph-db:reset-vector-segment g 'si-doc 'embedding))
+                 "no segment yet: NIL")
+             (with-transaction ()
+               (setq id (id (make-si-doc :title "a"
+                                         :embedding (%si-embedding 4 1.0)))))
+             (signals graph-db:vector-segment-in-use
+               (graph-db:reset-vector-segment g 'si-doc 'embedding))
+             (with-transaction ()
+               (let ((c (copy (lookup-vertex id))))
+                 (setf (slot-value c 'embedding) nil)
+                 (save c)))
+             (signals graph-db::vector-dimension-violation
+               (with-transaction ()
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 1.0)))
+               "precondition: the emptied segment still refuses dimension 8")
+             (is-true (graph-db:reset-vector-segment g 'si-doc 'embedding))
+             (finishes
+               (with-transaction ()
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 1.0))))
+             (is (= 8 (graph-db::segment-dimension
+                       (%si-segment g 'embedding)))))
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 8 (graph-db::segment-dimension
+                         (%si-segment g2 'embedding)))
+                   "the new dimension survives a reopen")
+               (multiple-value-bind (hits status)
+                   (vector-search g2 'si-doc 'embedding (%si-embedding 8 1.0)
+                                  1)
+                 (is (eq :ok status))
+                 (is (= 1 (length hits)))))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))

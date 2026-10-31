@@ -183,3 +183,16 @@ signalling, so export never errors on live data. `ensure-namespace`
 shipped a `:record-p` keyword (default `T`) purely for
 `materialize-schema`'s own replay — an ordinary caller never passes
 it. The docs deliverable is Task 5, covered separately.
+
+## Built — `:record-p` on the type constructors (GH #381, 2026-09-13)
+
+`create-vertex-type` / `create-edge-type` take `:record-p` (default T)
+as `ensure-namespace` does. NIL is durable for the type within the
+image: the name is marked in `*manifest-silent-types*`, consulted at
+the single append choke point `%schema-manifest-append-if-changed`, so
+neither creation nor a later store open's `instantiate-node-type`
+re-assertion (R2) writes a TYPE row. Re-creating the type with the
+default clears the mark. Motivation: a consumer that keeps its own
+record of runtime types and never runs `materialize-schema` was left
+with type rows and no namespace rows — the orphan-package state R3
+warns about — unless it bound the internal `*record-manifest-rows*`.

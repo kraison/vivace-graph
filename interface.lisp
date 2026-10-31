@@ -4,7 +4,7 @@
 ;; before this file -- these two live here (not graph-class.lisp, alongside
 ;; the UNRESOLVED-NODE struct and STORE-DETACHED-ERROR condition they use)
 ;; because they call it (GH #169).
-(defun resolve-node-graph (id)
+(defun resolve-node-graph (id &key class-hint)
   "The open store holding ID, as (values GRAPH STATUS STORE-ID) with
 STATUS one of :RESOLVED, :DETACHED (registry knows the tag, no open
 graph carries it) or :UNKNOWN.  A v8 id indexes the open-store vector,
@@ -29,21 +29,43 @@ resolves to the WRONG graph yet reports :RESOLVED (GH #209)."
                  (values nil :detached tag))
                 (t (values nil :unknown tag))))
         (progn
-          (maphash (lambda (name graph)
-                     (declare (ignore name))
-                     (when (and (graph-open-p graph)
-                                (lookup-vertex id :graph graph))
-                       (return-from resolve-node-graph
-                         (values graph :resolved (store-id graph)))))
-                   *graphs*)
+          ;; GH #244: the edge-occupancy hint ORDERS the scan -- stores
+          ;; known to hold CLASS-HINT's edges are tried first, the rest
+          ;; still follow, so disproof coverage is unchanged (the hint
+          ;; carries no completeness marker, so it must never RESTRICT
+          ;; a scan whose miss is treated as disproof).
+          (dolist (graph (%v5-scan-candidates class-hint))
+            (when (and (graph-open-p graph)
+                       (lookup-vertex id :graph graph))
+              (return-from resolve-node-graph
+                (values graph :resolved (store-id graph)))))
           (values nil :unknown nil)))))
 
-(defun lookup-vertex-anywhere (id &key (if-detached :marker))
+(defun %v5-scan-candidates (class-hint)
+  "Every open graph, hinted stores first (GH #244): CLASS-HINT (an edge
+class name, or NIL) consults EDGE-TYPE-STORES; graphs it names come
+first, every other open graph follows.  Pure ordering -- the full set is
+always returned, so a stale or incomplete hint costs lookups, never an
+answer."
+  (let* ((hinted (when class-hint
+                   (loop for name in (edge-type-stores class-hint)
+                         for g = (lookup-graph name)
+                         when g collect g)))
+         (rest '()))
+    (maphash (lambda (name graph)
+               (declare (ignore name))
+               (unless (member graph hinted :test #'eq)
+                 (push graph rest)))
+             *graphs*)
+    (append hinted rest)))
+
+(defun lookup-vertex-anywhere (id &key (if-detached :marker) class-hint)
   "ID's vertex from whichever open store holds it; an UNRESOLVED-NODE
 marker when its store is detached (or, with :IF-DETACHED :ERROR, a
 STORE-DETACHED-ERROR -- the explicit-access half of D8); NIL when no
 store known to the system holds it (GH #169)."
-  (multiple-value-bind (graph status tag) (resolve-node-graph id)
+  (multiple-value-bind (graph status tag)
+      (resolve-node-graph id :class-hint class-hint)
     (ecase status
       (:resolved (lookup-vertex id :graph graph))
       (:detached

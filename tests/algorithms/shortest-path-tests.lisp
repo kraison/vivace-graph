@@ -74,8 +74,9 @@
       (is (= 1.0 (cdr (assoc "B" by-name :test #'string=))))
       (is (= 2.0 (cdr (assoc "C" by-name :test #'string=))))
       (is (= 3.0 (cdr (assoc "D" by-name :test #'string=))))
-      ;; sorted ascending
-      (is (equal '(0 1.0 2.0 3.0) (mapcar #'cdr cells))))))
+      ;; sorted ascending; by value, since CCL hands the weights back as
+      ;; doubles (GH #426)
+      (is (every #'= '(0 1.0 2.0 3.0) (mapcar #'cdr cells))))))
 
 (test shortest-path-edge-type-as-list
   "EDGE-TYPE accepts a single type or a list of types.  With A -ae-> B -ae2-> C,

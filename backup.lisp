@@ -135,9 +135,20 @@ RECREATE-GRAPH's :PACKAGE-NAME."
     (t object)))
 
 (defun write-backup-plist (plist stream)
-  "Print PLIST as one readable snapshot line on STREAM."
-  (let ((*print-pretty* nil))
-    (format stream "~S~%" (backup-literalize plist))))
+  "Print PLIST as one readable snapshot line on STREAM.
+
+Printed under standard syntax, not the caller's: a caller's print level or
+length wrote # and ... into the recovery file, and a non-default float format
+demoted every double on the way back in (GH #354).  Three deliberate
+deviations: the caller's *PACKAGE* (symbols print relative to it, as
+RECREATE-GRAPH's :PACKAGE-NAME expects), *PRINT-READABLY* NIL (see the header
+of transaction-restore.lisp) and *PRINT-PRETTY* NIL."
+  (let ((package *package*))
+    (with-standard-io-syntax
+      (let ((*package* package)
+            (*print-readably* nil)
+            (*print-pretty* nil))
+        (format stream "~S~%" (backup-literalize plist))))))
 
 (defmethod backup :around ((node node) location &key include-deleted-p)
   (when (or include-deleted-p (not (deleted-p node)))
@@ -359,7 +370,10 @@ recorded location is stale after the copy and OPEN-LHASH resets it
   "Migrate a pre-current (v1 or v2) graph at OLD-LOCATION to the current (v3)
 on-disk format at NEW-LOCATION, returning (values NEW-GRAPH UNIFIED) -- the
 new, open graph, and (under :RENUMBER-P T) the types whose several ids were
-unified into one.
+unified into one.  A source already in the current format is accepted
+too: that makes this a logical copy, the way to import a store into
+another system directory (pass :RENUMBER-P T so type-ids come from the
+destination's registry).
 
 Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
 version is read first, so the old graph is opened read-only with the head
