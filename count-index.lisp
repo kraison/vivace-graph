@@ -241,6 +241,9 @@ memory one -- and pass the old value so the update stays in place
            (add-to-skip-list sl key (cons all current)))
           (t (update-in-skip-list sl key (cons all current) old)))))
 
+;; Tests swap these with (SETF FDEFINITION); ECL needs NOTINLINE for the
+;; swap to reach same-file callers (GH #428, as mmap.lisp).
+(declaim (notinline %count-node %build-count-index-for-spec))
 (defun %count-node (cix node d-all d-current)
   "Apply D-ALL / D-CURRENT for NODE at every leading prefix of its
 tuple; nothing for a tuple that is not countable."

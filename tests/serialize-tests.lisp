@@ -220,7 +220,10 @@ reaching the DESERIALIZE-HELP decoder added in this task -- and SERIALIZE's
 :AROUND method wraps it into a GRAPH-DB:SERIALIZATION-ERROR.  So the codec does
 not silently corrupt non-finite data: it refuses to store it at all."
   (let ((inf #+sbcl sb-ext:single-float-positive-infinity
-             #+ecl si:single-float-positive-infinity))
+             #+ecl si:single-float-positive-infinity
+             ;; No exported single-float infinity on CCL (#437).
+             #+ccl (coerce ccl::double-float-positive-infinity
+                           'single-float)))
     (let ((v (make-array 1 :element-type 'single-float :initial-element inf)))
       (signals serialization-error (deserialized v)))))
 

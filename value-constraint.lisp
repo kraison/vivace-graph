@@ -365,7 +365,7 @@ for admin passes over a quiescent graph.
 ⚠ SPEC-COUNT counts DEF-VALUE-CONSTRAINT declarations only.  A :CHECK
 slot option (GH #172) lives on the class, not in this registry, so a
 schema constrained entirely by :CHECK is audited normally and still
-reports SPECS 0 -- do not read that as "unchecked" here.
+reports SPECS 0 -- do not read that as \"unchecked\" here.
 
 ⚠ SPEC-COUNT counts declarations registered on GRAPH, not declarations
 that apply to what was scanned -- with a spec on class B only, scanning

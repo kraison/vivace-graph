@@ -510,6 +510,127 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Shadow copies read only the data** (#434). `%copy-file-sparse` read
+  every apparent byte of a store file to find its holes, ~12 GB per
+  fresh store, at 1.8 ms/MB on SBCL and 8.5 ms/MB on CCL; the detach
+  and system-restore suites spent about 1.5 h of CCL's main lane there.
+  The copy now walks the filesystem's data extents (`SEEK_DATA` /
+  `SEEK_HOLE`, `%posix-data-extents` in posix.lisp, shared with
+  `%posix-allocated-size`) and falls back to the chunk scan where the
+  probe is unsupported. A 1 GiB sparse file with 1 MiB of data copies
+  in about 10 ms on both instead of 1.9 s and 8.7 s.
+
+- **`%posix-allocated-size` returns a size** (#438). `SEEK_DATA` past the
+  last extent is ENXIO, which the walk mistook for a filesystem without
+  the probe and answered NIL, so the GUI's store size fell back to the
+  apparent size (gigabytes for a fresh store). ENXIO now ends the walk;
+  only EINVAL answers NIL. Its test asserted nothing on NIL; on Linux
+  it now requires a number, and checks a dense and an empty file.
+
+- **tests: three CCL arms** (#437). The infinity literal, redefining
+  `truename` under CCL's kernel guard, and the sparse-file real-usage
+  helper (now the engine's `%posix-allocated-size` outside SBCL/ECL).
+
+- **Sidecar reader counts a torn tail once on CCL** (#436). It noted the
+  position before `read`, but CCL's `read` leaves the newline after a
+  form where SBCL's eats it, so the recovery's `read-line` consumed an
+  empty line and the torn record was counted and warned twice. The
+  position is now taken after skipping whitespace.
+
+- **`check-value-constraints` no longer carries a stray `UNCHECKED`
+  reference** (#435). Unescaped quotes in its docstring ended it early
+  and left the word as a bare symbol in the body; SBCL and ECL dropped
+  the unused read, CCL signalled `UNBOUND-VARIABLE` on every audit.
+
+- **tests(detach): the two drain tests no longer join their worker
+  twice** (#433). CCL's `join-process` blocks forever on a second join
+  of a finished thread (the termination semaphore is consumed by the
+  first), so the CCL main lane hung after the four passing checks of
+  `detach-drains-in-flight-readers-first`. The cleanup join is now
+  guarded by `thread-alive-p`, as every engine caller already is.
+
+- **The #387 string-bound paging test compares its solutions sorted**:
+  they arrive in type-index order, which is hash order, and CCL's changed
+  with the fixnum-wide fold (#424).
+
+- **CCL: a timed `with-lock` waits instead of signalling** (#432).
+  `do-grab-lock-with-timeout` passed `(list lock)` where
+  `process-wait-with-timeout` takes the predicate's arguments as
+  `&rest`, so `try-lock` got a list and every timed wait, the peer
+  writer's `receive-message` first, died with a type error. The first
+  full CCL main lane (#118) reached it.
+
+- **GUI roster on CCL: open answers 409 for a dirty store and 404
+  location-missing for a vanished one** (#315) instead of
+  no-recorded-location for both. CCL file streams are private to the
+  thread that opened them; `journal-records` flushes the system clock's
+  journal from the request thread, the flush signalled, the roster read
+  swallowed it and saw no attach records. The journal is opened with
+  `:sharing :lock` on CCL, as the replication log already was.
+
+- **CCL: a writer no longer starves behind back-to-back readers**
+  (#118). CCL's native `make-read-write-lock` admits new readers while a
+  writer waits, so three segment scanners re-entering the read side kept
+  `segment-put` out indefinitely and the main suite never terminated
+  there (3.0.0 through 4.0.1). The CCL shim in `utilities.lisp` now
+  counts queued writers and gates new readers while one waits, the FIFO
+  `rw-lock.lisp` gives the other implementations; a thread already
+  holding the lock on either side is not gated. `acquire-write-lock`
+  still ignores `:wait-p` on CCL, as before.
+
+- **A float literal with an absurd exponent is refused on the raw query
+  text** (#315): SBCL's reader signals on `1e999999` and ECL reads
+  infinity, both already refused, but CCL clamps it to the largest float
+  and the non-finite screen cannot tell it from a real one, so the GUI
+  answered 200. `%screen-exponent-text` runs after the character screen
+  and refuses an exponent past 400 outside strings, names and comments,
+  with the same "could not be read" message everywhere.
+
+- **The skip-list node cache's get-or-install is atomic on CCL and
+  LispWorks too** (#425, #406): `with-sl-cache-lock` was a mutex on ECL
+  and a no-op elsewhere, and a CCL `:shared` table only serializes single
+  operations, so two threads missing at once still built two objects for
+  one node (6 of 300 rounds in the #406 test on CCL). The mutex now
+  guards every implementation whose table cannot lock itself.
+
+- **The algorithms distance test compares by value** (#426): CCL hands
+  the weights back as doubles, and `equal` on a double and a single is
+  false.
+
+- **A `reaped-claim` answers NIL to `claim-current-p` and
+  `claim-transaction-extent`** (#429) instead of a no-applicable-method
+  error, so a caller that skips the `reaped-claim-p` guard gets the
+  documented unknown. The #324 as-of test and the two #391 feed-cursor
+  tests take their stamps from `%st-now`, the engine's monotonic clock:
+  on a whole-second clock (ECL, #308) `local-time:now` sits at or before
+  the stamps the engine moved past it by nanoseconds.
+
+- **`%desired` is declaimed `notinline`** (#430, #428): the rules scope
+  test's transaction probe swaps it, and ECL compiled its same-file
+  callers past the swap (three ECL failures in
+  `the-scope-decides-where-the-body-is-evaluated`).
+
+- **The count-index build and per-node probes fire on ECL** (#428):
+  `%count-node` and `%build-count-index-for-spec` are declaimed
+  `notinline`, so a test's FDEFINITION swap reaches their same-file
+  callers, as `mmap.lisp` already does. Four ECL failures, the counters
+  themselves were right.
+
+- **`rebuild-vector-segment` replaces the live segment file with
+  rename(2)** (#427). It used `cl:rename-file` over an existing target,
+  which ECL and CCL refuse (nine ECL segment tests; the trap #313 fixed in
+  the system clock). Now `%posix-rename`, as there.
+
+- **The in-memory id fold is as wide as a fixnum on the running
+  implementation** (#424, #425, #373). `%fixnum-hash-bytes` masked to 62
+  bits, SBCL's fixnum width; CCL's is 60 and ECL's 61, so on both the fold
+  returned bignums for most ids, and a CCL custom-hash table misses a key
+  whose code is a bignum. The node cache and the transaction's tables
+  missed, a retried transaction read a superseded version (#424), and the
+  skip list installed two objects for one node (#425). The mask is now
+  `(integer-length most-positive-fixnum)` bits; SBCL's values and its
+  consing-free arithmetic are unchanged.
+
 - **Claim namespaces carry a canonical `:check`** (#327).
   `canonical-namespace-p`, exported beside the relation and producer
   predicates, admits a keyword whose name is uppercase `[A-Z0-9-]+`,

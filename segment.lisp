@@ -744,7 +744,9 @@ traffic -- at open, before writes, like rebuild-spatial-indexes."
                      (segment-put fresh (id node) v)))))
              graph owner-name)
             (close-vector-segment fresh)
-            (rename-file tmp path)
+            ;; rename(2), not CL:RENAME-FILE: the target exists, and ECL
+            ;; and CCL refuse to replace it (GH #427, as #313).
+            (%posix-rename tmp path)
             (let ((seg (open-vector-segment path)))
               (setf (gethash key table) seg)
               (when old (close-vector-segment old))

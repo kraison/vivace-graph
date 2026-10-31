@@ -314,6 +314,9 @@ run writes does not depend on hash order."
             (setf (cdr seen)
                   (%merge-store-name (cdr seen) (cdr r))))))))
 
+;; Tests swap %DESIRED with (SETF FDEFINITION); ECL needs NOTINLINE for
+;; the swap to reach same-file callers (GH #428, #430).
+(declaim (notinline %desired))
 (defun %desired (compiled graph report
                 &optional (goals (compiled-rule-goals compiled)))
   "The derivation GOALS asks for -- COMPILED's body by default, or a

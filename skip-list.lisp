@@ -8,9 +8,13 @@
 ;;; adding :synchronized to the table too would just double-lock the hottest
 ;;; read path in the engine.  Guard the ECL node-cache with its own lock; a
 ;;; no-op everywhere else.
+;; The cache's get-or-install must be atomic (GH #406): SBCL locks the
+;; table itself; the others take this mutex.  A CCL :SHARED table only
+;; serializes single operations (GH #425).
 (defmacro with-sl-cache-lock ((skip-list) &body body)
-  #+ecl `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
-  #-ecl `(progn ,@body))
+  #+(or ecl lispworks) `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
+  #+ccl `(ccl:with-lock-grabbed ((%sl-cache-lock ,skip-list)) ,@body)
+  #-(or ecl lispworks ccl) `(progn ,@body))
 
 ;;; On the lock-free implementations, MUTATORS coordinate through a striped
 ;;; per-node lock vector (%SL-LOCKS).  The one rule: a mutator that needs
@@ -282,7 +286,7 @@ garbage), but is cleared here too so both caches are dropped in one place."
   "Cache NODE for ADDR unless another thread cached one first; return the
 cached node.  Two objects for one address go stale apart: a splice updates
 one's pointers and a writer walking the other retries forever (GH #406).
-Atomic on SBCL; CCL and LispWorks keep a narrow get-then-set window."
+Atomic everywhere: the table lock on SBCL, the cache mutex elsewhere."
   (let ((table (%sl-node-cache skip-list)))
     (with-sl-cache-lock (skip-list)
       #+sbcl (sb-ext:with-locked-hash-table (table)
@@ -371,7 +375,8 @@ Atomic on SBCL; CCL and LispWorks keep a narrow get-then-set window."
   ;; Explicit lock retained instead of :synchronized on NODE-CACHE itself: it
   ;; also covers ECLs predating that option, and :synchronized would be
   ;; redundant given this lock (GH #101).  See WITH-SL-CACHE-LOCK.
-  #+ecl (cache-lock (mp:make-lock))
+  #+(or ecl lispworks) (cache-lock (mp:make-lock))
+  #+ccl (cache-lock (ccl:make-lock))
   ;; ECL-only: a per-skip-list reader/writer lock (see WITH-SL-READ-LOCK /
   ;; WITH-SL-WRITE-LOCK).  Shared among concurrent readers, exclusive for writers.
   #+ecl (lock (make-rw-lock))

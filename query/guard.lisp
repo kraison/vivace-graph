@@ -206,6 +206,48 @@ between concurrent requests."
         when pkg return pkg
           finally (error "Cannot create a GUI Prolog scratch package.")))
 
+(defun %absurd-exponent-p (token)
+  "True when TOKEN spells a float whose exponent is past 400: beyond any
+float here, and the point where CCL's reader stops signalling and clamps
+instead (GH #315)."
+  (let* ((n (length token))
+         (m (position-if (lambda (c) (find c "esfdlESFDL")) token)))
+    (when (and m (plusp m) (< (1+ m) n))
+      (let* ((mantissa (subseq token 0 m))
+             (start (if (find (char token (1+ m)) "+-") (+ m 2) (1+ m))))
+        (and (some #'digit-char-p mantissa)
+             (every (lambda (c) (or (digit-char-p c) (find c "+-.")))
+                    mantissa)
+             (< start n)
+             (every #'digit-char-p (subseq token start))
+             (> (parse-integer token :start start) 400))))))
+
+(defun %screen-exponent-text (text)
+  "Refuse a float literal no reader can carry, on the raw characters.
+SBCL signals on 1e999999 and ECL reads infinity, both refused later; CCL
+clamps it to the largest float, a finite number the non-finite screen
+cannot tell from a real one (GH #315).  Strings, |...| names and
+comments are skipped, as %SCAN-QUERY-TEXT skips them."
+  (let ((i 0) (n (length text)))
+    (flet ((delimiter-p (ch)
+             (or (member ch '(#\Space #\Tab #\Newline #\Return #\Page))
+                 (find ch "()\"|;"))))
+      (loop while (< i n) do
+        (let ((ch (char text i)))
+          (cond
+            ((char= ch #\") (setq i (%skip-delimited text (1+ i) #\" "string")))
+            ((char= ch #\|)
+             (setq i (%skip-delimited text (1+ i) #\| "|...| name")))
+            ((char= ch #\;)
+             (setq i (or (position #\Newline text :start i) n)))
+            ((delimiter-p ch) (incf i))
+            (t
+             (let ((end (or (position-if #'delimiter-p text :start i) n)))
+               (when (%absurd-exponent-p (subseq text i end))
+                 (%refuse "the query could not be read: check the ~
+quoting and the numeric literals"))
+               (setq i end)))))))))
+
 (defun %read-query-forms (text package)
   "TEXT read into PACKAGE as a list of forms.  *READ-EVAL* NIL, the
 restricted readtable, standard IO syntax otherwise.  A string stream
@@ -570,6 +612,7 @@ once READ has resolved a package-qualified name the interning it was
 meant to prevent has already happened.  Every way READ can fail is a
 refusal, so a malformed query is a 400 and never a 500."
   (%scan-query-text text)
+  (%screen-exponent-text text)
   (let ((forms (handler-case (%read-query-forms text scratch)
                  (prolog-guard-error (c) (error c))
                  (end-of-file ()
