@@ -793,9 +793,10 @@ ECL: direct C stat, same idiom as tests/posix-tests.lisp' %STAT-MODE
   (* 512 (ffi:c-inline ((namestring path)) (:cstring) :long
                        "{ struct stat sb; stat(#0,&sb);
                           @(return)=(long)sb.st_blocks; }"))
+  ;; Elsewhere, the engine's own extent walk (#274), CCL included (#437).
   #-(or sbcl ecl)
-  (error "%FILE-REAL-BYTES (sparse-file real-usage check) is SBCL/ECL-only; ~
-no portable ST_BLOCKS accessor is wired up for this implementation."))
+  (or (graph-db::%posix-allocated-size (namestring path))
+      (error "%POSIX-ALLOCATED-SIZE failed for ~A" path)))
 
 (defun %directory-usage (dir)
   "(values APPARENT-SIZES REAL-BYTES) for every regular file under DIR:

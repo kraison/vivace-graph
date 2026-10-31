@@ -510,6 +510,10 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **tests: three CCL arms** (#437). The infinity literal, redefining
+  `truename` under CCL's kernel guard, and the sparse-file real-usage
+  helper (now the engine's `%posix-allocated-size` outside SBCL/ECL).
+
 - **Sidecar reader counts a torn tail once on CCL** (#436). It noted the
   position before `read`, but CCL's `read` leaves the newline after a
   form where SBCL's eats it, so the recovery's `read-line` consumed an
