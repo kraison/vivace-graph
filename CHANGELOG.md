@@ -510,6 +510,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The count-index build and per-node probes fire on ECL** (#428):
+  `%count-node` and `%build-count-index-for-spec` are declaimed
+  `notinline`, so a test's FDEFINITION swap reaches their same-file
+  callers, as `mmap.lisp` already does. Four ECL failures, the counters
+  themselves were right.
+
 - **`rebuild-vector-segment` replaces the live segment file with
   rename(2)** (#427). It used `cl:rename-file` over an existing target,
   which ECL and CCL refuse (nine ECL segment tests; the trap #313 fixed in
