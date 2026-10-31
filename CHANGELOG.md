@@ -510,6 +510,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **tests(spacetime): the retraction test takes its as-of reference
+  from the engine's monotonic stamp** (#447). `local-time:now` is a
+  whole second on ECL, so the claim could be stamped a nanosecond
+  after `then` and the as-of read answered nothing; seen on ECL arm64.
+
 - **GUI: the read-only rail drains the request body before answering**
   (#446). An answer from the dispatcher left the body unread, so the
   close was a TCP reset; a macOS client then saw the reset in place of

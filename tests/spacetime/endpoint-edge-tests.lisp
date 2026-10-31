@@ -244,8 +244,9 @@ nothing commits."
     (let (s c then)
       (with-transaction () (setq s (ee-thing "t-1")) (ee-thing "t-2"))
       (with-transaction () (setq c (ee-b)))
-      (setq then (local-time:now))
-      (sleep 0.01)
+      ;; %ST-NOW, not LOCAL-TIME:NOW: on ECL the latter is a whole
+      ;; second and can fall before the claim's stamp (GH #447).
+      (setq then (graph-db.spacetime::%st-now))
       (retract-claim c)
       (is (= 1 (length (node-claims s))))
       (is (= 1 (length (node-claims s :as-of then :current t))))
