@@ -510,6 +510,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`rebuild-vector-segment` replaces the live segment file with
+  rename(2)** (#427). It used `cl:rename-file` over an existing target,
+  which ECL and CCL refuse (nine ECL segment tests; the trap #313 fixed in
+  the system clock). Now `%posix-rename`, as there.
+
 - **The in-memory id fold is as wide as a fixnum on the running
   implementation** (#424, #425, #373). `%fixnum-hash-bytes` masked to 62
   bits, SBCL's fixnum width; CCL's is 60 and ECL's 61, so on both the fold
