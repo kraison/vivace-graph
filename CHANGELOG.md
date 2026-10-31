@@ -510,6 +510,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`%desired` is declaimed `notinline`** (#430, #428): the rules scope
+  test's transaction probe swaps it, and ECL compiled its same-file
+  callers past the swap (three ECL failures in
+  `the-scope-decides-where-the-body-is-evaluated`).
+
 - **The count-index build and per-node probes fire on ECL** (#428):
   `%count-node` and `%build-count-index-for-spec` are declaimed
   `notinline`, so a test's FDEFINITION swap reaches their same-file
