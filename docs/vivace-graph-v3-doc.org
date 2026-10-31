@@ -4972,12 +4972,16 @@ carrying both conditions.
 The copy is sparse-preserving because a fresh store already reserves
 several gigabytes of mostly-zero mmap regions — a byte-for-byte copy
 would materialize every one of those unwritten reservations. The
-copier walks each file in fixed-size chunks and re-creates only the
-holes: an all-zero chunk is skipped via a bare seek on the (already
-zero) destination file rather than written, so an empty multi-gigabyte
-store copies in seconds. This is why "copies in seconds against a load
-measured in tens of minutes" (spec §8) holds in practice, not just in
-principle.
+copier asks the filesystem where the data is (~lseek~ with
+~SEEK_DATA~/~SEEK_HOLE~, ~%posix-data-extents~ in =posix.lisp=) and
+reads and writes only those runs, so the cost is the data, not the
+apparent size; an all-zero chunk inside a run is still skipped via a
+bare seek on the (already zero) destination rather than written, and
+the last byte is pinned so the copy has the source's exact length.
+Where a filesystem has no ~SEEK_DATA~ the whole file is one run and
+the chunk scan alone keeps the copy sparse (GH #170, #434). This is
+why "copies in seconds against a load measured in tens of minutes"
+(spec §8) holds in practice, not just in principle.
 
 **Loading: ~open-shadow-graph~.** Opens the shadow directory as a
 graph under the *live* store's own name — so its schema metadata

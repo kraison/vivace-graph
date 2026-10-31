@@ -90,6 +90,16 @@ everything."
   "A unique, not-yet-created scratch file pathname (PREFIX-<tag>.TYPE)."
   (graph-db-test-scratch:make-scratch-file-name prefix type))
 
+(defun %truncate-file (path length)
+  "ftruncate(2) PATH to LENGTH: extends with a hole that owns no block
+(#434; posix-tests and detach-tests use it)."
+  (let ((fd (graph-db::%posix-open path graph-db::+o-rdwr+)))
+    (unwind-protect
+         (unless (zerop (cffi:foreign-funcall "ftruncate" :int fd
+                                              :long length :int))
+           (error "ftruncate failed for ~A" path))
+      (graph-db::%posix-close fd))))
+
 (defmacro with-temp-directory ((var) &body body)
   "Bind VAR to a fresh scratch directory, run BODY, then delete the tree."
   `(let ((,var (make-temp-directory)))

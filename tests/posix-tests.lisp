@@ -119,6 +119,70 @@ matter."
                  (graph-db::%posix-close b))))
         (when a (graph-db::%posix-close a))))))
 
+(test data-extents-walk-the-file
+  "#434: %POSIX-DATA-EXTENTS lists (START . END) data runs and the file
+length; an empty file has none, a dense page is one run, data at both
+ends of a hole is two.  The second value is NIL only where SEEK_DATA is
+unsupported, never on Linux."
+  (let ((path (namestring
+               (graph-db-test-scratch:make-scratch-file-name
+                "extents" "dat")))
+        (page (make-array 4096 :element-type '(unsigned-byte 8)
+                               :initial-element 9))
+        (mib (* 1024 1024)))
+    (flet ((extents ()
+             (multiple-value-bind (extents length supported)
+                 (graph-db::%posix-data-extents path)
+               #+graph-db-posix-linux
+               (is-true supported "SEEK_DATA unsupported?")
+               (values (and supported extents) length supported))))
+      (unwind-protect
+           (progn
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-does-not-exist :create))
+             (multiple-value-bind (extents length) (extents)
+               (is (null extents) "empty file: ~S" extents)
+               (is (eql 0 length)))
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+               (write-sequence page s))
+             (multiple-value-bind (extents length supported) (extents)
+               (when supported
+                 (is (equal '((0 . 4096)) extents) "dense: ~S" extents))
+               (is (eql 4096 length)))
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+               (write-sequence page s)
+               (file-position s (* 64 mib))
+               (write-sequence page s)
+               ;; A zero byte at the end allocates a block, as the
+               ;; engine's %POSIX-EXTEND-FILE-BACKING does: a third run.
+               (file-position s (1- (* 80 mib)))
+               (write-byte 0 s))
+             (multiple-value-bind (extents length supported) (extents)
+               (is (eql (* 80 mib) length))
+               (when supported
+                 (is (= 3 (length extents)) "three runs: ~S" extents)
+                 (is (equal '(0 . 4096) (first extents)))
+                 (is (and (<= (car (second extents)) (* 64 mib))
+                          (<= (+ (* 64 mib) 4096) (cdr (second extents))))
+                     "second run should cover the page at 64 MiB: ~S"
+                     (second extents))
+                 (is (< (cdr (second extents)) (* 65 mib))
+                     "the hole after it is not data: ~S" extents)
+                 (is (eql (* 80 mib) (cdr (third extents))))))
+             ;; ftruncate makes a hole with no block behind it.
+             (%truncate-file path (* 96 mib))
+             (multiple-value-bind (extents length supported) (extents)
+               (is (eql (* 96 mib) length))
+               (when supported
+                 (is (= 3 (length extents)) "a trailing hole adds no run")
+                 (is (eql (* 80 mib) (cdr (third extents)))))))
+        (ignore-errors (delete-file path))))))
+
 (test allocated-size-sees-through-sparse-files
   "GH #274: a sparse file's allocated size tracks its data extents, not
 its apparent length; a dense file reports its length, an empty file 0.

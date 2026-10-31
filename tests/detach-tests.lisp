@@ -817,6 +817,49 @@ FILE-LENGTH); REAL-BYTES is the sum of %FILE-REAL-BYTES over every file
          (incf real (%file-real-bytes file)))))
     (values sizes real)))
 
+(test copy-file-sparse-copies-the-extents-and-pins-the-length
+  "#434: %COPY-FILE-SPARSE reproduces a file with three data runs around
+holes -- a page at 0, an allocated all-zero block at 32 MiB (what the
+engine's file extension leaves), pages at 64 and 80 MiB -- and a
+trailing hole from ftruncate: same length, same bytes at every offset
+probed, while the copy stays sparse.  The last run is nonzero data on
+purpose: a copy that drops it must fail here, not read back as zeros."
+  (with-temp-directory (dir)
+    (let* ((src (merge-pathnames "src.dat" dir))
+           (dst (merge-pathnames "dst.dat" dir))
+           (mib (* 1024 1024))
+           (page (make-array 4096 :element-type '(unsigned-byte 8)
+                                  :initial-element 11))
+           (length (* 96 mib)))
+      (with-open-file (s src :direction :output
+                             :element-type '(unsigned-byte 8))
+        (write-sequence page s)
+        (file-position s (1- (* 32 mib)))
+        (write-byte 0 s)
+        (file-position s (* 64 mib))
+        (write-sequence page s)
+        (file-position s (- (* 80 mib) 4096))
+        (write-sequence page s))
+      (%truncate-file src length)
+      (graph-db::%copy-file-sparse src dst)
+      (is (eql length (with-open-file (s dst :element-type
+                                             '(unsigned-byte 8))
+                        (file-length s))))
+      (flet ((bytes-at (file offset n)
+               (with-open-file (s file :element-type '(unsigned-byte 8))
+                 (file-position s offset)
+                 (let ((buf (make-array n :element-type '(unsigned-byte 8))))
+                   (read-sequence buf s)
+                   buf))))
+        (dolist (offset (list 0 4000 4096 (* 32 mib) (- (* 64 mib) 100)
+                              (- (* 32 mib) 4096) (* 64 mib)
+                              (+ (* 64 mib) 4000) (- (* 80 mib) 4096)
+                              (- length 4096)))
+          (is (equalp (bytes-at src offset 4096) (bytes-at dst offset 4096))
+              "bytes differ at offset ~D" offset)))
+      (let ((real (%file-real-bytes dst)))
+        (is (< real mib) "copy should stay sparse: ~D real bytes" real)))))
+
 (test shadow-store-copy-preserves-sparseness
   "%COPY-DIRECTORY-TREE must not materialize a fresh store's reserved
 mmap holes: a near-empty store's shadow should use a SMALL FRACTION of

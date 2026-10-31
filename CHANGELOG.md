@@ -510,6 +510,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Shadow copies read only the data** (#434). `%copy-file-sparse` read
+  every apparent byte of a store file to find its holes, ~12 GB per
+  fresh store, at 1.8 ms/MB on SBCL and 8.5 ms/MB on CCL; the detach
+  and system-restore suites spent about 1.5 h of CCL's main lane there.
+  The copy now walks the filesystem's data extents (`SEEK_DATA` /
+  `SEEK_HOLE`, `%posix-data-extents` in posix.lisp, shared with
+  `%posix-allocated-size`) and falls back to the chunk scan where the
+  probe is unsupported. A 1 GiB sparse file with 1 MiB of data copies
+  in about 10 ms on both instead of 1.9 s and 8.7 s.
+
 - **`%posix-allocated-size` returns a size** (#438). `SEEK_DATA` past the
   last extent is ENXIO, which the walk mistook for a filesystem without
   the probe and answered NIL, so the GUI's store size fell back to the
