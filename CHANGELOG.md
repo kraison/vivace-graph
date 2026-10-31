@@ -510,6 +510,10 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The algorithms distance test compares by value** (#426): CCL hands
+  the weights back as doubles, and `equal` on a double and a single is
+  false.
+
 - **A `reaped-claim` answers NIL to `claim-current-p` and
   `claim-transaction-extent`** (#429) instead of a no-applicable-method
   error, so a caller that skips the `reaped-claim-p` guard gets the
