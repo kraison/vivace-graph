@@ -135,6 +135,19 @@ because this answers from the dispatcher, before ningle (GH #386)."
                        (cons :message "This GUI is read-only; only ~
 reads are served")))))))
 
+(defun %drain-request-body (env)
+  "Read and drop ENV's request body.  An answer from the dispatcher
+leaves it unread: clack hands it to the app as a stream, which
+hunchentoot's own drain before the headers skips, and a close with
+unread bytes is a TCP reset that a macOS client sees in place of the
+reply (GH #446).  Bounded by the length the 413 rail already checked."
+  (let ((in (getf env :raw-body))
+        (length (getf env :content-length)))
+    (when (and in (integerp length) (plusp length))
+      (let ((buffer (make-array (min length 4096)
+                                :element-type '(unsigned-byte 8))))
+        (loop while (plusp (read-sequence buffer in)))))))
+
 (defparameter *read-only-post-routes* '("query" "prolog")
   "The /api/graphs/:name/<verb> POST routes a read-only GUI still
 serves: JSON-bodied reads that never write (GH #278, #279).")
@@ -195,6 +208,7 @@ outcome that is already safe."
       ((and *read-only*
             (not (member (getf env :request-method) '(:get :head)))
             (not (%read-route-p path)))
+       (%drain-request-body env)
        (%read-only-response))
       ((and (member (getf env :request-method) '(:get :head))
             (not (eql 0 (search "/api/" path))))

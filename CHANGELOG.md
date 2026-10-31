@@ -510,6 +510,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **GUI: the read-only rail drains the request body before answering**
+  (#446). An answer from the dispatcher left the body unread, so the
+  close was a TCP reset; a macOS client then saw the reset in place of
+  the 403, and `read-only-is-a-dispatch-rail` was flaky on arm64. Linux
+  delivers the queued reply before the error and never showed it.
+
 - **Shadow copies read only the data** (#434). `%copy-file-sparse` read
   every apparent byte of a store file to find its holes, ~12 GB per
   fresh store, at 1.8 ms/MB on SBCL and 8.5 ms/MB on CCL; the detach
