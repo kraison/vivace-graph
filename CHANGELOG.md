@@ -518,7 +518,9 @@ between releases; cutting a release renames it to the new version and dates it.
   `SEEK_HOLE`, `%posix-data-extents` in posix.lisp, shared with
   `%posix-allocated-size`) and falls back to the chunk scan where the
   probe is unsupported. A 1 GiB sparse file with 1 MiB of data copies
-  in about 10 ms on both instead of 1.9 s and 8.7 s.
+  in about 10 ms on both instead of 1.9 s and 8.7 s. Its tests assert
+  what every filesystem agrees on, not ext4's run layout: APFS reports
+  16 KiB runs and allocates small gaps (#442).
 
 - **`%posix-allocated-size` returns a size** (#438). `SEEK_DATA` past the
   last extent is ENXIO, which the walk mistook for a filesystem without

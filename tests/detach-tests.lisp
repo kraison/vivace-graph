@@ -857,8 +857,13 @@ purpose: a copy that drops it must fail here, not read back as zeros."
                               (- length 4096)))
           (is (equalp (bytes-at src offset 4096) (bytes-at dst offset 4096))
               "bytes differ at offset ~D" offset)))
+      ;; ext4 allocates only the written blocks; APFS allocated a 16 MiB
+      ;; gap between the upper pages (thoth, 2026-10-31), so the bound
+      ;; there is the half the source could never reach when copied dense.
       (let ((real (%file-real-bytes dst)))
-        (is (< real mib) "copy should stay sparse: ~D real bytes" real)))))
+        (is (< real #+graph-db-posix-linux mib #-graph-db-posix-linux
+                    (floor length 2))
+            "copy should stay sparse: ~D real bytes" real)))))
 
 (test shadow-store-copy-preserves-sparseness
   "%COPY-DIRECTORY-TREE must not materialize a fresh store's reserved
