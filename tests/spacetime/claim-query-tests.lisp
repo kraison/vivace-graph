@@ -263,8 +263,16 @@ transaction still answers from committed versions, so an uncommitted
 retraction does not rewrite history the transaction may yet abandon."
   (with-claim-graph (g)
     (with-transaction () (make-b :object "old"))
-    (let ((then (local-time:now)))
-      (sleep 0.01)
+    ;; THEN strictly after the commit: on a whole-second clock (ECL,
+    ;; GH #308) NOW can still equal the claim's recorded instant, and an
+    ;; :AS-OF at that instant finds no version (GH #429).
+    (let* ((recorded (claim-recorded-at
+                      (first (claims-touching g 'ct-claim :ns "s1"
+                                              :role :subject))))
+           (then (loop for now = (local-time:now)
+                       until (local-time:timestamp> now recorded)
+                       do (sleep 0.01)
+                       finally (return now))))
       (with-transaction ()
         (retract-claim (first (claims-touching g 'ct-claim :ns "s1"
                                                :role :subject)))

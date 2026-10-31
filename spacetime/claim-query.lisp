@@ -484,9 +484,11 @@ validation placement, not because this SETF would fail to persist."
 
 (defun claim-transaction-extent (claim)
   "CLAIM's transaction-time TEMPORAL-EXTENT, decoded, or NIL when the claim
-predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
-  (let ((s (claim-transaction-extent-sexp claim)))
-    (when s (sexp->extent s))))
+predates the axis (GH #148) or is a REAPED-CLAIM, whose versions are gone
+(GH #429).  NIL is INDETERMINATE, never the epoch."
+  (unless (reaped-claim-p claim)
+    (let ((s (claim-transaction-extent-sexp claim)))
+      (when s (sexp->extent s)))))
 
 (defun (setf claim-transaction-extent) (extent claim)
   "Store EXTENT as CLAIM's transaction extent, once.  Signals
@@ -518,9 +520,11 @@ TIMESTAMP without checking (GH #148)."
 (defun claim-current-p (claim)
   "True while CLAIM is still believed: its transaction period is open, or
 absent -- a claim predating the axis was never retracted.  NIL once
-RETRACT-CLAIM has closed the period (GH #162)."
-  (let ((e (claim-transaction-extent claim)))
-    (or (null e) (bound-unknown-p (extent-end e)))))
+RETRACT-CLAIM has closed the period (GH #162), and NIL for a REAPED-CLAIM:
+nothing is known of it but its id (GH #429)."
+  (and (not (reaped-claim-p claim))
+       (let ((e (claim-transaction-extent claim)))
+         (or (null e) (bound-unknown-p (extent-end e))))))
 
 (defun retract-claim (claim &key (at (%st-now)))
   "Close CLAIM's transaction period at AT: it was believed until now and no

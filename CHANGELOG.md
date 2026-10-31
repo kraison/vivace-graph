@@ -510,6 +510,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A `reaped-claim` answers NIL to `claim-current-p` and
+  `claim-transaction-extent`** (#429) instead of a no-applicable-method
+  error, so a caller that skips the `reaped-claim-p` guard gets the
+  documented unknown. The #324 as-of test takes its stamp strictly after
+  the commit, which on a whole-second clock (ECL, #308) is the next
+  second.
+
 - **`%desired` is declaimed `notinline`** (#430, #428): the rules scope
   test's transaction probe swaps it, and ECL compiled its same-file
   callers past the swap (three ECL failures in
