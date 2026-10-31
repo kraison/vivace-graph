@@ -510,6 +510,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`%posix-allocated-size` returns a size** (#438). `SEEK_DATA` past the
+  last extent is ENXIO, which the walk mistook for a filesystem without
+  the probe and answered NIL, so the GUI's store size fell back to the
+  apparent size (gigabytes for a fresh store). ENXIO now ends the walk;
+  only EINVAL answers NIL. Its test asserted nothing on NIL; on Linux
+  it now requires a number, and checks a dense and an empty file.
+
 - **tests: three CCL arms** (#437). The infinity literal, redefining
   `truename` under CCL's kernel guard, and the sparse-file real-usage
   helper (now the engine's `%posix-allocated-size` outside SBCL/ECL).

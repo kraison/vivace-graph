@@ -121,26 +121,42 @@ matter."
 
 (test allocated-size-sees-through-sparse-files
   "GH #274: a sparse file's allocated size tracks its data extents, not
-its apparent length; a dense file reports (about) its length."
+its apparent length; a dense file reports its length, an empty file 0.
+NIL means a filesystem without SEEK_DATA, which no Linux filesystem in
+use here is -- there it is a failure, not a skip (#438)."
   (let ((path (namestring
                (graph-db-test-scratch:make-scratch-file-name
-                "sparse" "dat"))))
-    (unwind-protect
-         (progn
-           (with-open-file (s path :direction :output
-                                   :element-type '(unsigned-byte 8)
-                                   :if-does-not-exist :create)
-             ;; 64 MiB apparent, one page of data at the end.
-             (file-position s (* 64 1024 1024))
-             (write-sequence (make-array 4096 :element-type
-                                              '(unsigned-byte 8)
-                                              :initial-element 7)
-                             s))
-           (let ((alloc (graph-db::%posix-allocated-size path)))
-             ;; NIL = filesystem without SEEK_DATA; nothing to assert.
-             (when alloc
-               (is (< alloc (* 8 1024 1024))
-                   "allocated ~D should be far below the 64MiB apparent"
-                   alloc)
-               (is (plusp alloc)))))
-      (ignore-errors (delete-file path)))))
+                "sparse" "dat")))
+        (page (make-array 4096 :element-type '(unsigned-byte 8)
+                               :initial-element 7)))
+    (flet ((allocated ()
+             (let ((alloc (graph-db::%posix-allocated-size path)))
+               #+graph-db-posix-linux
+               (is-true alloc "the SEEK_DATA walk answered NIL")
+               alloc)))
+      (unwind-protect
+           (progn
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-does-not-exist :create))
+             (let ((alloc (allocated)))
+               (when alloc (is (eql 0 alloc) "empty file: ~D" alloc)))
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+               (write-sequence page s))
+             (let ((alloc (allocated)))
+               (when alloc (is (eql 4096 alloc) "dense page: ~D" alloc)))
+             (with-open-file (s path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+               ;; 64 MiB apparent, one page of data at the end.
+               (file-position s (* 64 1024 1024))
+               (write-sequence page s))
+             (let ((alloc (allocated)))
+               (when alloc
+                 (is (< alloc (* 8 1024 1024))
+                     "allocated ~D should be far below the 64MiB apparent"
+                     alloc)
+                 (is (plusp alloc)))))
+        (ignore-errors (delete-file path))))))

@@ -240,11 +240,25 @@ Linux/x86-64 is 4 KiB, and this file is compiled on one host per target."
 (defconstant +seek-data+ #+graph-db-posix-linux 3 #-graph-db-posix-linux 4)
 (defconstant +seek-hole+ #+graph-db-posix-linux 4 #-graph-db-posix-linux 3)
 
+(defconstant +enxio+ 6)                 ; Linux and Darwin agree
+
+(defun %posix-seek-data (fd pos)
+  "lseek(FD, POS, SEEK_DATA): the next data offset at or after POS, :END
+when there is none (ENXIO: at or past EOF, or inside a trailing hole),
+NIL when the filesystem has no SEEK_DATA (#438)."
+  (let* ((r (cffi:foreign-funcall "lseek" :int fd :long pos :int +seek-data+
+                                  :long))
+         (e (when (minusp r) (%errno))))
+    (cond ((not (minusp r)) r)
+          ((eql e +enxio+) :end)
+          (t nil))))
+
 (defun %posix-allocated-size (path)
   "Bytes PATH actually occupies -- the sum of its data extents, hopping
 SEEK_DATA/SEEK_HOLE -- or NIL where the filesystem does not support the
 probe (caller falls back to the apparent size).  Sparse mmap stores
-report GiB of apparent size for MiB of data (GH #274)."
+report GiB of apparent size for MiB of data (GH #274).  SEEK_DATA past
+the last extent is ENXIO, the end of the walk, not a failure (#438)."
   (let ((fd (%posix-open path 0)))      ; 0 = O_RDONLY on both targets
     (when (and fd (>= fd 0))
       (unwind-protect
@@ -253,12 +267,12 @@ report GiB of apparent size for MiB of data (GH #274)."
                      (allocated 0)
                      (pos 0))
                  (loop
-                   (let ((data (%posix-lseek fd pos +seek-data+)))
-                     (when (or (null data) (minusp data) (>= data size))
-                       (return allocated))
+                   (when (>= pos size) (return allocated))
+                   (let ((data (%posix-seek-data fd pos)))
+                     (cond ((null data) (return nil))
+                           ((or (eq data :end) (>= data size))
+                            (return allocated)))
                      (let ((hole (%posix-lseek fd data +seek-hole+)))
-                       (when (or (null hole) (minusp hole))
-                         (return (+ allocated (- size data))))
                        (incf allocated (- hole data))
                        (setf pos hole)))))
              (error () nil))
