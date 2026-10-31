@@ -79,6 +79,13 @@ Separately, the main CCL convoy was in the transaction-manager and
 type-index locks, not the rw-lock. A #118 fix that moves CCL to
 `rw-lock.lisp` therefore needs a pooled waker first.
 
+What landed instead (2026-10-31, #118): CCL keeps its native lock, and
+the shim adds a queued-writer count that new readers wait on before
+taking the read side. The scanners of `%scan-race-round` re-enter back
+to back and the native lock admits them over a waiting writer; with the
+gate the reader count drains within one scan and the writer proceeds.
+A thread that already holds the lock on either side skips the gate.
+
 ---
 
 ## 1. Verdict (answers the three hypotheses)

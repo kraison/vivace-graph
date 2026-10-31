@@ -7,7 +7,7 @@ VG takes design inspiration from CouchDB, neo4j and AllegroGraph.  It implements
 
 VivaceGraph runs on SBCL (>= 1.045), ECL (>= 26.5.5), and Clozure CL (CCL, Linux x86_64). As of 3.0.0 the full test suite — seven suites, ~5,400 checks — passes with zero failures on SBCL 2.6.6 and ECL 26.5.5, on both macOS arm64 and Linux x86_64. One ECL-only test (the full-system mixed storm) can intermittently time out late in the concurrent-stress suite on many-core Linux hosts — cumulative GC/resource state slowing tests run later in the same image, not the test itself (issue #43). (Earlier ECL releases such as 21.2.1 are no longer supported — 26.5.5 is required.)
 
-**CCL has a known concurrency limitation as of 3.0.0** ([#118](https://github.com/kraison/vivace-graph/issues/118)): a vector-segment writer starves against sustained concurrent scanners, so the two segment growing-writes tests do not terminate there. CCL alone does not use this repo's `rw-lock.lisp`, whose FIFO writer queue makes writer starvation structurally impossible — it uses `ccl:make-read-write-lock`, which offers no writer fairness. The shims long predate this release; vector segments are simply the first workload that provokes it. Because the main suite does not terminate on CCL, **3.0.0 is not fully validated there** — treat CCL as best-effort for this release. SBCL and ECL are unaffected.
+**CCL's writer starvation is fixed** ([#118](https://github.com/kraison/vivace-graph/issues/118), unreleased): CCL does not use this repo's `rw-lock.lisp`, and its native `ccl:make-read-write-lock` admits new readers while a writer waits, so a vector-segment writer starved against sustained scanners from 3.0.0 to 4.0.1 and the main suite did not terminate there. The shim in `utilities.lisp` now gates new readers while a writer is queued, which is `rw-lock.lisp`'s FIFO in effect. SBCL and ECL were never affected.
 
 LispWorks support is currently **untested** for lack of access to a license; the free Personal Edition's heap limit is too small to compile VivaceGraph. The codebase still carries `#+lispworks` conditionalization, but its status is unknown until it can be exercised on a current LispWorks.
 
@@ -87,9 +87,9 @@ pass. The temporal algebra now lives in its own library,
 
 Validated for release on SBCL and ECL (macOS arm64 + Linux) and CCL
 (Linux) across all eight test suites (#299). Known and documented:
-CCL's main suite still hangs on writer starvation (#118), and the
-peer type-table wire field stays 16-bit by contract (#199) — type-ids
-above 65535 cannot cross the peer wire.
+the peer type-table wire field stays 16-bit by contract (#199) —
+type-ids above 65535 cannot cross the peer wire. CCL's main-suite
+hang (#118) is fixed since 4.0.1 (see above).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full record and the
 developer's manual for chapters on each subsystem.

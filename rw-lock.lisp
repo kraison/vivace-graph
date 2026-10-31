@@ -1,8 +1,8 @@
 (in-package :graph-db)
 
 ;;;; Custom read-write lock for SBCL / LispWorks / ECL.
-;;;; (CCL is excluded in graph-db.asd and uses ccl:make-read-write-lock via the
-;;;; shims in utilities.lisp.)
+;;;; (CCL is excluded in graph-db.asd and uses ccl:make-read-write-lock
+;;;; behind a reader gate in utilities.lisp, GH #118.)
 ;;;;
 ;;;; Scaling design — targeted wakeup (fix #3):
 ;;;;   The lock keeps a FIFO writer-queue plus a count of active readers.  To

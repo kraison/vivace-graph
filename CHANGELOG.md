@@ -510,6 +510,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **CCL: a writer no longer starves behind back-to-back readers**
+  (#118). CCL's native `make-read-write-lock` admits new readers while a
+  writer waits, so three segment scanners re-entering the read side kept
+  `segment-put` out indefinitely and the main suite never terminated
+  there (3.0.0 through 4.0.1). The CCL shim in `utilities.lisp` now
+  counts queued writers and gates new readers while one waits, the FIFO
+  `rw-lock.lisp` gives the other implementations; a thread already
+  holding the lock on either side is not gated. `acquire-write-lock`
+  still ignores `:wait-p` on CCL, as before.
+
 - **A float literal with an absurd exponent is refused on the raw query
   text** (#315): SBCL's reader signals on `1e999999` and ECL reads
   infinity, both already refused, but CCL clamps it to the largest float
