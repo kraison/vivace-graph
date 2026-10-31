@@ -82,7 +82,10 @@ pin is held, release the pin, join, assert detached."
              (is-true done)
              (is (graph-db::store-detachment-p result))
              (is (not (graph-db::graph-open-p g))))
-        (ignore-errors (bt:join-thread thread))))
+        ;; A finished thread is not joined again: CCL's second
+        ;; join-process blocks forever (#433).
+        (when (bt:thread-alive-p thread)
+          (ignore-errors (bt:join-thread thread)))))
     clock))
 
 (test detach-timeout-restores-service
@@ -1006,7 +1009,9 @@ SWAP-IN-SHADOW really quiesces rather than closing straight away."
                (with-transaction ((graph-db::transaction-manager result))
                  (graph-db:make-vertex :generic nil :graph result))
                (setq g result))
-          (ignore-errors (bt:join-thread thread)))))))
+          ;; Not joined twice: CCL (#433).
+          (when (bt:thread-alive-p thread)
+            (ignore-errors (bt:join-thread thread))))))))
 
 (test discard-shadow-refuses-non-shadow-paths
   "THE deletion-safety test: DISCARD-SHADOW refuses any path that does

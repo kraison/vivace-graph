@@ -510,6 +510,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **tests(detach): the two drain tests no longer join their worker
+  twice** (#433). CCL's `join-process` blocks forever on a second join
+  of a finished thread (the termination semaphore is consumed by the
+  first), so the CCL main lane hung after the four passing checks of
+  `detach-drains-in-flight-readers-first`. The cleanup join is now
+  guarded by `thread-alive-p`, as every engine caller already is.
+
 - **The #387 string-bound paging test compares its solutions sorted**:
   they arrive in type-index order, which is hash order, and CCL's changed
   with the fixnum-wide fold (#424).
