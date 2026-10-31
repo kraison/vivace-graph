@@ -93,6 +93,10 @@ READ-SIDECAR-FILE-FORMS, the only place that actually signals it."
   (with-sidecar-input (:package package)
     (let ((forms nil) (skipped 0) (first-skip nil))
       (loop
+        ;; Skip to the form first: CCL's READ leaves the newline after
+        ;; a form where SBCL's eats it, and POS must be the record's
+        ;; start for the READ-LINE below to drop the whole record (#436).
+        (peek-char t stream nil)
         (let ((pos (file-position stream)))
           (let ((form (handler-case (read stream nil :eof)
                         (error ()

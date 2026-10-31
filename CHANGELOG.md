@@ -510,6 +510,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Sidecar reader counts a torn tail once on CCL** (#436). It noted the
+  position before `read`, but CCL's `read` leaves the newline after a
+  form where SBCL's eats it, so the recovery's `read-line` consumed an
+  empty line and the torn record was counted and warned twice. The
+  position is now taken after skipping whitespace.
+
 - **`check-value-constraints` no longer carries a stray `UNCHECKED`
   reference** (#435). Unescaped quotes in its docstring ended it early
   and left the word as a bare symbol in the body; SBCL and ECL dropped
