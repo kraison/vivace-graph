@@ -510,6 +510,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **GUI roster on CCL: open answers 409 for a dirty store and 404
+  location-missing for a vanished one** (#315) instead of
+  no-recorded-location for both. CCL file streams are private to the
+  thread that opened them; `journal-records` flushes the system clock's
+  journal from the request thread, the flush signalled, the roster read
+  swallowed it and saw no attach records. The journal is opened with
+  `:sharing :lock` on CCL, as the replication log already was.
+
 - **CCL: a writer no longer starves behind back-to-back readers**
   (#118). CCL's native `make-read-write-lock` admits new readers while a
   writer waits, so three segment scanners re-entering the read side kept
