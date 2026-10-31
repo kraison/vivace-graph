@@ -688,7 +688,10 @@ no fixture: every store this suite makes carries the axis."
 ;; on CLAIM-RECORDED-AT/2 cannot see it.  CLAIM-RETRACTED-AT/2 binds the
 ;; transaction END in the same spelling; CLAIM-TOUCHED-AT/2 the later of
 ;; the two, the single cursor a feed wants.  The retraction is stamped a
-;; second past the cursor so the order is fixed, not a race on NOW.
+;; second past the cursor so the order is fixed, not a race on NOW.  The
+;; cursor comes from %ST-NOW, the engine's monotonic clock: on a
+;; whole-second clock (ECL) LOCAL-TIME:NOW sits BEFORE the seed's stamps,
+;; which %ST-NOW moved past it by nanoseconds (GH #308, #429).
 (defvar *cursor* nil "The feed cursor, special so LISP/2 can read it.")
 
 (test claim-retracted-at-answers-the-transaction-end
@@ -697,7 +700,7 @@ no fixture: every store this suite makes carries the axis."
     ;; Open: NIL is a solution, and selects every open claim.
     (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
                                 (claim-retracted-at ?c nil))))
-    (let ((*cursor* (local-time:now))
+    (let ((*cursor* (graph-db.spacetime::%st-now))
           (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
                                      :relation "reachable"))))
       (retract-claim c :at (local-time:timestamp+ *cursor* 1 :sec))
@@ -724,7 +727,7 @@ no fixture: every store this suite makes carries the axis."
 (test claim-touched-at-is-the-later-of-recorded-and-retracted
   (with-rules-graph (g)
     (seed g)
-    (let ((*cursor* (local-time:now))
+    (let ((*cursor* (graph-db.spacetime::%st-now))
           (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
                                      :relation "reachable"))))
       ;; Open: touched-at is recorded-at, for every claim.
