@@ -76,7 +76,11 @@ sessions. Recorded 2026-10-07 from those runs (GH #403):
   a crash would read as success. Keep driver scripts out of `/tmp`
   (unverified: this looks like the `TEMPORARY-FILES:` logical pathname).
   The main lane runs whole since #118's fix; before it, the two
-  growing-writes tests had to be removed from the suite by hand.
+  growing-writes tests had to be removed from the suite by hand. Give
+  it a 3 h limit: the detach and system-restore suites spend about
+  1.5 h in the shadow copy, which reads every apparent byte of a
+  sparse store (#434). CCL buffers output under redirect too, so a
+  frozen log is a hang only once the process's CPU time stops moving.
 - **Read the check count, not the exit code.** ECL once segfaulted
   mid-suite, printed no FiveAM summary and exited 0 (#430); a lane
   driver treats a missing `Did N checks` line as a failure.
