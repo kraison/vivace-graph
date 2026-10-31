@@ -510,6 +510,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`check-value-constraints` no longer carries a stray `UNCHECKED`
+  reference** (#435). Unescaped quotes in its docstring ended it early
+  and left the word as a bare symbol in the body; SBCL and ECL dropped
+  the unused read, CCL signalled `UNBOUND-VARIABLE` on every audit.
+
 - **tests(detach): the two drain tests no longer join their worker
   twice** (#433). CCL's `join-process` blocks forever on a second join
   of a finished thread (the termination semaphore is consumed by the
