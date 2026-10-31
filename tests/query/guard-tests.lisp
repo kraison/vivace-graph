@@ -288,3 +288,16 @@ interpreter, so no request pays a native compile; the query body sees
                                  :format :raw
                                  :callback (lambda (row) (push row rows)))
       (is (equal '((:interpret)) rows)))))
+
+(test an-absurd-exponent-is-refused-before-the-reader-sees-it
+  "GH #315: not every reader rejects 1e999999.  SBCL signals, ECL reads
+infinity (caught by the non-finite screen), CCL clamps it to the largest
+float and passes it on as a finite number.  The raw text is screened
+first, so the answer is the same refusal everywhere; a literal inside a
+string is data and passes."
+  (signals graph-db.query:prolog-guard-error
+    (graph-db.query::%screen-exponent-text "(= ?x 1e999999)"))
+  (signals graph-db.query:prolog-guard-error
+    (graph-db.query::%screen-exponent-text "(= ?x 2.5d+99999)"))
+  (finishes (graph-db.query::%screen-exponent-text
+             "(= ?x 1.5e3) (= ?y 1e308) (= ?z \"1e999999\")")))

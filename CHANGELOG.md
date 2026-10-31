@@ -510,6 +510,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A float literal with an absurd exponent is refused on the raw query
+  text** (#315): SBCL's reader signals on `1e999999` and ECL reads
+  infinity, both already refused, but CCL clamps it to the largest float
+  and the non-finite screen cannot tell it from a real one, so the GUI
+  answered 200. `%screen-exponent-text` runs after the character screen
+  and refuses an exponent past 400 outside strings, names and comments,
+  with the same "could not be read" message everywhere.
+
 - **The skip-list node cache's get-or-install is atomic on CCL and
   LispWorks too** (#425, #406): `with-sl-cache-lock` was a mutex on ECL
   and a no-op elsewhere, and a CCL `:shared` table only serializes single
