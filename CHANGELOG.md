@@ -510,6 +510,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The skip-list node cache's get-or-install is atomic on CCL and
+  LispWorks too** (#425, #406): `with-sl-cache-lock` was a mutex on ECL
+  and a no-op elsewhere, and a CCL `:shared` table only serializes single
+  operations, so two threads missing at once still built two objects for
+  one node (6 of 300 rounds in the #406 test on CCL). The mutex now
+  guards every implementation whose table cannot lock itself.
+
 - **The algorithms distance test compares by value** (#426): CCL hands
   the weights back as doubles, and `equal` on a double and a single is
   false.
