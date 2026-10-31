@@ -7,7 +7,7 @@ VG takes design inspiration from CouchDB, neo4j and AllegroGraph.  It implements
 
 VivaceGraph runs on SBCL (>= 1.045), ECL (>= 26.5.5), and Clozure CL (CCL, Linux x86_64). As of 3.0.0 the full test suite — seven suites, ~5,400 checks — passes with zero failures on SBCL 2.6.6 and ECL 26.5.5, on both macOS arm64 and Linux x86_64. One ECL-only test (the full-system mixed storm) can intermittently time out late in the concurrent-stress suite on many-core Linux hosts — cumulative GC/resource state slowing tests run later in the same image, not the test itself (issue #43). (Earlier ECL releases such as 21.2.1 are no longer supported — 26.5.5 is required.)
 
-**CCL's writer starvation is fixed** ([#118](https://github.com/kraison/vivace-graph/issues/118), unreleased): CCL does not use this repo's `rw-lock.lisp`, and its native `ccl:make-read-write-lock` admits new readers while a writer waits, so a vector-segment writer starved against sustained scanners from 3.0.0 to 4.0.1 and the main suite did not terminate there. The shim in `utilities.lisp` now gates new readers while a writer is queued, which is `rw-lock.lisp`'s FIFO in effect. SBCL and ECL were never affected.
+**CCL's writer starvation is fixed** ([#118](https://github.com/kraison/vivace-graph/issues/118), fixed in 4.1.0): CCL does not use this repo's `rw-lock.lisp`, and its native `ccl:make-read-write-lock` admits new readers while a writer waits, so a vector-segment writer starved against sustained scanners from 3.0.0 to 4.0.1 and the main suite did not terminate there. The shim in `utilities.lisp` now gates new readers while a writer is queued, which is `rw-lock.lisp`'s FIFO in effect. SBCL and ECL were never affected.
 
 LispWorks support is currently **untested** for lack of access to a license; the free Personal Edition's heap limit is too small to compile VivaceGraph. The codebase still carries `#+lispworks` conditionalization, but its status is unknown until it can be exercised on a current LispWorks.
 
@@ -26,6 +26,23 @@ it: [`examples/example-spacetime.lisp`](examples/example-spacetime.lisp)
 A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), offline-first peer replication, and temporal extents, provenance-carrying claims and geometry registration (the optional `graph-db/spacetime` add-on), plus an API reference.
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
+
+### Announcement, 2026-10-31 — VivaceGraph 4.1.0 (features and fixes)
+
+A minor release: 98 changes since 4.0.1, with no on-disk format change
+and no peer-protocol bump, so 4.0.x stores open as they are. Two new
+subsystems: `graph-db/rules` reads claims as Prolog facts and runs rules
+as versioned producers, recursive ones included; `graph-db/query` is a
+web-free guarded query runner with paging. Spacetime claims gain edges
+and endpoint linking, runtime twins of the schema macros
+(`register-source`, `ensure-index`, `ensure-unique`) and a counting
+index (`def-count-index`); node-local time travel (`with-as-of`) lands;
+`vector-search` takes a `:filter`. A transaction now sees its own writes
+through every index-backed read, and a snapshot read never answers a
+node from a later commit. ECL and CCL run the whole suite green
+(fixnum-width id folds, CCL writer starvation #118, sparse shadow copies
+#434). Requires cl-temporal-extent >= 0.3.0. See
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ### Announcement, 2026-09-02 — VivaceGraph 4.0.1 (bug fix)
 
