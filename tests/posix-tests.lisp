@@ -121,21 +121,30 @@ matter."
 
 (test data-extents-walk-the-file
   "#434: %POSIX-DATA-EXTENTS lists (START . END) data runs and the file
-length; an empty file has none, a dense page is one run, data at both
-ends of a hole is two.  The second value is NIL only where SEEK_DATA is
-unsupported, never on Linux."
+length.  Run boundaries are the filesystem's -- ext4 reports 4 KiB
+blocks, APFS 16 KiB and it may allocate a small gap between two writes
+(seen on thoth, 2026-10-31) -- so this asserts what every filesystem
+must agree on: written pages lie inside runs, a wide gap lies inside
+none, data is far below the apparent size, a trailing hole from
+ftruncate adds nothing.  SUPPORTED-P is NIL only without SEEK_DATA,
+never on Linux or macOS."
   (let ((path (namestring
                (graph-db-test-scratch:make-scratch-file-name
                 "extents" "dat")))
         (page (make-array 4096 :element-type '(unsigned-byte 8)
                                :initial-element 9))
         (mib (* 1024 1024)))
-    (flet ((extents ()
-             (multiple-value-bind (extents length supported)
-                 (graph-db::%posix-data-extents path)
-               #+graph-db-posix-linux
-               (is-true supported "SEEK_DATA unsupported?")
-               (values (and supported extents) length supported))))
+    (labels ((extents ()
+               (multiple-value-bind (extents length supported)
+                   (graph-db::%posix-data-extents path)
+                 (is-true supported "SEEK_DATA unsupported?")
+                 (values (and supported extents) length supported)))
+             (covered-p (extents start end)
+               (some (lambda (run) (and (<= (car run) start)
+                                        (<= end (cdr run))))
+                     extents))
+             (data-bytes (extents)
+               (loop for (start . end) in extents sum (- end start))))
       (unwind-protect
            (progn
              (with-open-file (s path :direction :output
@@ -159,28 +168,36 @@ unsupported, never on Linux."
                (file-position s (* 64 mib))
                (write-sequence page s)
                ;; A zero byte at the end allocates a block, as the
-               ;; engine's %POSIX-EXTEND-FILE-BACKING does: a third run.
+               ;; engine's %POSIX-EXTEND-FILE-BACKING does.
                (file-position s (1- (* 80 mib)))
                (write-byte 0 s))
-             (multiple-value-bind (extents length supported) (extents)
-               (is (eql (* 80 mib) length))
-               (when supported
-                 (is (= 3 (length extents)) "three runs: ~S" extents)
-                 (is (equal '(0 . 4096) (first extents)))
-                 (is (and (<= (car (second extents)) (* 64 mib))
-                          (<= (+ (* 64 mib) 4096) (cdr (second extents))))
-                     "second run should cover the page at 64 MiB: ~S"
-                     (second extents))
-                 (is (< (cdr (second extents)) (* 65 mib))
-                     "the hole after it is not data: ~S" extents)
-                 (is (eql (* 80 mib) (cdr (third extents))))))
-             ;; ftruncate makes a hole with no block behind it.
-             (%truncate-file path (* 96 mib))
-             (multiple-value-bind (extents length supported) (extents)
-               (is (eql (* 96 mib) length))
-               (when supported
-                 (is (= 3 (length extents)) "a trailing hole adds no run")
-                 (is (eql (* 80 mib) (cdr (third extents)))))))
+             (let ((before 0))
+               (multiple-value-bind (extents length supported) (extents)
+                 (is (eql (* 80 mib) length))
+                 (when supported
+                   (is (covered-p extents 0 4096) "page at 0: ~S" extents)
+                   (is (covered-p extents (* 64 mib) (+ (* 64 mib) 4096))
+                       "page at 64 MiB: ~S" extents)
+                   (is (covered-p extents (1- (* 80 mib)) (* 80 mib))
+                       "zero block at the end: ~S" extents)
+                   (is (notany (lambda (run) (and (< (car run) (* 63 mib))
+                                                  (< mib (cdr run))))
+                               extents)
+                       "the gap 1..63 MiB must be a hole: ~S" extents)
+                   (setf before (data-bytes extents))
+                   (is (< before (* 40 mib))
+                       "data ~D bytes should be far below 80 MiB" before)))
+               ;; ftruncate makes a hole with no block behind it.
+               (%truncate-file path (* 96 mib))
+               (multiple-value-bind (extents length supported) (extents)
+                 (is (eql (* 96 mib) length))
+                 (when supported
+                   (is (eql before (data-bytes extents))
+                       "a trailing hole adds no data: ~S" extents)
+                   (is (notany (lambda (run) (> (cdr run) (* 80 mib)))
+                               extents)
+                       "no run reaches into the trailing hole: ~S"
+                       extents)))))
         (ignore-errors (delete-file path))))))
 
 (test allocated-size-sees-through-sparse-files
