@@ -510,6 +510,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **CCL: a timed `with-lock` waits instead of signalling** (#432).
+  `do-grab-lock-with-timeout` passed `(list lock)` where
+  `process-wait-with-timeout` takes the predicate's arguments as
+  `&rest`, so `try-lock` got a list and every timed wait, the peer
+  writer's `receive-message` first, died with a type error. The first
+  full CCL main lane (#118) reached it.
+
 - **GUI roster on CCL: open answers 409 for a dirty store and 404
   location-missing for a vanished one** (#315) instead of
   no-recorded-location for both. CCL file streams are private to the

@@ -493,10 +493,12 @@ characters.~@:>" string (length string)))
 (defun do-grab-lock-with-timeout (lock whostate timeout)
   (if timeout
       (or (ccl:try-lock lock)
+          ;; The predicate's arguments are &REST: the lock itself, not a
+          ;; list of it (GH #432).
           (ccl:process-wait-with-timeout whostate
                                          (round
                                           (* timeout ccl:*ticks-per-second*))
-                                         #'ccl:try-lock (list lock)))
+                                         #'ccl:try-lock lock))
       (ccl:grab-lock lock)))
 
 #+ccl
