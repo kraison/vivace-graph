@@ -89,14 +89,17 @@ TRUNCATED-P is per page.  A bad offset is no offset."
 
 (test a-string-bound-pages-by-key
   "GH #387's third option: </2 and >/2 order two strings lexically, so a
-caller pages an indexed route by bounding the last key it saw."
+caller pages an indexed route by bounding the last key it saw.  The
+solutions arrive in type-index order, which is hash order (CCL's changed
+with #424's fold), so they are compared sorted."
   (with-query-graph (g)
     (seed g)
     (is (equal '("b" "c")
-               (mapcar #'second
-                       (nth-value 1 (q g "(is-a ?i qt-item)
-                                          (node-slot-value ?i label ?l)
-                                          (> ?l \"a\")")))))
+               (sort (mapcar #'second
+                             (nth-value 1 (q g "(is-a ?i qt-item)
+                                                (node-slot-value ?i label ?l)
+                                                (> ?l \"a\")")))
+                     #'string<)))
     (is (equal '("a")
                (mapcar #'second
                        (nth-value 1 (q g "(is-a ?i qt-item)

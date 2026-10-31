@@ -510,6 +510,10 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The #387 string-bound paging test compares its solutions sorted**:
+  they arrive in type-index order, which is hash order, and CCL's changed
+  with the fixnum-wide fold (#424).
+
 - **CCL: a timed `with-lock` waits instead of signalling** (#432).
   `do-grab-lock-with-timeout` passed `(list lock)` where
   `process-wait-with-timeout` takes the predicate's arguments as
