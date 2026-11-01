@@ -935,7 +935,7 @@ empty, and deleting the image discards the ONLY durable copy of the graph
         (when msg
           (is (search "v5" msg))
           (is (search "v6" msg))
-          (is (search "v8" msg)
+          (is (search (format nil "v~D" graph-db::+native-image-version+) msg)
               "the message names the version this build writes")
           (is (not (search "Delete" msg)))
           (is (not (search "delete" msg))))))))
@@ -1148,3 +1148,87 @@ rebuilds from the journal), which is the documented recovery."
           "a refused create must leave no files behind")
       (is (probe-file (format nil "~A.dirty" loc))
           "the marker that records the earlier crash is kept"))))
+
+;;; ---------------------------------------------------------------------------
+;;; #60 spec §9: an image written before every geometry slot was indexed holds
+;;; one spatial record per class; reopening it re-derives from the nodes.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex m-twin ()
+  ((centroid :type geometry :index t)
+   (outline :type geometry :index t :spatial-precision 5))
+  :graph-db-memory-test)
+
+(defun %m-twin-indexed-p (g slot min-lon min-lat max-lon max-lat id)
+  (let ((idx (graph-db::spatial-index-for g 'm-twin slot)))
+    (and idx (has-p id (graph-db::spatial-index-query-bbox
+                        idx min-lon min-lat max-lon max-lat))
+         t)))
+
+(defun %m-twin-both-indexed-p (g id)
+  (and (%m-twin-indexed-p g 'centroid 29.9d0 49.9d0 30.1d0 50.1d0 id)
+       (%m-twin-indexed-p g 'outline 34.9d0 54.9d0 36.1d0 56.1d0 id)))
+
+(defun %write-pre-60-image (loc lazy patch)
+  "Create a memory graph at LOC with one M-TWIN, drop its OUTLINE index from
+the registry (as a pre-#60 image never had one), close it so the image is
+written, then call PATCH on the image file to stamp the older version.
+Returns the node id."
+  (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy lazy))
+        id)
+    (let ((*graph* g))
+      (with-transaction ()
+        (setq id (id (make-m-twin :centroid (graph-db::make-point 30d0 50d0)
+                                  :outline (scope-rect 35d0 55d0 36d0 56d0)))))
+      (is (%m-twin-both-indexed-p g id) "premise: both indexed before close")
+      (remhash (cons 'm-twin 'outline) (graph-db::spatial-indexes g))
+      (close-graph g :snapshot-p t))
+    (funcall patch (graph-db::memory-image-file loc))
+    id))
+
+(test a-v8-native-image-rebuilds-its-spatial-indexes
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let* ((loc (namestring dir))
+           (id (%write-pre-60-image
+                loc t
+                (lambda (file)
+                  ;; The version is the 4-byte little-endian word after the
+                  ;; magic (NI-UINT); stamp it 8.
+                  (let ((bytes (with-open-file (s file :element-type
+                                                 '(unsigned-byte 8))
+                                 (let ((a (make-array (file-length s)
+                                                      :element-type
+                                                      '(unsigned-byte 8))))
+                                   (read-sequence a s) a)))
+                        (off (length graph-db::*native-image-magic*)))
+                    (setf (aref bytes off) 8 (aref bytes (+ off 1)) 0
+                          (aref bytes (+ off 2)) 0 (aref bytes (+ off 3)) 0)
+                    (with-open-file (s file :direction :output
+                                            :if-exists :supersede
+                                            :element-type '(unsigned-byte 8))
+                      (write-sequence bytes s)))))))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc
+                                             :lazy t)))
+        (unwind-protect
+             (is (%m-twin-both-indexed-p g2 id)
+                 "a v8 image re-derives every slot's index from the nodes")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-v5-cl-store-image-rebuilds-its-spatial-indexes
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let* ((loc (namestring dir))
+           (id (%write-pre-60-image
+                loc nil
+                (lambda (file)
+                  (let ((plist (graph-db::%restore-node-image file)))
+                    (setf (getf plist :version) 5)
+                    (cl-store:store plist file))))))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (is (%m-twin-both-indexed-p g2 id)
+                 "a :version 5 image re-derives every slot's index")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

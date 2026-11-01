@@ -84,10 +84,12 @@ rebuild.  The rescan is 12 iterations and runs only on that transition."
 ;; and a remove derives its cells from the geometry -- cells the old budget
 ;; wrote would be orphaned by a new remove.  v5 is v4's layout too; it bumps
 ;; because each entry's VALUE now carries the node's type tag (GH #104) and a v4
-;; index's NIL values would leave every scoped query on the old floor.  Any
+;; index's NIL values would leave every scoped query on the old floor.  v6 is
+;; v5's layout too; it bumps because a node is now indexed under EVERY declared
+;; geometry slot (#60) and a v5 sidecar names one index per class.  Any
 ;; older sidecar triggers an index-only re-derivation from live node geometries
 ;; at open (RESTORE-SPATIAL-INDEX-ROOTS).
-(alexandria:define-constant +spatial-index-format+ 5 :test '=)
+(alexandria:define-constant +spatial-index-format+ 6 :test '=)
 
 ;; A bbox query covers its window with at most this many (coarse) cells, each of
 ;; which becomes ONE prefix range scan.  Bounding the covering set is what keeps a

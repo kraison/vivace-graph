@@ -1339,7 +1339,8 @@ that follows must leave every entry tagged."
       (let* ((file (graph-db::spatial-indexes-root-file
                     (namestring (graph-db:location g))))
              (plist (cl-store:restore file)))
-        (is (= 5 (getf plist :format)) "sanity: this build writes v5")
+        (is (= graph-db::+spatial-index-format+ (getf plist :format))
+            "sanity: this build writes the current format")
         (cl-store:store (list :format 4 :complete t
                               :indexes (getf plist :indexes))
                         file))

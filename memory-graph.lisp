@@ -720,7 +720,7 @@ lookups return the live object).  Returns the node."
     (nreverse acc)))
 
 (defun write-memory-image-native (graph)
-  "Write GRAPH's full state in the VG-native (v8) format: per-node blob records
+  "Write GRAPH's full state in the VG-native (v9) format: per-node blob records
 plus the same structural derived dumps.  Untouched LZNODEs pass their blob
 through."
   (let ((buf (ni-mkbuf)))
@@ -730,7 +730,9 @@ through."
     ;; bumps because a spatial entry's value now carries its type tag, and a v6
     ;; image's NIL values would restore an index no scoped query can filter on
     ;; (GH #104).  v8 is v7's layout with type-id widened 2 -> 4 bytes (#187);
-    ;; v5-v7 are still read, so an older image is never orphaned.
+    ;; v9 is v8's layout and bumps because a node is now indexed under every
+    ;; geometry slot (#60): a v8 spatial section is incomplete.  v5-v8 are
+    ;; still read, so an older image is never orphaned.
     (ni-bytes buf *native-image-magic*)
     (ni-uint buf +native-image-version+ 4)
     (ni-uint buf (load-highest-transaction-id graph) 8)
@@ -761,10 +763,10 @@ journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
 recover from the journal was actively wrong (it discards the graph and 'succeeds'
 onto an empty one).  Say what remedies actually exist instead."
   (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6, ~
-v7 and v8, writing v8).  This image is the ONLY durable record of a cleanly-~
+v7, v8 and v9, writing v9).  This image is the ONLY durable record of a cleanly-~
 closed memory graph -- the journal is cleared after every checkpoint, so ~
 deleting the image discards the graph, it does not recover it.  Open it with a ~
-build that reads v~D, or migrate it to v8 first."
+build that reads v~D, or migrate it to v9 first."
          ver file ver))
 
 (defun %custom-node-geometry-classes ()
@@ -858,7 +860,7 @@ was filed for).  Returns :STRUCTURAL and stashes the view dump in
     ;; the spatial section per-(owner . slot); v7 shares v6's layout exactly
     ;; and differs only in what a spatial entry's value holds (GH #104).  Both
     ;; v5 and v6 are migrated below.
-    (unless (member ver '(5 6 7 8))
+    (unless (member ver '(5 6 7 8 9))
       (%signal-unsupported-memory-image-version ver file))
     (ri-uint rc 8)                                 ; highest-tx-id
     ;; v8 widened type-id 2 -> 4 bytes (#187).  Every record and index key
@@ -899,14 +901,16 @@ was filed for).  Returns :STRUCTURAL and stashes the view dump in
     ;; remaining bytes anyway, harmlessly, so a truncated tail cannot signal here.
     (when (< (ric-i rc) (length (ric-bytes rc)))
       (%load-unique-indexes graph (ri-val rc)))
-    ;; Pre-v7 migration: rederive the spatial index from the nodes.  v5 never
+    ;; Pre-v9 migration: rederive the spatial index from the nodes.  v5 never
     ;; carried one (GH #65); v6 carried one whose entries have no type tag, and
     ;; the rebuild is the only way to write them -- a re-insert over an existing
     ;; (cell . node-id) is a duplicate-key no-op and would leave the tag NIL
-    ;; (GH #104).  %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-NODES clears the
-    ;; registry first, so the restored v6 indexes are dropped, not merged into.
-    ;; Lazy-safe (see its docstring), so this runs on a LAZY graph too.
-    (when (< ver 7) (%rebuild-memory-spatial-indexes-from-nodes graph))
+    ;; (GH #104); v7 and v8 carry one index per class where a node now belongs
+    ;; in one per geometry slot (#60).  %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-
+    ;; NODES clears the registry first, so the restored indexes are dropped,
+    ;; not merged into.  Lazy-safe (see its docstring), so this runs on a LAZY
+    ;; graph too.
+    (when (< ver 9) (%rebuild-memory-spatial-indexes-from-nodes graph))
     :structural))
 
 (defun write-memory-image (graph)
@@ -919,8 +923,9 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
       (write-memory-image-native graph)
       (cl-store:store
        ;; v4: per-(owner . slot) spatial records (v3 wrote :spatial NIL).  v5 is
-       ;; v4's shape with a type tag on each spatial entry (GH #104).
-       (list :version 5
+       ;; v4's shape with a type tag on each spatial entry (GH #104); v6 is
+       ;; v5's shape with every geometry slot indexed (#60).
+       (list :version 6
              :highest-tx-id (load-highest-transaction-id graph)
              :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
              :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
@@ -990,12 +995,14 @@ RESTORE-VIEWS."
           (setf (node-graph e) graph)
           (mem-table-put (edge-table graph) (id e) e))
         (cond
-          ((and (eql version 5) type-vertex)
+          ((and (member version '(5 6)) type-vertex)
            ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
            ;; geohash recompute.  This is what keeps open fast (#50).  An older image
            ;; (v4's entries carry no type tag, GH #104; v3 wrote :SPATIAL NIL;
            ;; v2 keyed cells by bare string) fails the version check and falls
-           ;; through to the rebuild-from-nodes branch below.
+           ;; through to the rebuild-from-nodes branch below.  v5's spatial
+           ;; section names one index per class (#60): it is re-derived from
+           ;; the nodes below instead of restored.
            (%load-mem-index (mem-type-index-data (vertex-index graph)) type-vertex)
            (%load-mem-index (mem-type-index-data (edge-index graph))   type-edge)
            (%load-mem-index (mem-ve-index-data (ve-index-in graph))    ve-in)
@@ -1003,10 +1010,14 @@ RESTORE-VIEWS."
            (%load-mem-index (mem-vev-index-data (vev-index graph))     vev)
            ;; Spatial: one record per (owner . slot), recreated structurally from its
            ;; own cells, precision, cap and histogram -- no rebuild from the nodes.
-           (dolist (rec spatial)
-             (destructuring-bind (owner slot pairs precision max-cells counts) rec
-               (%restore-mem-spatial-index graph owner slot pairs precision
-                                           max-cells counts)))
+           (if (eql version 5)
+               (%rebuild-memory-spatial-indexes-from-nodes graph)
+               (dolist (rec spatial)
+                 (destructuring-bind (owner slot pairs precision max-cells
+                                      counts)
+                     rec
+                   (%restore-mem-spatial-index graph owner slot pairs precision
+                                               max-cells counts))))
            (setf *memory-image-view-dump* (or views '()))
            (when unique (%load-unique-indexes graph unique))   ; #6
            :structural)

@@ -121,7 +121,8 @@ are not checked against the registry.")
 ;; independent of +STORAGE-VERSION+.  v8 (#187) widens type-id from 2 to 4
 ;; bytes; v5/v6/v7 stay readable, because a cleanly-closed memory graph's
 ;; image is its ONLY durable copy -- the journal is cleared on checkpoint.
-(alexandria:define-constant +native-image-version+ 8)
+;; 9 since #60 (see memory-graph.lisp's writer).
+(alexandria:define-constant +native-image-version+ 9)
 (alexandria:define-constant +image-type-id-bytes+  4)
 (alexandria:define-constant +fixed-integer-64+    #x01)
 (alexandria:define-constant +data-magic-byte+     #x17)

@@ -389,3 +389,40 @@ transaction's own node is the answer."
         (is (equal (list n)
                    (mapcar #'car (find-nearest-k 'ms-area 55.5d0 35.5d0 1
                                                  :slot 'outline))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Spec §9: a 4.1.0 sidecar (format 5) re-derives into every slot's index.
+;;; ---------------------------------------------------------------------------
+
+(test a-format-5-sidecar-is-rederived-into-both-indexes
+  "A sidecar written before #60 names one index per class.  Reopening it must
+re-derive from the nodes, so the second slot's index appears, and the sidecar
+is rewritten at the current format."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) id)
+      (let ((g (make-graph *integration-graph-name* path
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (setq id (id (ms-make-area))))
+          (close-graph g :snapshot-p nil)))
+      (let* ((file (graph-db::spatial-indexes-root-file path))
+             (plist (cl-store:restore file)))
+        (is (= graph-db::+spatial-index-format+ (getf plist :format)))
+        ;; Mimic 4.1.0: format 5, the centroid's record only.
+        (cl-store:store
+         (list :format 5 :complete t
+               :indexes (remove-if-not (lambda (r) (eq (second r) 'centroid))
+                                       (getf plist :indexes)))
+         file))
+      (let ((g (open-graph *integration-graph-name* path)))
+        (unwind-protect
+             (progn
+               (is-true (ms-in-centroid-window-p g 'centroid id))
+               (is-true (ms-in-outline-window-p g 'outline id))
+               (is (= graph-db::+spatial-index-format+
+                      (getf (cl-store:restore
+                             (graph-db::spatial-indexes-root-file path))
+                            :format))
+                   "the reopen rewrote the sidecar at the current format"))
+          (close-graph g :snapshot-p nil)
+          (collect-garbage))))))
