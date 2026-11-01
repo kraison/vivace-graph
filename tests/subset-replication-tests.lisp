@@ -120,3 +120,22 @@ staying in/out keeps/drops.  (Generalises filter-writes with slave presence.)"
             (is (not (typep (first r) 'graph-db::tx-update))))
           ;; absent + stays out -> dropped
           (is (null (one w-a-out)) "still-outside node -> dropped"))))))
+
+(test filter-accepts-a-node-by-any-geometry
+  "#60 spec §7: subset replication ships a node when ANY of its geometries'
+representative points lies in the area.  MS-AREA is the two-slot fixture from
+spatial-multi-slot-tests."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (by-outline neither)
+      (with-transaction ()
+        (setq by-outline (make-ms-area
+                          :centroid (make-point 2.47d0 41.78d0)
+                          :outline (ms-rect 12.342d0 45.671d0
+                                            12.348d0 45.675d0))
+              neither (make-ms-area
+                       :centroid (make-point 2.47d0 41.78d0)
+                       :outline (ms-rect 2.4d0 41.7d0 2.5d0 41.8d0))))
+      (let ((filter (make-spatial-replication-filter (make-polygon *area*))))
+        (is (funcall filter by-outline) "outline centre in the area: ships")
+        (is (not (funcall filter neither)) "no geometry in the area")))))

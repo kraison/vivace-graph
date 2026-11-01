@@ -221,6 +221,19 @@ representative point.  SCOPE and SLOT are as for FIND-NODES-WITHIN."
             (funcall cont))
           (undo-bindings old-trail))))))
 
+(def-global-prolog-functor find-within/4 (?node ?scope ?slot ?area cont)
+  "FIND-WITHIN/3 with the geometry slot to test in third position (#60)."
+  (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
+        (slot (var-deref ?slot))
+        (area (var-deref ?area)))
+    (when (geometryp area)
+      (dolist (node (find-nodes-within scope area :slot slot :graph *graph*))
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify node-var node)
+            (funcall cont))
+          (undo-bindings old-trail))))))
+
 (def-global-prolog-functor find-intersects/3 (?node ?scope ?area cont)
   "Yield each node in ?SCOPE whose geometry intersects the bound ?AREA geometry."
   (let ((node-var (var-deref ?node))
@@ -233,6 +246,20 @@ representative point.  SCOPE and SLOT are as for FIND-NODES-WITHIN."
             (funcall cont))
           (undo-bindings old-trail))))))
 
+(def-global-prolog-functor find-intersects/4 (?node ?scope ?slot ?area cont)
+  "FIND-INTERSECTS/3 with the geometry slot to test in third position (#60)."
+  (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
+        (slot (var-deref ?slot))
+        (area (var-deref ?area)))
+    (when (geometryp area)
+      (dolist (node (find-nodes-intersecting scope area :slot slot
+                                                        :graph *graph*))
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify node-var node)
+            (funcall cont))
+          (undo-bindings old-trail))))))
+
 (def-global-prolog-functor find-near/5 (?node ?scope ?lat ?lon ?radius cont)
   "Yield each node in ?SCOPE within ?RADIUS metres of (?LAT, ?LON)."
   (let ((node-var (var-deref ?node))
@@ -240,6 +267,22 @@ representative point.  SCOPE and SLOT are as for FIND-NODES-WITHIN."
         (lat (var-deref ?lat)) (lon (var-deref ?lon)) (radius (var-deref ?radius)))
     (when (and (numberp lat) (numberp lon) (numberp radius))
       (dolist (nd (find-nodes-near scope lat lon radius :graph *graph*))
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify node-var (car nd))
+            (funcall cont))
+          (undo-bindings old-trail))))))
+
+(def-global-prolog-functor find-near/6 (?node ?scope ?slot ?lat ?lon ?radius
+                                        cont)
+  "FIND-NEAR/5 with the geometry slot to test in third position (#60)."
+  (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
+        (slot (var-deref ?slot))
+        (lat (var-deref ?lat)) (lon (var-deref ?lon))
+        (radius (var-deref ?radius)))
+    (when (and (numberp lat) (numberp lon) (numberp radius))
+      (dolist (nd (find-nodes-near scope lat lon radius :slot slot
+                                                        :graph *graph*))
         (let ((old-trail (fill-pointer *trail*)))
           (when (unify node-var (car nd))
             (funcall cont))
@@ -303,18 +346,38 @@ widen MAX-RADIUS only if you accept scanning the larger candidate set."
             (funcall cont))
           (undo-bindings old-trail))))))
 
+(def-global-prolog-functor find-nearest/6 (?node ?scope ?slot ?lat ?lon ?k
+                                           cont)
+  "FIND-NEAREST/5 with the geometry slot to test in third position (#60)."
+  (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
+        (slot (var-deref ?slot))
+        (lat (var-deref ?lat)) (lon (var-deref ?lon)) (k (var-deref ?k)))
+    (when (and (numberp lat) (numberp lon) (integerp k))
+      (dolist (nd (find-nearest-k scope lat lon k :slot slot :graph *graph*))
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify node-var (car nd))
+            (funcall cont))
+          (undo-bindings old-trail))))))
+
 (defun make-spatial-replication-filter (area)
   "Return a predicate (NODE) -> generalized boolean for use as a slave graph's
 REPLICATION-FILTER (see MAKE-GRAPH :replication-filter).  It accepts a node when
 it has no geometry (so non-spatial data -- schema, reference data -- replicates
-in full) or when its geometry's representative point lies within AREA (a
-:polygon / :multipolygon).  A field slave then receives only the nodes for its
-coverage area, plus all non-spatial nodes."
+in full) or when the representative point of ANY of its geometries
+ (NODE-GEOMETRIES) lies within AREA (a :polygon / :multipolygon): replication
+is about having the data, so union is right here and only here (#60, spec §7).
+A field slave then receives only the nodes for its coverage area, plus all
+non-spatial nodes.  The rep-point test is a known coarseness: an outline that
+overlaps AREA with its bbox centre outside does not ship."
   (lambda (node)
-    (let ((geom (node-geometry node)))
-      (or (null geom)
-          (multiple-value-bind (lat lon) (%geometry-rep-point geom)
-            (geometry-contains-point-p area lon lat))))))
+    (let ((geoms (node-geometries node)))
+      (or (null geoms)
+          (some (lambda (pair)
+                  (multiple-value-bind (lat lon)
+                      (%geometry-rep-point (cdr pair))
+                    (geometry-contains-point-p area lon lat)))
+                geoms)))))
 
 (defun report-degraded-spatial-indexes (graph)
   "Warn ONCE PER INDEX whose coarsest occupied precision is below the precision it

@@ -682,6 +682,11 @@
            #:find-intersects/3
            #:find-near/5
            #:find-nearest/5
+           ;; the same with the geometry slot in third position (#60)
+           #:find-within/4
+           #:find-intersects/4
+           #:find-near/6
+           #:find-nearest/6
            #:geo-distance/5
            #:geo-near/5
            #:geo-within/3

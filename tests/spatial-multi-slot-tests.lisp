@@ -332,3 +332,60 @@ subclass declares on its own slot, by name."
         (def-vertex ms-redef () ((a :type geometry :index t))
           :graph-db-integration-test))
       (is (= 1 (length (find-nodes-within 'ms-redef area)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Spec §6.2: the slot-taking Prolog arities, next to their unnamed twins.
+;;; ---------------------------------------------------------------------------
+
+(test prolog-arities-take-the-slot
+  "find-within/4, find-intersects/4, find-near/6 and find-nearest/6 carry the
+slot in third position.  Both outlines are centred on (30 50); only A's
+centroid is."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (a)
+      (with-transaction ()
+        (setq a (make-ms-area :centroid (make-point 30d0 50d0)
+                              :outline (ms-rect 29d0 49d0 31d0 51d0)))
+        (make-ms-area :centroid (make-point 40d0 60d0)
+                      :outline (ms-rect 29.5d0 49.5d0 30.5d0 50.5d0)))
+      (is (equal (list a)
+                 (select-flat (?n)
+                   (is ?area (ms-area-of-interest))
+                   (find-within ?n ms-area centroid ?area))))
+      (is (= 2 (length (select-flat (?n)
+                         (is ?area (ms-area-of-interest))
+                         (find-intersects ?n ms-area outline ?area)))))
+      (is (equal (list a)
+                 (select-flat (?n)
+                   (find-near ?n ms-area centroid 50d0 30d0 1d4))))
+      (is (= 2 (length (select-flat (?n)
+                         (find-near ?n ms-area outline 50d0 30d0 1d4)))))
+      (is (equal (list a)
+                 (select-flat (?n)
+                   (find-nearest ?n ms-area centroid 50d0 30d0 1))))
+      (is (= 2 (length (select-flat (?n)
+                         (find-nearest ?n ms-area outline 50d0 30d0 2))))))))
+
+(test prolog-literal-list-scope-with-slot
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (sub)
+      (with-transaction ()
+        (setq sub (make-ms-only-sub :loc (make-point 30.05d0 50.05d0))))
+      (is (equal (list sub)
+                 (select-flat (?n)
+                   (is ?area (ms-area-of-interest))
+                   (find-within ?n (ms-base ms-only-sub) loc ?area)))
+          "a literal list scope with a slot, deduped across the two classes"))))
+
+(test nearest-k-finds-an-own-node-before-any-index-exists
+  "Review Focus 5: GH #410's rule under :SLOT -- no index yet, the open
+transaction's own node is the answer."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-transaction ()
+      (let ((n (ms-make-area)))
+        (is (equal (list n)
+                   (mapcar #'car (find-nearest-k 'ms-area 55.5d0 35.5d0 1
+                                                 :slot 'outline))))))))
