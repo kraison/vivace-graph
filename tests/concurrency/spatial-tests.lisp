@@ -147,3 +147,94 @@ cell de-indexed, new cell indexed, no node lost or duplicated)."
           "after deletes: index empty; got ~D" (idx-count g *a-box*))
       (is (= 0 (live-place-count g))
           "after deletes: 0 live; got ~D" (live-place-count g)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Test 5 (#60): two geometry slots, each maintained under its own index,
+;;; under concurrent creates, updates and reads.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex c-twin ()
+  ((centroid :type geometry :index t)
+   (outline  :type geometry :index t))
+  :graph-db-concurrency-test)
+
+(defun b-rect (k)
+  "A one-step square in cluster B at step K, inside *B-BOX*."
+  (let ((lon (+ *b-lon* (* k *step*)))
+        (lat (+ *b-lat* (* k *step*))))
+    (make-polygon (list (list (list lon lat)
+                              (list (+ lon *step*) lat)
+                              (list (+ lon *step*) (+ lat *step*))
+                              (list lon (+ lat *step*))
+                              (list lon lat))))))
+
+(defun slot-idx-count (g slot box)
+  "Distinct node ids C-TWIN's index for SLOT returns inside BOX; 0 before
+the index exists."
+  (let ((idx (graph-db:spatial-index-for g 'c-twin slot)))
+    (if idx
+        (length (remove-duplicates
+                 (apply #'spatial-index-query-bbox idx box)
+                 :test 'equalp))
+        0)))
+
+(defun live-twin-count (g)
+  (length (map-vertices #'identity g :collect-p t :vertex-type 'c-twin)))
+
+(test concurrent-two-slot-maintenance
+  "#60: N writers each create M two-slot nodes (CENTROID in A, OUTLINE in B)
+and then move each within its cluster, while N readers query each slot's
+index over BOTH windows.  No reader ever sees a node under the wrong slot --
+a CENTROID in B's window or an OUTLINE in A's -- and at the end each slot's
+index holds exactly the N×M live nodes in its own window and none in the
+other's."
+  (let* ((n *thread-count*) (m 10) (r 40) (total (* n m)))
+    (with-conc-graph (g)
+      (run-threads
+       (* 2 n)
+       (lambda (i)
+         (if (< i n)
+             (let ((ids '()))
+               (dotimes (k m)
+                 (with-transaction ()
+                   (push (id (make-c-twin
+                              :centroid (a-point (+ (* i m) k 1))
+                              :outline (b-rect (+ (* i m) k 1))))
+                         ids)))
+               ;; Each thread owns its nodes: no write/write conflict.
+               ;; The move stays inside the cluster, so the windows below
+               ;; keep their meaning while both slots are re-indexed.
+               (loop for id in ids
+                     for k from 1
+                     do (with-transaction ()
+                          (let ((v (copy (lookup-vertex id)))
+                                (step (+ total (* i m) k)))
+                            (setf (slot-value v 'centroid) (a-point step)
+                                  (slot-value v 'outline) (b-rect step))
+                            (save v)))))
+             (dotimes (_ r)
+               (let ((c-in-b (slot-idx-count g 'centroid *b-box*))
+                     (o-in-a (slot-idx-count g 'outline *a-box*))
+                     (c-in-a (slot-idx-count g 'centroid *a-box*))
+                     (o-in-b (slot-idx-count g 'outline *b-box*)))
+                 (unless (and (zerop c-in-b) (zerop o-in-a))
+                   (error "a reader saw a node under the wrong slot: ~
+~D centroids in B, ~D outlines in A" c-in-b o-in-a))
+                 (unless (and (<= 0 c-in-a total) (<= 0 o-in-b total))
+                   (error "spatial query returned out-of-range counts ~
+~D (centroid) ~D (outline)" c-in-a o-in-b))))))
+       :timeout 120)
+      (is (= total (live-twin-count g))
+          "Expected ~D live twins; got ~D" total (live-twin-count g))
+      (is (= total (slot-idx-count g 'centroid *a-box*))
+          "centroid index over A: expected ~D; got ~D"
+          total (slot-idx-count g 'centroid *a-box*))
+      (is (= total (slot-idx-count g 'outline *b-box*))
+          "outline index over B: expected ~D; got ~D"
+          total (slot-idx-count g 'outline *b-box*))
+      (is (= 0 (slot-idx-count g 'centroid *b-box*))
+          "centroid index over B must be empty; got ~D"
+          (slot-idx-count g 'centroid *b-box*))
+      (is (= 0 (slot-idx-count g 'outline *a-box*))
+          "outline index over A must be empty; got ~D"
+          (slot-idx-count g 'outline *a-box*)))))
