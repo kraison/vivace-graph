@@ -493,6 +493,17 @@ not match established segment dimension ~D"
 ;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
 ;;; (query/dsl.lisp) is its DSL-level subclass.
 
+;;; #60 spec §4.4: what an UNNAMED spatial query does on a class with several
+;;; geometry slots.  :ERROR (default) signals QUERY-PRECONDITION-ERROR;
+;;; :FIRST-DECLARED tests the first declared slot and warns once per class.
+;;; A transition switch for consumers porting to :SLOT; removed in the next
+;;; major release after they have.  Defined here so every file binds the
+;;; same special (the GH #92 trap).
+(defvar *spatial-unnamed-slot-policy* :error
+  "How an unnamed spatial query resolves on a class with several geometry
+slots: :ERROR (default) or :FIRST-DECLARED (first declared slot, one warning
+per class).  Transitional (#60).")
+
 (define-condition query-precondition-error (error)
   ((reason :initarg :reason :reader query-precondition-error-reason))
   (:report (lambda (c s)

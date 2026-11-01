@@ -1294,83 +1294,6 @@ subclass must be dropped too when a SUPERCLASS gains or loses a geometry slot."
                       when (%geometry-slot-p slot)
                         collect (slot-definition-name slot)))))))
 
-(defparameter *node-geometry-multi-sample-limit* 64
-  "How many nodes of a class are checked for a SECOND geometry-valued indexed
-slot before the check is retired for that class.  Checking only the first node
-would miss a schema where a centroid is populated at creation and an extent is
-filled in later; checking always would cost a slot read per :INDEX slot -- scalars
-included, since NODE-GEOMETRY-INDEX-SLOTS returns them all -- on every spatial
-write forever.  AUDIT-SPATIAL-SLOTS is the exhaustive sweep.")
-
-(defvar *node-geometry-multi-sample-counts*
-  #+sbcl (make-hash-table :test 'eq :synchronized t)
-  #+ccl (make-hash-table :test 'eq :shared t)
-  #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
-  "CLASS -> nodes sampled so far, or :DONE once the check has fired or expired.")
-
-(defun node-geometry-slots-with-values (node)
-  "Every indexed slot of NODE that actually holds a geometry, in effective-slot
-order.  The first is the one NODE-GEOMETRY selects; any others are INERT."
-  (loop for slot in (node-geometry-index-slots (class-of node))
-        when (geometryp (ignore-errors (slot-value node slot)))
-          collect slot))
-
-(defun %maybe-warn-inert-geometry-slots (node)
-  "Warn once per class when a node carries more than one geometry-valued indexed
-slot: only the first is indexed, and the rest are silently inert.
-
-Deliberately NOT a finalization-time check.  NODE-GEOMETRY-INDEX-SLOTS refuses to
-compare the declared `:type geometry' symbol -- it is read in the *application's*
-package and is not reliably EQ to GRAPH-DB:GEOMETRY, and a user need not declare a
-type at all -- so which slots will hold geometry is unknowable until a node exists.
-Hence a value-based check, here on the maintenance path.
-
-Bounded, not permanent: *NODE-GEOMETRY-MULTI-SAMPLE-LIMIT* nodes per class, then
-the class is retired.  A class with ONE geometry slot and several indexed scalars
-is the ordinary case and stays silent -- :INDEX is also the general ordered-index
-option, so most of the slots this walks are not geometry at all.
-
-No lock: this runs on the spatial write path, and a diagnostic does not justify
-serializing it.  Two threads can both read SEEN before either writes, so the
-final store below re-reads the hash-table entry rather than trusting SEEN, and
-only ever writes something at least as large as what that re-read saw, never
-blindly SEEN.  Without that re-check, a descheduled thread could clobber a
-concurrently-set :DONE with a plain integer, or move the count backwards, on
-the strength of a SEEN it read long before it finally stored -- an arbitrarily
-wide window.  The re-read narrows that window to the gap between the re-read
-and the SETF a few lines below, which is real and worth having, but it does NOT
-close it: those two forms are still separate operations, not a single atomic
-compare-and-swap, so a thread can still be preempted between them.  Losing
-:DONE is still possible (A re-reads CUR=5, computes 6, is preempted; B warns
-and sets :DONE; A resumes and stores 6, un-retiring the class) and so is going
-backwards (A re-reads CUR=5, computes (MAX 4 5)=5, is preempted; B stores 6; A
-resumes and stores 5).  Both windows are now two hash-table operations wide
-instead of spanning the whole slot walk, which is the improvement this re-read
-actually buys; the count can also still under-count (two threads both reading
-SEEN=N and each computing N+1).  No lock or CAS closes the remaining window --
-there is no portable compare-and-swap on a hash-table entry across
-SBCL/CCL/ECL/LispWorks, and a diagnostic does not justify inventing one; the
-64-sample bound and the single warning are therefore best-effort, not
-guaranteed, under concurrent writers to the same class."
-  (let* ((class (class-of node))
-         (seen (gethash class *node-geometry-multi-sample-counts* 0)))
-    (unless (eq seen :done)
-      (let ((slots (node-geometry-slots-with-values node)))
-        (cond ((rest slots)
-               (setf (gethash class *node-geometry-multi-sample-counts*) :done)
-               (warn "~S declares ~D geometry-valued indexed slots ~S; only ~S is ~
-                      indexed and the rest are INERT.  Index under one slot, or ~
-                      run AUDIT-SPATIAL-SLOTS to review the whole graph."
-                     (class-name class) (length slots) slots (first slots)))
-              ((>= (1+ seen) *node-geometry-multi-sample-limit*)
-               (setf (gethash class *node-geometry-multi-sample-counts*) :done))
-              (t
-               (let ((cur (gethash class *node-geometry-multi-sample-counts* 0)))
-                 (unless (eq cur :done)
-                   (setf (gethash class *node-geometry-multi-sample-counts*)
-                         (max (1+ seen) (if (integerp cur) cur 0)))))))))))
-
 (defvar *node-vector-index-slot-cache*
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
@@ -1399,9 +1322,9 @@ indexed."
 *NODE-CLASS-CACHE-INVALIDATORS*, which handles the subclass walk."
   (remhash class *node-geometry-slot-cache*)
   (remhash class *node-vector-index-slot-cache*)
-  ;; Also the multi-geometry sampling state: its :DONE marker retires a class
-  ;; from sampling, and a redefined class deserves to be looked at afresh.
-  (remhash class *node-geometry-multi-sample-counts*))
+  (remhash class *node-geometry-method-owner-cache*)
+  ;; A redefined class gets its :FIRST-DECLARED warning again (#60).
+  (remhash class *spatial-first-declared-warned*))
 
 (pushnew '%invalidate-node-class-slot-caches *node-class-cache-invalidators*)
 
@@ -1430,35 +1353,104 @@ never a per-subclass one -- mirroring :UNIQUE / :INDEX exactly."
 
 (defgeneric node-geometry (node)
   (:documentation
-   "The GEOMETRY a node occupies and the slot it came from, as (values geometry
-slot-name), or (values nil nil).  By default the geometry is the value of the
-node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS); declaring
- (slot :type geometry :index t) is enough to make a node type spatially indexed.
-Applications may instead specialize this method (e.g. for a computed geometry);
-an explicit method takes precedence over the default.  A specializing method that
-returns only ONE value reports no slot: such a node is indexed under
- (METHOD-OWNER . NIL), where METHOD-OWNER is the most general class carrying an
-applicable method (see %NODE-GEOMETRY-METHOD-OWNER-NAME), so the class is still
-scopeable by name exactly as a declared :INDEX slot is.
+   "ONE geometry of NODE and the slot it came from, as (values geometry
+slot-name), or (values nil nil).  The single-geometry convenience and the
+extension point: an application method (e.g. a computed geometry) is the
+authority for its class, and NODE-GEOMETRIES yields its one geometry per node.
+A one-value method reports no slot and keys the node (METHOD-OWNER . NIL); a
+two-value method naming a declared geometry slot keys it (CLASS . SLOT).
 
-CAVEAT for a two-value method: if a specializing method returns (values geom
-slot-name), the node is indexed under (CLASS . SLOT-NAME) -- but a class scope
-resolves through NODE-GEOMETRY-INDEX-SLOTS, i.e. the :INDEX-marked slots only, so
-if SLOT-NAME names a slot that is NOT declared :INDEX, no class scope will
-enumerate that key and the node is reachable ONLY via the :ALL scope.  Return the
-declared :INDEX slot's name (or one value) to keep the node scopeable by class.")
+By default the geometry is the class's UNNAMED resolution
+ (%UNNAMED-SPATIAL-SLOT): its one declared geometry slot, or, with several,
+what *SPATIAL-UNNAMED-SLOT-POLICY* says -- so this signals on a multi-slot
+class under :ERROR exactly as an unnamed query does.  Engine maintenance reads
+NODE-GEOMETRIES, never this (#60, spec §5.1).")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
-    ;; NB: do NOT gate on SLOT-BOUNDP -- node-class persistent slots are read
-    ;; through SLOT-VALUE-USING-CLASS from the serialized buffer, and
-    ;; SLOT-BOUNDP reports the (always-unbound) backing CLOS slot, so it would
-    ;; skip every persistent slot.  Read the value and test it directly.
-    ;; Returns (values GEOMETRY SLOT-NAME): the slot is what selects the node's
-    ;; spatial index, and it is chosen PER NODE, so two instances of one class
-    ;; can legitimately land in different indexes when different slots are bound.
-    (loop for slot in (node-geometry-index-slots (class-of node))
-          for v = (ignore-errors (slot-value node slot))
-          when (geometryp v) return (values v slot))))
+    (let ((class (class-of node)))
+      (if (node-geometry-index-slots class)
+          (let ((slot (%unnamed-spatial-slot class)))
+            (values (node-slot-geometry node slot) slot))
+          (values nil nil)))))
+
+(defgeneric node-geometries (node)
+  (:documentation
+   "Every geometry NODE occupies, as a list of (SLOT-NAME . GEOMETRY) in
+effective-slot order -- what the write path, the rebuilds and the query refine
+read (#60, spec §5.1).  By default one entry per declared geometry slot
+ (NODE-GEOMETRY-INDEX-SLOTS) that holds a geometry.  A class with an
+application-supplied NODE-GEOMETRY method yields that method's single geometry
+instead, under the slot it named or NIL: the method is the authority for its
+class.  Specialize this directly for a computed plural geometry.")
+  (:method (node) (declare (ignore node)) nil)
+  (:method ((node node))
+    (let ((class (class-of node)))
+      (if (%node-geometry-method-owner-name class)
+          (multiple-value-bind (geom slot) (node-geometry node)
+            (when geom (list (cons slot geom))))
+          ;; NB: no SLOT-BOUNDP -- persistent slots read through
+          ;; SLOT-VALUE-USING-CLASS; the backing CLOS slot is always unbound.
+          (loop for slot in (node-geometry-index-slots class)
+                for v = (ignore-errors (slot-value node slot))
+                when (geometryp v) collect (cons slot v))))))
+
+(defun node-slot-geometry (node slot-name)
+  "The geometry NODE holds under SLOT-NAME per NODE-GEOMETRIES, or NIL.  A NIL
+SLOT-NAME is the geometry of an application NODE-GEOMETRY method that names no
+slot."
+  (cdr (assoc slot-name (node-geometries node))))
+
+(defvar *spatial-first-declared-warned*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "CLASS -> T once the :FIRST-DECLARED warning fired for it in this image.")
+
+(defun %warn-first-declared-once (class slot)
+  (unless (gethash class *spatial-first-declared-warned*)
+    (setf (gethash class *spatial-first-declared-warned*) t)
+    (warn "~S has several geometry slots; an unnamed spatial query resolved ~
+to ~S under the FIRST-DECLARED policy.  Name the slot with :SLOT (#60)."
+          (class-name class) slot)))
+
+(defun %multi-geometry-slot-class-p (class)
+  "True when CLASS declares more than one geometry slot and has no application
+NODE-GEOMETRY method (#60, spec §5.3)."
+  (and (null (%node-geometry-method-owner-name class))
+       (rest (node-geometry-index-slots class))
+       t))
+
+(defun %unnamed-spatial-slot (class)
+  "The geometry slot an unnamed spatial query tests on CLASS (which has no
+application NODE-GEOMETRY method): its one declared geometry slot, or, with
+several, what *SPATIAL-UNNAMED-SLOT-POLICY* says -- :ERROR signals
+QUERY-PRECONDITION-ERROR, :FIRST-DECLARED warns once per class and picks the
+first (#60, spec §4.4, §5.3)."
+  (let ((slots (node-geometry-index-slots class)))
+    (cond ((null slots)
+           (error "~S declares no geometry slot." (class-name class)))
+          ((null (rest slots)) (first slots))
+          ((eq *spatial-unnamed-slot-policy* :first-declared)
+           (%warn-first-declared-once class (first slots))
+           (first slots))
+          (t (error 'query-precondition-error
+                    :reason (format nil "~S has ~D geometry slots ~S: name ~
+the one to test with :SLOT, or bind *SPATIAL-UNNAMED-SLOT-POLICY* to ~
+:FIRST-DECLARED." (class-name class) (length slots) slots))))))
+
+(defvar *node-geometry-method-owner-cache*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "CLASS -> its %NODE-GEOMETRY-METHOD-OWNER-NAME (NIL included).  Invalidated
+with the other slot caches; a NODE-GEOMETRY method defined after a class's
+nodes were written has the same exposure the CAVEAT below describes.")
 
 (defun %node-geometry-method-owner-name (class)
   "The most general class carrying an applicable application-supplied
@@ -1491,14 +1483,19 @@ NODE-GEOMETRY methods for a hierarchy before writing its nodes; if one is added
 later, REBUILD-SPATIAL-INDEXES re-derives every key from scratch.  This is the same
 exposure an :INDEX slot has under class redefinition -- consistent with existing
 engine behaviour, not a new risk introduced by the method-owner key."
-  (let ((owner nil))
-    (dolist (m (generic-function-methods #'node-geometry) owner)
-      (let ((spec (first (method-specializers m))))
-        (when (and (typep spec 'class)
-                   (not (member (class-name spec) '(t node)))
-                   (subtypep (class-name class) (class-name spec))
-                   (or (null owner) (subtypep owner (class-name spec))))
-          (setf owner (class-name spec)))))))
+  (multiple-value-bind (val present)
+      (gethash class *node-geometry-method-owner-cache*)
+    (when present (return-from %node-geometry-method-owner-name val)))
+  (setf (gethash class *node-geometry-method-owner-cache*)
+        (let ((owner nil))
+          (dolist (m (generic-function-methods #'node-geometry) owner)
+            (let ((spec (first (method-specializers m))))
+              (when (and (typep spec 'class)
+                         (not (member (class-name spec) '(t node)))
+                         (subtypep (class-name class) (class-name spec))
+                         (or (null owner)
+                             (subtypep owner (class-name spec))))
+                (setf owner (class-name spec))))))))
 
 (defun %node-spatial-owner-name (class slot-name)
   "The owner half of the (OWNER . SLOT) key CLASS's geometry is indexed under.
@@ -1532,29 +1529,15 @@ spatial-index.lisp, which loads before VERTEX and EDGE."
   (%spatial-type-tag (type-id node) (typep node 'edge)))
 
 (defun %spatial-index-node (graph node)
-  "Insert NODE into the index its geometry slot selects.  No-op without geometry.
+  "Insert NODE into the index of each of its geometries (NODE-GEOMETRIES, #60).
 
 A node whose geometry came from a declared :INDEX slot is keyed by (OWNER . SLOT);
 one reported by an application's own NODE-GEOMETRY method has no slot and is keyed
 by (METHOD-OWNER . NIL).  Both go through %NODE-SPATIAL-OWNER-NAME, which is also
 what %SPATIAL-UNINDEX-NODE uses -- the two must agree exactly or a remove would
 miss the entry the insert wrote."
-  (multiple-value-bind (geom slot) (node-geometry node)
-    (when (and geom (not (deleted-p node)))
-      ;; §8: a class declaring two geometry slots indexes only the first, and the
-      ;; rest are silently inert.  Sampled here, on the one path every geometry
-      ;; write goes through; bounded per class, so it costs nothing after a class
-      ;; has been seen.  Before the insert, so the diagnostic still reaches an
-      ;; operator whose insert then fails.
-      ;;
-      ;; Only when SLOT is non-NIL: a NIL slot means this geometry came from an
-      ;; application's own NODE-GEOMETRY method (the documented workaround for
-      ;; wanting more than one geometry-valued input -- e.g. combining two
-      ;; indexed slots into one geometry), not from the "first indexed slot
-      ;; wins" default.  The multi-slot rule does not apply there at all, so
-      ;; warning would be a false positive against the very workaround the
-      ;; warning's own message recommends.
-      (when slot (%maybe-warn-inert-geometry-slots node))
+  (unless (deleted-p node)
+    (loop for (slot . geom) in (node-geometries node) do
       (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (%spatial-index-for graph owner slot))
              (before (spatial-index-coarsest-precision idx)))
@@ -1589,11 +1572,11 @@ miss the entry the insert wrote."
                     (id node) mnl mnt mxl mxt after owner slot))))))))
 
 (defun %spatial-unindex-node (graph node)
-  "Remove NODE from the index its geometry slot selects.  No-op without geometry,
-and no-op when that index does not exist (nothing was ever written).  Resolves the
+  "Remove NODE from the index of each of its geometries (NODE-GEOMETRIES, #60);
+no-op for an index that does not exist (nothing was ever written).  Resolves the
 owner through %NODE-SPATIAL-OWNER-NAME, exactly as %SPATIAL-INDEX-NODE does."
-  (multiple-value-bind (geom slot) (node-geometry node)
-    (when geom
+  (dolist (pair (node-geometries node))
+    (destructuring-bind (slot . geom) pair
       (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (spatial-index-for graph owner slot)))
         (when idx

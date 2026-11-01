@@ -661,18 +661,15 @@
            #:rebuild-spatial-indexes
            #:regenerate-spatial-index
            #:regenerate-spatial-indexes
-           ;; §8: the inert second geometry slot.  Only the FIRST geometry-valued
-           ;; :INDEX slot of a class is ever indexed; AUDIT-SPATIAL-SLOTS is the
-           ;; exhaustive read-only sweep for the rest, and
-           ;; NODE-GEOMETRY-SLOTS-WITH-VALUES is the per-node predicate behind it.
-           #:audit-spatial-slots
-           #:node-geometry-slots-with-values
            ;; declaring a spatial index's grid precision: the reader for the
            ;; (slot :spatial-precision N) slot option, its one declaration surface
            #:spatial-precision-spec
            #:install-spatial-indexes
-           ;; write-path protocol (applications specialize this)
+           ;; write-path protocol (applications specialize these, #60)
            #:node-geometry
+           #:node-geometries
+           #:node-slot-geometry
+           #:*spatial-unnamed-slot-policy*
            ;; subset replication (field devices)
            #:replication-filter
            #:make-spatial-replication-filter
