@@ -67,13 +67,12 @@ CURRENT geometry.  No window pre-filter: the body's exact predicate is
 the truth, and the write set is small."
   (loop for n in (overlay-live-nodes ov)
         when (and (%scope-admits-p n types)
-                  (multiple-value-bind (geom slot) (node-geometry n)
-                    (and geom
+                  (let ((own (%node-spatial-keys n)))
+                    (and own
                          (or (eq keys :all)
-                             (member (cons (%node-spatial-owner-name
-                                            (class-of n) slot)
-                                           slot)
-                                     keys :test #'equalp)))))
+                             (some (lambda (entry)
+                                     (member (car entry) keys :test #'equalp))
+                                   own)))))
           collect n))
 
 (defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius (guard t))
@@ -373,13 +372,12 @@ full rebuild on every subsequent open until something happened to save it comple
       (save-spatial-index-roots graph :complete nil)
       (flet ((reindex (node)
                (unless (deleted-p node)
-                 (multiple-value-bind (geom slot) (node-geometry node)
-                   (when geom
-                     (spatial-index-insert
-                      (%spatial-index-for
-                       graph (%node-spatial-owner-name (class-of node) slot) slot)
-                      (id node) geom (%node-spatial-type-tag node))
-                     (incf count))))))
+                 ;; One insert per geometry (#60): COUNT counts inserts.
+                 (loop for ((owner . slot) . geom) in (%node-spatial-keys node)
+                       do (spatial-index-insert
+                           (%spatial-index-for graph owner slot)
+                           (id node) geom (%node-spatial-type-tag node))
+                          (incf count)))))
         (map-vertices #'reindex graph)
         (map-edges #'reindex graph))
       (report-degraded-spatial-indexes graph)
@@ -437,10 +435,10 @@ has no per-index completeness granularity -- but it is the safe direction."
       (let ((count 0))
         (flet ((reindex (node)
                  (unless (deleted-p node)
-                   (multiple-value-bind (geom slot) (node-geometry node)
-                     (when (and geom (eq slot slot-name)
-                                (eq (%node-spatial-owner-name (class-of node) slot)
-                                    owner-name))
+                   ;; Only the geometry keyed (OWNER-NAME . SLOT-NAME) (#60).
+                   (let ((geom (cdr (assoc key (%node-spatial-keys node)
+                                           :test #'equalp))))
+                     (when geom
                        (spatial-index-insert
                         (%spatial-index-for graph owner-name slot-name)
                         (id node) geom (%node-spatial-type-tag node))

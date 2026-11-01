@@ -1528,6 +1528,16 @@ the pathological case of a slotless geometry with no class-specialized method
 spatial-index.lisp, which loads before VERTEX and EDGE."
   (%spatial-type-tag (type-id node) (typep node 'edge)))
 
+(defun %node-spatial-keys (node)
+  "NODE's spatial index memberships: a list of ((OWNER . SLOT) . GEOMETRY), one
+per NODE-GEOMETRIES pair, the owner from %NODE-SPATIAL-OWNER-NAME.  Every
+maintenance path -- insert, remove, rebuild, regenerate, the memory-graph
+rebuilds, the overlay -- iterates this (#60, spec §5.2)."
+  (let ((class (class-of node)))
+    (loop for (slot . geom) in (node-geometries node)
+          collect (cons (cons (%node-spatial-owner-name class slot) slot)
+                        geom))))
+
 (defun %spatial-index-node (graph node)
   "Insert NODE into the index of each of its geometries (NODE-GEOMETRIES, #60).
 

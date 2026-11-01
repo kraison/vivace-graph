@@ -823,13 +823,12 @@ only that fraction -- fault-on-access survives for everything else."
                                (mem-materialize table (car e) raw))
                              raw)))
               (when (and node (not (deleted-p node)))
-                (multiple-value-bind (geom slot) (node-geometry node)
-                  (when geom
-                    (spatial-index-insert
-                     (%spatial-index-for
-                      graph (%node-spatial-owner-name (class-of node) slot) slot)
-                     (id node) geom (%node-spatial-type-tag node))
-                    (incf count)))))))))))
+                ;; One insert per geometry (#60).
+                (loop for ((owner . slot) . geom) in (%node-spatial-keys node)
+                      do (spatial-index-insert
+                          (%spatial-index-for graph owner slot)
+                          (id node) geom (%node-spatial-type-tag node))
+                         (incf count))))))))))
 
 (defun restore-memory-image-native (graph file)
   "Restore a VG-native image, v5 or v6.  When GRAPH is LAZY, node tables receive
@@ -945,12 +944,10 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
     (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))
     (flet ((reindex (n)
              (unless (deleted-p n)
-               (multiple-value-bind (geom slot) (node-geometry n)
-                 (when geom
-                   (spatial-index-insert
-                    (%spatial-index-for
-                     graph (%node-spatial-owner-name (class-of n) slot) slot)
-                    (id n) geom (%node-spatial-type-tag n)))))))
+               (loop for ((owner . slot) . geom) in (%node-spatial-keys n)
+                     do (spatial-index-insert
+                         (%spatial-index-for graph owner slot)
+                         (id n) geom (%node-spatial-type-tag n))))))
       (dolist (v vertices) (reindex v))
       (dolist (e edges)    (reindex e)))))
 
