@@ -3266,7 +3266,7 @@ To put a node type on the map, give it a geometry slot and mark that slot ~:inde
                       :note "sighting near the river"))
 #+END_SRC
 
-Under the hood, indexing goes through the ~node-geometry~ generic function, which returns the geometry a node occupies (or ~nil~ — the default — for a node with no location). The ~:index t~ flag wires this up for you: ~node-geometry~'s default method returns the value of the node's indexed geometry slot. You only need to write a ~node-geometry~ method yourself for a *computed* geometry (e.g. derived from several slots, or fetched from a related node); an explicit method takes precedence over the default.
+Under the hood, indexing goes through the ~node-geometries~ generic function, which returns every geometry a node occupies as a list of ~(slot-name . geometry)~ — by default one entry per declared geometry slot that holds a value, so a node with two geometry slots is in two indexes (#60). A /geometry slot/ is an ~:index t~ slot whose declared type is ~geometry~ (or an ~(or null geometry)~-style union naming it); the declaration, not the value, decides. ~node-geometry~ is the single-geometry convenience and the extension point: write a method yourself only for a *computed* geometry (e.g. derived from several slots, or fetched from a related node). An explicit method is the authority for its class — ~node-geometries~ yields its one geometry — and it may ~call-next-method~ to fall back to the declared slot.
 
 #+BEGIN_SRC lisp
   ;; Equivalent to the :index t form above, and the escape hatch for a
@@ -3279,7 +3279,7 @@ Under the hood, indexing goes through the ~node-geometry~ generic function, whic
 
 - A geometry slot declared on a *mixin* gives all of that mixin's subclasses /one shared/ index — the index is owned by the class that /declares/ the slot, not by each subclass. Sibling subclasses are then kept apart at query time by the scope's type filter, not by storage — and that filter runs /inside/ the index scan, so sharing an index costs a scoped query nothing. A class that declares its own geometry slot (no mixin) gets an index to itself.
 - Indexes are created *lazily*, on the first geometry-valued write for that class+slot — not by ~make-graph~. A slot marked ~:index t~ that never actually holds a geometry creates no index at all, and a query scoped to it simply returns ~nil~. Each index lives in the graph's index region (~indexes.dat~) and is reopened automatically by ~open-graph~; you never manage it directly.
-- *Known limitation — scoping to a parent does not reach a subclass's /own/ extra index.* A scope resolves the /named/ class's geometry slots, but the result type-filter admits subclasses. So if a subclass declares an /additional/ geometry slot of its own, ~(find-nodes-within 'parent …)~ will not scan that subclass-declared index, even though a node stored in it is a ~parent~ by ~typep~. Scope to the exact subclass (or use ~:all~) to reach it. This is not data loss — the node is indexed and findable — only the parent scope misses it; it is folded into the "index a node under every geometry slot" work (GitHub #60), where the multi-index semantics are solved once.
+- *A scope is subclass-inclusive.* Scoping to a parent reaches every finalized subclass, including an /additional/ geometry slot a subclass declares on its own: ~(find-nodes-within 'parent area :slot 'extra)~ scans the subclass's index for ~extra~ and skips the classes that lack that slot (#60).
 
 Here is a second spatial type, so the query examples below have two classes to scope across. Because ~sensor~ declares its own geometry slot, it gets its own index, independent of ~observation~'s:
 
@@ -3300,7 +3300,22 @@ Here is a second spatial type, so the query examples below have two classes to s
 #+END_SRC
 
 
-*One geometry slot per node is indexed.* A node is indexed by the /first/ geometry-valued indexed slot ~node-geometry~ finds; a second geometry-valued indexed slot on the same class is silently /inert/. Because the effective geometry is decided by value at write time (the ~:type geometry~ declaration cannot be compared reliably across application packages), VivaceGraph reports this by value rather than by declaration: a class whose nodes bind two geometry slots triggers a ~warn~ on the write path — naming the class, the geometry slots found, and which one wins — sampled over the class's first 64 nodes, so it costs nothing steady-state. ~audit-spatial-slots~ (graph) is the exhaustive, read-only counterpart: it sweeps every live node and reports every such class with its winning and inert slots — the thing to run after a migration or wire into a schema test suite.
+*Several geometry slots on one class, and the slot a query names.* A class may declare several geometry slots — a centroid and an outline, say — and a node is indexed under every one it binds. A query then names the geometry it tests with ~:slot~ (#60):
+
+#+BEGIN_SRC lisp
+  (def-vertex district ()
+    ((centroid :type geometry :index t)
+     (outline  :type geometry :index t :spatial-precision 5))
+    :sensor-app)
+
+  ;; Districts whose CENTROID lies inside AREA, and whose OUTLINE overlaps it:
+  (find-nodes-within 'district area :slot 'centroid)
+  (find-nodes-intersecting 'district area :slot 'outline)
+  ;; The distance reported is to the named slot's geometry.
+  (find-nodes-near 'district 45.67 12.34 5000.0 :slot 'centroid)
+#+END_SRC
+
+A class with /one/ geometry slot behaves as before, with or without ~:slot~. An *unnamed query on a multi-slot class signals* ~query-precondition-error~: it never unions the slots and never picks one silently. ~*spatial-unnamed-slot-policy*~ is the transition switch for a consumer porting its call sites: ~:error~ (the default) or ~:first-declared~, which answers an unnamed query from the first declared slot and warns once per class. The switch is removed in the next major release; port the call sites, do not depend on it. Naming a slot the scope's classes do not declare signals in every spelling (~'nothing~, ~:centroid~, ~"centroid"~).
 
 *** Querying
 
@@ -3324,7 +3339,13 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
   ;; :all scans every index in the graph.
   (find-nodes-within '(observation sensor) my-region)
   (find-nodes-within :all my-region)
+
+  ;; A class with several geometry slots: name the one the query tests.
+  (find-nodes-within 'district my-region :slot 'centroid)
+  (find-nodes-within :all my-region :slot 'outline)   ; classes without OUTLINE are skipped
 #+END_SRC
+
+Every query takes ~:slot~; it is required on a class with several geometry slots and optional on one with a single slot (see "Making a node type spatial" for the unnamed rule and the transition switch). An unnamed ~:all~ signals as soon as any class in the type registry has several geometry slots.
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
 
@@ -3352,13 +3373,17 @@ band, never the whole globe. The candidates are then refined with
   ;; All observations inside a region geometry bound to ?area:
   (select-flat (?o)
     (find-within ?o observation ?area))
+
+  ;; A multi-slot class names its slot in third position:
+  (select-flat (?d)
+    (find-within ?d district centroid ?area))
 #+END_SRC
 
-~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
+~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The slot-naming arities put the slot right after the scope: ~find-near/6~ and ~find-nearest/6~ take ~?node scope slot lat lon …~, ~find-within/4~ and ~find-intersects/4~ take ~?node scope slot area~; the old arities remain and resolve the slot as an unnamed Lisp query does (#60). The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
 
 *** Under the hood, and a few caveats
 
-- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v5) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
+- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v6; v5 and earlier indexed a node once) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
 - *A bounded insert, self-healed at query time.* To stop a huge polygon from covering an astronomical number of fine cells, an insert caps its cover (16384 cells per index) and, when it must, stores that geometry more coarsely. The coarsening is made safe by the same /filter then refine/ contract: each index remembers the coarsest precision it actually holds and a query never covers finer than that, so a coarsely-stored country-scale polygon is still found (then refined exactly). Deleting the oversized geometry lets the finer selectivity return on its own, with no rebuild. Per-index precision (above) is the real control; the cap and clamp are a safety net for data that does not match the grid. The cap bounds a /whole geometry's/ cover: a multipolygon is covered part by part (so the gaps between separated parts are not indexed) but at one precision — the finest whose total fits — so a small island in a large boundary keeps full precision rather than dragging the index's clamp down with it (GH #103).
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *A bounded query window.* A radius query's window is clamped to the
@@ -3393,7 +3418,7 @@ band, never the whole globe. The candidates are then refined with
 
 A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its own region, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
 
-~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when its geometry lies in the area:
+~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when /any/ of its geometries lies in the area — a district whose centroid is outside but whose outline reaches in still ships (#60). Each geometry is judged by its representative point, so an extended geometry's test is as coarse as the refine layer's:
 
 #+BEGIN_SRC lisp
   (make-graph :ops-app "/data/field-laptop/"
@@ -6387,9 +6412,13 @@ facet:
                  :rule-version <string>      ; bumped when the rule changes
                  :precision-fn <fname-or-nil>
                  :confidence-fn <fname-or-nil>
-                 :method-fn <fname-or-nil>)
+                 :method-fn <fname-or-nil>
+                 :registry-slot <slot-name>      ; optional (#60)
+                 :geometry-fn <fname>)           ; optional (#60)
     | :none
 #+END_SRC
+
+~:registry-slot~ and ~:geometry-fn~ are optional and may be omitted. When a registry class declares several geometry slots, ~:registry-slot~ names the one the scan tests and measures — it is ~register-geometry~'s ~:slot~, and an unnamed scan of such a registry signals exactly as an unnamed spatial query does. When the /source/ itself has several geometries, ~:geometry-fn~ names the function of the record that returns the one to register; without it ~register-node~ uses ~node-geometry~. Present, each must be a non-keyword symbol.
 
 ~:precision-fn~, ~:confidence-fn~ and ~:method-fn~ are required KEYS
 whose VALUE may be ~nil~ — a source with no per-record measure of any
@@ -7028,8 +7057,17 @@ This chapter provides a categorized reference for the most important exported sy
 - ~geometry-area (g)~ ::
   Area in SQUARED COORDINATE UNITS (squared degrees for lon/lat, not m²). Requires ~graph-db/geos~. ~geometry-geodesic-area (g)~ / ~geometry-geodesic-length (g)~ are the metric, GEOS-free alternatives — square metres and metres respectively; see "Area and length" above.
 
+- ~node-geometries (node)~ ::
+  Generic function returning every geometry a node occupies, as a list of ~(slot-name . geometry)~ in slot order — by default one entry per declared geometry slot holding a value. The write path, the rebuilds and the query refine read this, so a node with two bound geometry slots is in two indexes (#60). A class with an application ~node-geometry~ method yields that method's one geometry. Specialize it directly for a computed /plural/ geometry.
+
+- ~node-slot-geometry (node slot-name)~ ::
+  The geometry ~node~ holds under ~slot-name~ per ~node-geometries~, or ~nil~.
+
 - ~node-geometry (node)~ ::
-  Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
+  Generic function returning /one/ geometry and the slot it came from, as ~(values geometry slot-name)~ — the class's unnamed resolution: its one geometry slot, or what ~*spatial-unnamed-slot-policy*~ says when there are several (so it signals on a multi-slot class under ~:error~). Specialize it for a *computed* geometry: such a method is the authority for its class (it reports no slot, and its class is indexed — and scoped — under the most general class carrying the method), and it may ~call-next-method~.
+
+- ~*spatial-unnamed-slot-policy*~ ::
+  ~:error~ (default) or ~:first-declared~: what an unnamed query, ~node-geometry~ or Prolog goal does on a class with several geometry slots. A transition switch, removed in the next major release.
 
 - ~(slot :type geometry :index t :spatial-precision N :spatial-max-cells M)~ (slot options) ::
   ~:index t~ opts a geometry slot into spatial indexing; optional
@@ -7040,19 +7078,22 @@ This chapter provides a categorized reference for the most important exported sy
 
 
 - *scope* (first argument to every query below) ::
-  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
+  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type; a named class brings its finalized subclasses. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
 
-- ~find-nodes-near (scope lat lon radius &key graph)~ ::
+- ~:slot~ (keyword on every query below) ::
+  The geometry slot the query tests, and the one a near query measures the distance to. Required on a class with several geometry slots, optional on one with a single slot; a slot the scope does not declare signals, and under ~:all~ classes lacking it are skipped (#60).
+
+- ~find-nodes-near (scope lat lon radius &key graph slot)~ ::
   Live nodes in ~scope~ within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
 
-- ~find-nearest-k (scope lat lon k &key graph max-radius)~ ::
+- ~find-nearest-k (scope lat lon k &key graph max-radius slot)~ ::
   The ~k~ nearest live nodes in ~scope~ to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
 
-- ~find-nodes-within (scope area &key graph)~ / ~find-nodes-intersecting (scope area &key graph)~ ::
-  Live nodes in ~scope~ whose location lies inside — respectively, overlaps — the ~area~ geometry.
+- ~find-nodes-within (scope area &key graph slot)~ / ~find-nodes-intersecting (scope area &key graph slot)~ ::
+  Live nodes in ~scope~ whose named geometry lies inside — respectively, overlaps — the ~area~ geometry.
 
 - ~(find-near ?node scope lat lon radius)~ / ~(find-nearest ?node scope lat lon k)~ / ~(find-within ?node scope area)~ / ~(find-intersects ?node scope area)~ ::
-  Prolog functors that yield matching nodes, composable with the rest of a query.
+  Prolog functors that yield matching nodes, composable with the rest of a query. Each has a slot-naming arity with the slot after the scope: ~find-near/6~, ~find-nearest/6~, ~find-within/4~, ~find-intersects/4~ (#60).
 
 - ~geohash-neighbor (cell dlon dlat)~ / ~geohash-neighbors (cell)~ ::
   Grid helpers: the cell ~dlon~/~dlat~ steps away (wraps the antimeridian, ~nil~ off a pole), and the 8 same-precision cells surrounding ~cell~.
@@ -7064,8 +7105,8 @@ This chapter provides a categorized reference for the most important exported sy
   ~spatial-index-precision-counts~, ~spatial-index-coarsest-precision~.
 
 - ~rebuild-spatial-indexes (graph)~ ::
-  Rebuild /every/ spatial index from scratch by scanning every live node with a
-  ~node-geometry~ and routing it into the ~(owner . slot)~ index its geometry slot
+  Rebuild /every/ spatial index from scratch by scanning every live node's
+  ~node-geometries~ and routing each into the ~(owner . slot)~ index its slot
   selects. Adopts the per-class scheme on a graph that predates it, or repairs.
   Run when the graph is quiescent (like ~regenerate-view~). Returns the number of
   nodes indexed.
@@ -7087,16 +7128,11 @@ This chapter provides a categorized reference for the most important exported sy
   ~:spatial-precision~ its slot option now declares. Creates nothing — indexes are
   still created lazily, at the first geometry-valued write.
 
-- ~audit-spatial-slots (graph)~ ::
-  Read-only exhaustive sweep: reports each class carrying more than one
-  geometry-valued indexed slot — as ~(class winning-slot . inert-slots)~. The
-  counterpart to the write-path inert-slot warning (see "Making a node type
-  spatial"); wire it into a schema test suite or run it after a migration.
-
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /
-  ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes inside
-  ~area~, so it holds only its own region. See "Subset replication" above.
+  ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes any of
+  whose geometries lies inside ~area~, so it holds only its own region. See
+  "Subset replication" above.
 
 **** REST API
 - ~start-rest ( &optional port)~ ::

@@ -11,6 +11,72 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+This section carries a **MAJOR** change: the spatial contract and two
+storage formats (#60).
+
+### Changed
+
+- **A node is indexed under every declared geometry slot, and a spatial
+  query names the slot it tests** (#60). `find-nodes-near`,
+  `find-nearest-k`, `find-nodes-within` and `find-nodes-intersecting`
+  take `:slot`; the distance a near query reports is to that slot's
+  geometry, and a scope is subclass-inclusive (a parent scope reaches a
+  subclass's own slot by name). A class with one geometry slot behaves as
+  before, named or not. An **unnamed query on a class with several
+  geometry slots signals `query-precondition-error`**; it never unions
+  the slots and never picks one silently.
+- **`*spatial-unnamed-slot-policy*`** is the transition switch: `:error`
+  (the default) or `:first-declared`, which answers an unnamed query from
+  the first declared slot and warns once per class. It exists so a
+  consumer can port call site by call site; **it is removed in the next
+  major release**, tracked by its own issue.
+- **A geometry slot is identified by its declared type** — `geometry`, or
+  an `(or null geometry)`-style union naming it — not by the value it
+  happens to hold. An untyped `:index t` slot that held geometries was
+  spatial by accident; it is a plain secondary index now.
+- Under `:first-declared`, a node whose first declared geometry slot is
+  `nil` is not found by an unnamed query, where the old write-path rule
+  ("the first slot with a value") would have found it under its second
+  slot. Name the slot.
+- **Sidecar format 6 and memory image v9**: the spatial registry and
+  both memory-graph image formats re-derive every index once at the first
+  open after upgrading, so a node with two bound geometry slots moves from
+  one index into two. Older files are read; nothing is written back in
+  the old formats.
+- The spacetime `:registration` facet accepts `:registry-slot` and
+  `:geometry-fn`, and `register-geometry` takes `:slot`, so a source
+  says which of a registry's geometries it registers against and which of
+  its own geometries it registers.
+
+### Removed
+
+- `audit-spatial-slots`, `node-geometry-slots-with-values`,
+  `*node-geometry-multi-sample-limit*` and the write-path "inert slot"
+  warning: there is no inert slot any more.
+
+### Added
+
+- `node-geometries` (every `(slot . geometry)` a node occupies) and
+  `node-slot-geometry`; an application `node-geometry` method stays the
+  authority for its class and may `call-next-method`.
+- Prolog `find-within/4`, `find-intersects/4`, `find-near/6` and
+  `find-nearest/6`, the slot in third position; the old arities remain
+  and resolve unnamed.
+
+**Re-check list for a consumer's port** (do these before setting the
+policy back to `:error`):
+
+1. Every spatial call site on a class with several geometry slots names
+   its `:slot`, in Lisp and in Prolog.
+2. Every `node-geometry` method written only to choose between indexed
+   slots is deleted; the slot name on the query replaces it.
+3. Every registration source on a multi-slot registry says which geometry
+   it registers against (`:registry-slot`) and, when the source itself has
+   several, which one it registers (`:geometry-fn`).
+4. Schema tests that called `audit-spatial-slots` are dropped.
+5. Reopen each store once with time for the re-derivation; a large graph
+   rebuilds every spatial index at that open.
+
 ## [4.1.0] - 2026-10-31
 
 ### Added
