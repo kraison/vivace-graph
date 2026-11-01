@@ -1317,6 +1317,26 @@ indexed."
                       when (vector-index-p slot)
                         collect (slot-definition-name slot)))))))
 
+(defvar *spatial-first-declared-warned*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "CLASS -> T once the :FIRST-DECLARED warning fired for it in this image.")
+
+(defvar *node-geometry-method-owner-cache*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "CLASS -> its %NODE-GEOMETRY-METHOD-OWNER-NAME (NIL included).  Invalidated
+with the other slot caches; a NODE-GEOMETRY method defined after a class's
+nodes were written has the same exposure the CAVEAT below describes.")
+
 (defun %invalidate-node-class-slot-caches (class)
   "Drop CLASS's memoized CLASS-SLOTS-derived answers.  Registered on
 *NODE-CLASS-CACHE-INVALIDATORS*, which handles the subclass walk."
@@ -1327,6 +1347,11 @@ indexed."
   (remhash class *spatial-first-declared-warned*))
 
 (pushnew '%invalidate-node-class-slot-caches *node-class-cache-invalidators*)
+
+(defun %forget-node-geometry-method-owners ()
+  "Drop the NODE-GEOMETRY method-owner memo for every class; the rebuilds call
+it through %FORGET-SPATIAL-CLASS-MEMOS (#60)."
+  (clrhash *node-geometry-method-owner-cache*))
 
 (defun %vector-index-slot-owner-name (class slot-name)
   "The most-general node-class in CLASS's precedence list that declares SLOT-NAME
@@ -1409,15 +1434,6 @@ SLOT-NAME is the geometry of an application NODE-GEOMETRY method that names no
 slot."
   (cdr (assoc slot-name (node-geometries node))))
 
-(defvar *spatial-first-declared-warned*
-  #+sbcl (make-hash-table :test 'eq :synchronized t)
-  #+ccl (make-hash-table :test 'eq :shared t)
-  #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq
-                         #+graph-db-ecl-sync-hash :synchronized
-                         #+graph-db-ecl-sync-hash t)
-  "CLASS -> T once the :FIRST-DECLARED warning fired for it in this image.")
-
 (defun %warn-first-declared-once (class slot)
   (unless (gethash class *spatial-first-declared-warned*)
     (setf (gethash class *spatial-first-declared-warned*) t)
@@ -1450,17 +1466,6 @@ first (#60, spec §4.4, §5.3)."
 the one to test with :SLOT, or bind *SPATIAL-UNNAMED-SLOT-POLICY* to ~
 :FIRST-DECLARED." (class-name class) (length slots) slots))))))
 
-(defvar *node-geometry-method-owner-cache*
-  #+sbcl (make-hash-table :test 'eq :synchronized t)
-  #+ccl (make-hash-table :test 'eq :shared t)
-  #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq
-                         #+graph-db-ecl-sync-hash :synchronized
-                         #+graph-db-ecl-sync-hash t)
-  "CLASS -> its %NODE-GEOMETRY-METHOD-OWNER-NAME (NIL included).  Invalidated
-with the other slot caches; a NODE-GEOMETRY method defined after a class's
-nodes were written has the same exposure the CAVEAT below describes.")
-
 (defun %node-geometry-method-owner-name (class)
   "The most general class carrying an applicable application-supplied
 NODE-GEOMETRY method, or NIL when CLASS relies on the engine's default method.
@@ -1479,32 +1484,30 @@ two built-in methods specialize on T and on NODE; only something more specific
 counts as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
 specifier -- away from SUBTYPEP.
 
-CAVEAT.  GENERIC-FUNCTION-METHODS returns the methods in an implementation-defined
-ORDER, unlike %INDEXED-SLOT-OWNER-NAME's deterministic reversed-CPL walk.  The
-SUBTYPEP most-general test above makes the RESULT order-independent for any fixed
-set of methods, so this is not a portability hazard in itself.
-
-The exposure is temporal, and it is real: defining a NODE-GEOMETRY method on a MORE
-GENERAL class at runtime, after nodes of a subclass are already indexed, relocates
-the owner.  Every entry written under the old key then orphans -- the remove looks
-in the new owner's index, and nothing ever visits the old key again.  Declare the
-NODE-GEOMETRY methods for a hierarchy before writing its nodes; if one is added
-later, REBUILD-SPATIAL-INDEXES re-derives every key from scratch.  This is the same
-exposure an :INDEX slot has under class redefinition -- consistent with existing
-engine behaviour, not a new risk introduced by the method-owner key."
-  (multiple-value-bind (val present)
-      (gethash class *node-geometry-method-owner-cache*)
-    (when present (return-from %node-geometry-method-owner-name val)))
-  (setf (gethash class *node-geometry-method-owner-cache*)
-        (let ((owner nil))
-          (dolist (m (generic-function-methods #'node-geometry) owner)
-            (let ((spec (first (method-specializers m))))
-              (when (and (typep spec 'class)
-                         (not (member (class-name spec) '(t node)))
-                         (subtypep (class-name class) (class-name spec))
-                         (or (null owner)
-                             (subtypep owner (class-name spec))))
-                (setf owner (class-name spec))))))))
+Memoised per class, keyed by the number of NODE-GEOMETRY methods, so a method
+added or removed later takes effect on the next read.  A swap that keeps the
+count is re-derived by a class redefinition or by REBUILD-SPATIAL-INDEXES
+(%FORGET-SPATIAL-CLASS-MEMOS).  Defining a method on a MORE GENERAL class after
+a subclass's nodes are indexed relocates their owner key: run
+REBUILD-SPATIAL-INDEXES after it, as after an :INDEX slot's redefinition."
+  (let* ((methods (generic-function-methods #'node-geometry))
+         (n (length methods)))
+    (multiple-value-bind (val present)
+        (gethash class *node-geometry-method-owner-cache*)
+      (when (and present (= (car val) n))
+        (return-from %node-geometry-method-owner-name (cdr val))))
+    (let ((owner nil))
+      (dolist (m methods)
+        (let ((spec (first (method-specializers m))))
+          (when (and (typep spec 'class)
+                     (not (member (class-name spec) '(t node)))
+                     (subtypep (class-name class) (class-name spec))
+                     (or (null owner)
+                         (subtypep owner (class-name spec))))
+            (setf owner (class-name spec)))))
+      (setf (gethash class *node-geometry-method-owner-cache*)
+            (cons n owner))
+      owner)))
 
 (defun %node-spatial-owner-name (class slot-name)
   "The owner half of the (OWNER . SLOT) key CLASS's geometry is indexed under.

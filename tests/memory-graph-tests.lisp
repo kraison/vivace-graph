@@ -857,13 +857,13 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
           (collect-garbage))))))
 
 (test v5-memory-image-lazy-open-migrates-selectively
-  "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own deleted
-%REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class MIGHT carry a
-geometry, via NODE-GEOMETRY-INDEX-SLOTS.  Since #60 that is the DECLARED geometry
-slots, so M-TAG (an indexed STRING) stays a deferred LZNODE blob along with plain
-M-PERSON -- the property fault-on-access depends on.  A test that only checked the
-query would pass even if migration materialized everything; this also pins down
-what did and didn't get touched (GH #65)."
+  "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own
+deleted %REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class
+MIGHT carry a geometry, via NODE-GEOMETRY-INDEX-SLOTS.  Since #60 that is the
+DECLARED geometry slots, so M-TAG (an indexed STRING) stays a deferred LZNODE
+blob along with plain M-PERSON -- the property fault-on-access depends on.  A
+test that only checked the query would pass even if migration materialized
+everything; this also pins down what did and didn't get touched (GH #65)."
   (reset-mem-view-registry)
   (flet ((n-materialized (g)
            (loop for v being the hash-values of
@@ -902,10 +902,12 @@ what did and didn't get touched (GH #65)."
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-region 'extent)
                              10.0d0 41.0d0 11.0d0 43.0d0)))
-                 ;; the 3 M-PERSON and the 5 M-TAG (no GEOMETRY slot) are untouched
+                 ;; the 3 M-PERSON and the 5 M-TAG (no GEOMETRY slot) are
+                 ;; untouched
                  (is (= 8 (n-lznodes g2))
-                     "nodes with no geometry slot were never touched by the migration")
-                 ;; only the 2 geometry nodes were materialized (#60, spec §5.0)
+                     "nodes with no geometry slot were never touched by the ~
+migration")
+                 ;; only the 2 geometry nodes were materialized (#60, §5.0)
                  (is (= 2 (n-materialized g2))
                      "geometry nodes alone are materialized"))
             (ignore-errors (close-graph g2 :snapshot-p nil))

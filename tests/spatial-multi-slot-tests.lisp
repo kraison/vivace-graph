@@ -221,8 +221,12 @@ but its centroid lies far outside it."
                    (find-nearest-k 'ms-area 50d0 30d0 1))))
       (let ((graph-db::*spatial-unnamed-slot-policy* :first-declared)
             (warnings 0))
+        ;; Forget both the once-per-class warning AND the unnamed memo: an
+        ;; earlier :FIRST-DECLARED resolution of MS-AREA in this image would
+        ;; otherwise answer from the memo and never re-enter the warning.
         (remhash (find-class 'ms-area)
                  graph-db::*spatial-first-declared-warned*)
+        (clrhash graph-db::*spatial-scope-keys-memo*)
         (handler-bind ((warning (lambda (c)
                                   (when (search "FIRST-DECLARED"
                                                 (string-upcase
@@ -332,6 +336,66 @@ NODE-GEOMETRIES, which would defer back to the method."
       (is (equal (list n) (find-nodes-within 'ms-fallthrough area)))
       (is (equal (list n)
                  (find-nodes-within 'ms-fallthrough area :slot 'where))))))
+
+(def-vertex ms-late () ((where :type geometry :index t))
+  :graph-db-integration-test)
+
+(test a-node-geometry-method-defined-later-takes-effect
+  "Review finding: the method-owner memo must not outlive the method set.  A
+NODE-GEOMETRY method added after the class was first written is the authority
+from the next read on; removed again, the declared slot is; and a swap that
+keeps the method count is caught by REBUILD-SPATIAL-INDEXES, the documented
+remedy."
+  (with-test-graph (g)
+    (let (n (p1 (make-point 10d0 10d0)) (p2 (make-point 11d0 11d0)))
+      (with-transaction ()
+        (setq n (make-ms-late :where (make-point 30d0 50d0))))
+      (is (equal '(where) (mapcar #'car (node-geometries n))))
+      (let ((m1 (defmethod graph-db:node-geometry ((x ms-late))
+                  (values p1 nil))))
+        (unwind-protect
+             (is (equal (list (cons nil p1)) (node-geometries n))
+                 "a method added later is the authority")
+          (remove-method #'graph-db:node-geometry m1)))
+      (is (equal '(where) (mapcar #'car (node-geometries n)))
+          "removed again, the declared slot is")
+      ;; Prime the memo under one method, then swap it for another: the
+      ;; count is unchanged, so only the rebuild may re-derive the owner.
+      (let ((m1 (defmethod graph-db:node-geometry ((x ms-late))
+                  (values p1 nil))))
+        (is (equal (list (cons nil p1)) (node-geometries n)))
+        (remove-method #'graph-db:node-geometry m1))
+      (let ((m2 (defmethod graph-db:node-geometry ((x ms-late))
+                  (values p2 nil))))
+        (unwind-protect
+             (progn
+               (rebuild-spatial-indexes g)
+               (is (equal (list (cons nil p2)) (node-geometries n))
+                   "REBUILD-SPATIAL-INDEXES re-derives the method owner"))
+          (remove-method #'graph-db:node-geometry m2)))
+      (is (equal '(where) (mapcar #'car (node-geometries n)))))))
+
+(test a-bad-slot-leaves-no-memo-entry
+  "Review finding: a slot nothing declares is never memoised -- Prolog with an
+unbound slot variable passes a fresh struct each call, and a repeated erroneous
+query would grow the memo without bound."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((area (ms-area-of-interest)))
+      (with-transaction () (ms-make-area))
+      (finishes (find-nodes-within 'ms-area area :slot 'centroid))
+      (let ((before (hash-table-count graph-db::*spatial-scope-keys-memo*)))
+        (dolist (slot (list :centroid "centroid" 'nothing (gensym "SLOT")))
+          (is-true (ms-signals-naming "MS-AREA"
+                     (find-nodes-within 'ms-area area :slot slot))))
+        ;; Under :ALL a declared-nowhere SYMBOL is skipped per class (spec
+        ;; §5.3); a keyword or string is a caller error in any scope.
+        (is (null (find-nodes-within :all area :slot 'nothing)))
+        (signals query-precondition-error
+          (find-nodes-within :all area :slot :centroid))
+        (is (= before
+               (hash-table-count graph-db::*spatial-scope-keys-memo*))
+            "no memo entry for a slot nothing declares")))))
 
 (def-vertex ms-redef () ((a :type geometry :index t))
   :graph-db-integration-test)

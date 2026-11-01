@@ -20,6 +20,7 @@
 ;; memory-graph backend).  Same idiom graph.lisp uses for the unique/secondary
 ;; index functions.
 (declaim (ftype (function (t t &key (:slot t)) t) %resolve-spatial-scope))
+(declaim (ftype (function () t) %forget-spatial-class-memos))
 (declaim (ftype (function (t t) t) %scope-admits-p))
 (declaim (ftype (function (t) t) all-spatial-indexes))
 (declaim (ftype (function (t t t) t) %spatial-index-for))
@@ -406,8 +407,9 @@ INDEX, never per node: a rebuild must not produce a warning storm."
 
 (defun rebuild-spatial-indexes (graph)
   "Rebuild GRAPH's spatial indexes from scratch: drop every current index, then
-re-index each live node into the (owner . slot) index its geometry slot selects.
-Returns the number of nodes indexed.
+re-index each live node into the (owner . slot) index of each of its geometries.
+Returns the number of index entries written: a node with two bound geometry
+slots counts twice (#60).
 
 Use this to adopt the per-class scheme on a graph that predates it, to change grid
 precision (set GRAPH-DEFAULT-SPATIAL-PRECISION first), or to repair.  It mutates
@@ -434,6 +436,9 @@ full rebuild on every subsequent open until something happened to save it comple
     ;; happened to have current (the wrong-graph bug class).
     (let ((*graph* graph)
           (count 0))
+      ;; Re-derive the class memos too: a NODE-GEOMETRY method swapped since
+      ;; the class was first written must key this rebuild (#60).
+      (%forget-spatial-class-memos)
       (dolist (idx (all-spatial-indexes graph))
         ;; Only a heap-backed ordered map owns storage that must be freed; a
         ;; memory-graph's in-RAM index is simply dropped with the registry entry.

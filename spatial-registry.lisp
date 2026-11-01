@@ -224,6 +224,16 @@ from a memo made under the other policy.  Cleared with *SPATIAL-SCOPE-MEMO*.")
   (clrhash *spatial-scope-keys-memo*))
 (pushnew '%invalidate-spatial-scope-keys-memo *node-type-definition-hooks*)
 
+(declaim (ftype (function () t) %forget-node-geometry-method-owners))
+(defun %forget-spatial-class-memos ()
+  "Drop every class-derived spatial memo: the NODE-GEOMETRY method-owner cache
+ (transactions.lisp, compiled after this file) and both scope memos.  The
+rebuilds call it, so a method swapped after a class was first written is
+re-derived (#60)."
+  (%forget-node-geometry-method-owners)
+  (clrhash *spatial-scope-memo*)
+  (clrhash *spatial-scope-keys-memo*))
+
 (defun %class-and-subclasses (class)
   "CLASS and its transitive subclasses that are finalized NODE-CLASSes, CLASS
 first.  MOP-based (CLASS-DIRECT-SUBCLASSES): the memo is keyed by name without
@@ -275,6 +285,10 @@ name) or unnamed (NIL), memoized.  With SIGNAL-MISSING, signals
 QUERY-PRECONDITION-ERROR when SLOT names a geometry slot neither the class nor
 a subclass declares; :ALL passes NIL, since a class without the slot simply
 contributes nothing there (#60, spec §5.3)."
+  (when (and slot (or (not (symbolp slot)) (keywordp slot)))
+    (error 'query-precondition-error
+           :reason (format nil "~S: :SLOT must be a slot name (a non-keyword ~
+symbol), not ~S." class-name slot)))
   (let* ((memo-key (if slot
                        (list class-name :slot slot)
                        (list class-name :unnamed
@@ -283,11 +297,16 @@ contributes nothing there (#60, spec §5.3)."
                    (gethash memo-key *spatial-scope-keys-memo*)
                  (if present
                      val
-                     (let ((class (find-class class-name)))
-                       (setf (gethash memo-key *spatial-scope-keys-memo*)
-                             (if slot
-                                 (%class-keys-for-slot class slot)
-                                 (%class-unnamed-keys class))))))))
+                     (let* ((class (find-class class-name))
+                            (computed (if slot
+                                          (%class-keys-for-slot class slot)
+                                          (%class-unnamed-keys class))))
+                       ;; A named slot nothing declares is never memoised:
+                       ;; the error path must not grow the table.
+                       (when (or (null slot) computed)
+                         (setf (gethash memo-key *spatial-scope-keys-memo*)
+                               computed))
+                       computed)))))
     (when (and slot signal-missing (null keys))
       (error 'query-precondition-error
              :reason (format nil "~S declares no geometry slot named ~S ~

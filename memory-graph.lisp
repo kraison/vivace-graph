@@ -763,10 +763,10 @@ journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
 recover from the journal was actively wrong (it discards the graph and 'succeeds'
 onto an empty one).  Say what remedies actually exist instead."
   (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6, ~
-v7, v8 and v9, writing v9).  This image is the ONLY durable record of a cleanly-~
-closed memory graph -- the journal is cleared after every checkpoint, so ~
-deleting the image discards the graph, it does not recover it.  Open it with a ~
-build that reads v~D, or migrate it to v9 first."
+v7, v8 and v9, writing v9).  This image is the ONLY durable record of a ~
+cleanly-closed memory graph -- the journal is cleared after every ~
+checkpoint, so deleting the image discards the graph, it does not recover ~
+it.  Open it with a build that reads v~D, or migrate it to v9 first."
          ver file ver))
 
 (defun %custom-node-geometry-classes ()
@@ -795,6 +795,7 @@ worth the MAKE-INSTANCE cost while migrating a v5 image's spatial index (GH #65)
              (some (lambda (c) (subtypep class c)) custom-classes))
          t)))
 
+(declaim (ftype (function () t) %forget-spatial-class-memos))
 (defun %rebuild-memory-spatial-indexes-from-nodes (graph)
   "Rebuild GRAPH's per-(owner . slot) spatial indexes by visiting every node --
 the v5 migration path (GH #65).  v5's writer emitted its spatial section EMPTY
@@ -808,6 +809,7 @@ non-lazy fallback: an LZNODE is materialized ONLY when its class could carry a
 geometry (NODE-GEOMETRY-INDEX-SLOTS, or a class a NODE-GEOMETRY method
 specializes on), so a graph with one geometry-bearing class among many touches
 only that fraction -- fault-on-access survives for everything else."
+  (%forget-spatial-class-memos)         ; #60: re-derive the method owners too
   (clrhash (spatial-indexes graph))            ; in-RAM indexes own no heap storage
   (let ((*graph* graph)                        ; node reads must resolve in GRAPH
         (customs (%custom-node-geometry-classes))
@@ -833,9 +835,9 @@ only that fraction -- fault-on-access survives for everything else."
                          (incf count))))))))))
 
 (defun restore-memory-image-native (graph file)
-  "Restore a VG-native image, v5 or v6.  When GRAPH is LAZY, node tables receive
-LZNODE blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is
-materialized now.  The ve/vev/type indexes and the views are restored
+  "Restore a VG-native image, v5 through v9.  When GRAPH is LAZY, node tables
+receive LZNODE blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each
+node is materialized now.  The ve/vev/type indexes and the views are restored
 STRUCTURALLY either way.  v6's per-(owner . slot) spatial records are also
 restored structurally; v5 (whose spatial section is one flat, always-empty
 (cell . node-id) pair list -- empty BY DESIGN, not truncated) has that section

@@ -58,7 +58,9 @@ storage formats (#60).
 
 - `node-geometries` (every `(slot . geometry)` a node occupies) and
   `node-slot-geometry`; an application `node-geometry` method stays the
-  authority for its class and may `call-next-method`.
+  authority for its class and, on a single-slot class, may
+  `call-next-method`; on a multi-slot class the default signals under
+  `:error`, on the write path too.
 - Prolog `find-within/4`, `find-intersects/4`, `find-near/6` and
   `find-nearest/6`, the slot in third position; the old arities remain
   and resolve unnamed.
@@ -69,7 +71,10 @@ policy back to `:error`):
 1. Every spatial call site on a class with several geometry slots names
    its `:slot`, in Lisp and in Prolog.
 2. Every `node-geometry` method written only to choose between indexed
-   slots is deleted; the slot name on the query replaces it.
+   slots is deleted; the slot name on the query replaces it. One of the
+   shape `(or (slot-value n 'outline) (call-next-method))` now signals on
+   a multi-slot class: rewrite it to return its geometry and slot,
+   `(values geometry 'outline)`, or delete it.
 3. Every registration source on a multi-slot registry says which geometry
    it registers against (`:registry-slot`) and, when the source itself has
    several, which one it registers (`:geometry-fn`).
