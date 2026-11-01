@@ -1256,20 +1256,31 @@ seed the cache (GH #237).")
   #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
   "Cache CLASS -> list of its :INDEX-marked slot names (candidate geometry slots).")
 
+(defun %type-admits-geometry-p (type)
+  "True when the declared slot TYPE admits GEOMETRY: a symbol spelled GEOMETRY
+in any package (an application rarely imports ours, so the symbol is seldom
+EQ), an (OR ...) with such a member, or anything SUBTYPEP accepts."
+  (and (not (eq type t))
+       (or (and (symbolp type) (string= (symbol-name type) "GEOMETRY"))
+           (and (consp type) (eq (first type) 'or)
+                (some #'%type-admits-geometry-p (rest type)))
+           (ignore-errors (subtypep 'geometry type)))))
+
+(defun %geometry-slot-p (slot)
+  "True when SLOT is a geometry slot: :INDEX-marked, with a declared type that
+admits GEOMETRY (%TYPE-ADMITS-GEOMETRY-P) (#60, spec §5.0)."
+  (and (indexed-p slot)
+       (%type-admits-geometry-p (slot-definition-type slot))))
+
 (defun node-geometry-index-slots (class)
-  "Names of CLASS's :INDEX-marked slots -- the candidate geometry slots.  A
-geometry slot opts into spatial indexing declaratively, e.g.
+  "Names of CLASS's geometry slots (%GEOMETRY-SLOT-P), in effective-slot order:
   (def-vertex observation () ((location :type geometry :index t)) :app)
-We deliberately do NOT match on the declared slot type here: the `:type geometry'
-symbol is read in the *application's* package, which is not necessarily EQ to
-GRAPH-DB:GEOMETRY (and a user need not even declare a type).  Instead we return
-every indexed slot, and NODE-GEOMETRY picks the one whose runtime value is an
-actual GEOMETRY (via GEOMETRYP) -- robust across packages and to mixed
-geometry/non-geometry indexed slots on the same type.
+An :INDEX slot with no geometry type is an ordinary secondary index, never
+spatial (#60, spec §5.0).
 
 Cached per class, and INVALIDATED on class redefinition via
 *NODE-CLASS-CACHE-INVALIDATORS* -- VG supports runtime schema mutation, and a
-subclass must be dropped too when a SUPERCLASS gains or loses an :INDEX slot."
+subclass must be dropped too when a SUPERCLASS gains or loses a geometry slot."
   (multiple-value-bind (val present) (gethash class *node-geometry-slot-cache*)
     (if present
         val
@@ -1280,7 +1291,7 @@ subclass must be dropped too when a SUPERCLASS gains or loses an :INDEX slot."
         (when (class-finalized-p class)
           (setf (gethash class *node-geometry-slot-cache*)
                 (loop for slot in (class-slots class)
-                      when (indexed-p slot)
+                      when (%geometry-slot-p slot)
                         collect (slot-definition-name slot)))))))
 
 (defparameter *node-geometry-multi-sample-limit* 64

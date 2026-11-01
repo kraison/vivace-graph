@@ -34,7 +34,7 @@ fault-on-access invariant.  Call at the start of any test that reopens a graph."
 ;; A geometry-bearing type: the :INDEX slot opts into spatial indexing.
 (def-vertex m-place ()
   ((label)
-   (geom :index t))
+   (geom :type geometry :index t))
   :graph-db-memory-test)
 
 ;; A SECOND geometry-bearing type declaring its OWN geometry slot, so it lands in
@@ -859,13 +859,11 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
 (test v5-memory-image-lazy-open-migrates-selectively
   "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own deleted
 %REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class MIGHT carry a
-geometry, via NODE-GEOMETRY-INDEX-SLOTS -- which returns every :INDEX-marked slot,
-scalars included, so a class like M-TAG (an indexed STRING) is over-approximated
-and materialized too, same as v5 always did.  Plain M-PERSON, with no :INDEX slot
-at all, is the one guaranteed to stay a deferred LZNODE blob -- the property
-fault-on-access depends on.  A test that only checked the query would pass even if
-migration materialized everything; this also pins down what did and didn't get
-touched (GH #65)."
+geometry, via NODE-GEOMETRY-INDEX-SLOTS.  Since #60 that is the DECLARED geometry
+slots, so M-TAG (an indexed STRING) stays a deferred LZNODE blob along with plain
+M-PERSON -- the property fault-on-access depends on.  A test that only checked the
+query would pass even if migration materialized everything; this also pins down
+what did and didn't get touched (GH #65)."
   (reset-mem-view-registry)
   (flet ((n-materialized (g)
            (loop for v being the hash-values of
@@ -904,13 +902,12 @@ touched (GH #65)."
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-region 'extent)
                              10.0d0 41.0d0 11.0d0 43.0d0)))
-                 ;; the 3 plain M-PERSON nodes (no :INDEX slot at all) are untouched
-                 (is (= 3 (n-lznodes g2))
-                     "nodes with no :INDEX slot were never touched by the migration")
-                 ;; the 2 geometry nodes AND the 5 M-TAG (:INDEX scalar,
-                 ;; over-approximated, same as v5 always did) were materialized
-                 (is (= 7 (n-materialized g2))
-                     "geometry nodes plus the over-approximated :INDEX-scalar class"))
+                 ;; the 3 M-PERSON and the 5 M-TAG (no GEOMETRY slot) are untouched
+                 (is (= 8 (n-lznodes g2))
+                     "nodes with no geometry slot were never touched by the migration")
+                 ;; only the 2 geometry nodes were materialized (#60, spec §5.0)
+                 (is (= 2 (n-materialized g2))
+                     "geometry nodes alone are materialized"))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
 

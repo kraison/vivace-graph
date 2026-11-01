@@ -704,11 +704,11 @@ same-class test went on passing everywhere."
 ;; check lives in the RESOLVER, and this pins its message without putting a class
 ;; the write path would choke on into the integration graph's schema.
 (defclass scope-bad-precision ()
-  ((extent :initarg :extent :index t :spatial-precision 15))
+  ((extent :initarg :extent :type geometry :index t :spatial-precision 15))
   (:metaclass graph-db::node-class))
 
 (defclass scope-float-precision ()
-  ((extent :initarg :extent :index t :spatial-precision 5.0))
+  ((extent :initarg :extent :type geometry :index t :spatial-precision 5.0))
   (:metaclass graph-db::node-class))
 
 (test out-of-range-precision-is-rejected-by-name
@@ -1566,3 +1566,36 @@ seen immediately."
     ((label :type string))
     :sc-memo-graph)
   (is-false (graph-db::%class-geometry-slots-declared-p 'sc-memo-item)))
+
+;;; ---------------------------------------------------------------------------
+;;; #60 spec §5.0: a geometry slot is identified by its DECLARED type.
+;;; ---------------------------------------------------------------------------
+
+(defpackage #:graph-db/test-other-pkg (:use) (:export #:geometry))
+
+(def-vertex scope-typed-variants ()
+  ((plain :type geometry :index t)
+   (nullable :type (or null geometry) :index t)
+   (foreign :type graph-db/test-other-pkg:geometry :index t)
+   (untyped :index t)
+   (label :type string :index t))
+  :graph-db-integration-test)
+
+(test geometry-slots-are-identified-by-declared-type
+  "Spec §5.0: :INDEX T plus a type admitting GEOMETRY, by SUBTYPEP or by a
+symbol spelled GEOMETRY in another package.  Untyped and scalar indexed slots
+are not geometry slots."
+  (is (equal '(plain nullable foreign)
+             (graph-db::node-geometry-index-slots
+              (find-class 'scope-typed-variants))))
+  (is (equal '(geom)
+             (graph-db::node-geometry-index-slots
+              (find-class 'scope-mixed-index)))))
+
+(test untyped-indexed-slot-holding-a-geometry-is-not-spatial
+  "Spec §5.0 consequence: a geometry written to an untyped :INDEX T slot is an
+ordinary secondary-index value now, so it creates no spatial index."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-typed-variants :untyped (make-point 12.3424d0 45.6720d0)))
+    (is (null (spatial-index-for g 'scope-typed-variants 'untyped)))))

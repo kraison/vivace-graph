@@ -198,14 +198,16 @@ which means a geometry slot added to a parent was silently never spatially
 indexed for subclass instances."
   (let ((parent (%nc-fresh-name "rt-parent"))
         (child (%nc-fresh-name "rt-child")))
-    (eval `(defclass ,parent () ((pgeom :index t)) (:metaclass graph-db::node-class)))
+    (eval `(defclass ,parent () ((pgeom :type geometry :index t))
+             (:metaclass graph-db::node-class)))
     (eval `(defclass ,child (,parent) ((cname)) (:metaclass graph-db::node-class)))
     (graph-db::finalize-inheritance (find-class child))
     (is (equal '(pgeom)
                (graph-db::node-geometry-index-slots (find-class child)))
         "baseline: subclass inherits the parent's indexed slot")
     ;; add a SECOND indexed slot to the PARENT
-    (eval `(defclass ,parent () ((pgeom :index t) (pgeom2 :index t))
+    (eval `(defclass ,parent () ((pgeom :type geometry :index t)
+                                 (pgeom2 :type geometry :index t))
              (:metaclass graph-db::node-class)))
     (graph-db::finalize-inheritance (find-class parent))
     (graph-db::finalize-inheritance (find-class child))
@@ -244,7 +246,8 @@ exploit there and this degenerates to checking the answers are right.  The
 assertions below therefore do not require the window to exist -- requiring it
 made this test fail on ECL against perfectly correct code."
   (let ((name (%nc-fresh-name "rt-unfin")))
-    (eval `(defclass ,name () ((g :index t) (emb :vector-index t))
+    (eval `(defclass ,name () ((g :type geometry :index t)
+                               (emb :vector-index t))
              (:metaclass graph-db::node-class)))
     ;; Ask too early WHERE THAT IS POSSIBLE -- this is what used to poison the
     ;; cache.  Harmless (and simply a warm read) where the class is already
