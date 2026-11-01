@@ -19,7 +19,8 @@
 ;; which loads after this file (it needs the MOP helpers, the graph and the
 ;; memory-graph backend).  Same idiom graph.lisp uses for the unique/secondary
 ;; index functions.
-(declaim (ftype (function (t t) t) %resolve-spatial-scope %scope-admits-p))
+(declaim (ftype (function (t t &key (:slot t)) t) %resolve-spatial-scope))
+(declaim (ftype (function (t t) t) %scope-admits-p))
 (declaim (ftype (function (t) t) all-spatial-indexes))
 (declaim (ftype (function (t t t) t) %spatial-index-for))
 ;; Forward reference: SAVE-SPATIAL-INDEX-ROOTS lives in graph.lisp, which loads
@@ -61,25 +62,31 @@ historical behaviour), so results are unchanged when the add-on is absent."
 
 (defun %overlay-spatial-candidates (ov keys types)
   "The open transaction's own live nodes the apply pass will index under
-one of KEYS -- (OWNER . SLOT) pairs, or :ALL -- and that TYPES admits
+one of KEYS -- (OWNER . SLOT) pairs -- and that TYPES admits
 \(GH #410): the overlay's half of %DO-SCOPED-CANDIDATES, at each node's
 CURRENT geometry.  No window pre-filter: the body's exact predicate is
 the truth, and the write set is small."
   (loop for n in (overlay-live-nodes ov)
         when (and (%scope-admits-p n types)
-                  (let ((own (%node-spatial-keys n)))
-                    (and own
-                         (or (eq keys :all)
-                             (some (lambda (entry)
-                                     (member (car entry) keys :test #'equalp))
-                                   own)))))
+                  (some (lambda (entry)
+                          (member (car entry) keys :test #'equalp))
+                        (%node-spatial-keys n)))
           collect n))
 
-(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius (guard t))
+(defun %scope-geometry (node keys)
+  "The geometry of NODE a scope resolving to KEYS tests: the first of its
+%NODE-SPATIAL-KEYS whose key is in KEYS, or NIL (#60, spec §5.4)."
+  (loop for (key . geom) in (%node-spatial-keys node)
+        when (member key keys :test #'equalp) return geom))
+
+(defmacro %do-scoped-candidates ((node-var geom-var scope graph
+                                  &key slot bbox radius (guard t))
                                  &body body)
   "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
-back from every index in SCOPE.  Dedups by node id across indexes, so a node
-reachable through two of its own slot-indexes is visited once.
+back from every index in SCOPE, and GEOM-VAR to the geometry the scope tests on
+it (%SCOPE-GEOMETRY; a candidate with none is skipped).  SLOT is the query's
+:SLOT (#60).  Dedups by node id across indexes, so a node reachable through
+two of its own slot-indexes is visited once.
 
 The scope's TYPE FILTER is pushed INTO the index scan as a tag set (GH #104):
 each entry carries its node's type tag, so a candidate outside the scope is
@@ -114,7 +121,7 @@ runs BODY -- not through SEEN, which the walk marks for a skipped id too."
         (idx (gensym "I")) (id (gensym "ID")) (win (gensym "WINDOW"))
         (a (gensym "A")) (b (gensym "B")) (c (gensym "C")) (d (gensym "D")))
     `(multiple-value-bind (,indexes ,types ,tags ,keys)
-         (%resolve-spatial-scope ,scope ,graph)
+         (%resolve-spatial-scope ,scope ,graph :slot ,slot)
        (when ,guard
          (let ((,seen (make-hash-table :test 'equalp))
                (,win ,(or bbox radius))
@@ -124,7 +131,9 @@ runs BODY -- not through SEEN, which the walk marks for a skipped id too."
                       (let ((,node-var (%node-by-id ,id ,graph)))
                         (when (and ,node-var (not (deleted-p ,node-var))
                                    (%scope-admits-p ,node-var ,types))
-                          ,@body)))))
+                          (let ((,geom-var (%scope-geometry ,node-var ,keys)))
+                            (when ,geom-var
+                              ,@body)))))))
              (dolist (,idx ,indexes)
                ,(if bbox
                     `(destructuring-bind (,a ,b ,c ,d) ,win
@@ -137,46 +146,50 @@ runs BODY -- not through SEEN, which the walk marks for a skipped id too."
              (when ,ov
                (dolist (,node-var (%overlay-spatial-candidates ,ov ,keys
                                                                ,types))
-                 ,@body))))))))
+                 (let ((,geom-var (%scope-geometry ,node-var ,keys)))
+                   (when ,geom-var
+                     ,@body))))))))))
 
-(defun find-nodes-within (scope area &key (graph *graph*))
-  "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
+(defun find-nodes-within (scope area &key slot (graph *graph*))
+  "Live nodes in SCOPE whose SLOT geometry lies within AREA (a :POLYGON or
 :MULTIPOLYGON).  SCOPE is a node-class name, a list of them, or :ALL; it selects
-which spatial indexes are scanned AND filters the results by type.  Signals when
-SCOPE names a class that is not spatially indexed.
+which spatial indexes are scanned AND filters the results by type.  SLOT names
+the geometry slot tested; it may be omitted on a class with one geometry slot,
+and on a class with several the omission follows *SPATIAL-UNNAMED-SLOT-POLICY*
+(#60).  Signals when SCOPE names a class that is not spatially indexed, or a
+slot it does not declare.
 
 A :POINT node is judged exactly; an extended-geometry node is judged exactly when
 graph-db/geos is loaded, otherwise by its representative point (bbox centre)."
   (let ((result '()))
-    (%do-scoped-candidates (node scope graph
+    (%do-scoped-candidates (node geom scope graph :slot slot
                             :guard (geometryp area)
                             :bbox (multiple-value-bind (mnl mnt mxl mxt)
                                       (geometry-bbox area)
                                     (list mnl mnt mxl mxt)))
-      (let ((geom (node-geometry node)))
-        (when (and geom (%node-within-area-p area geom))
-          (push node result))))
+      (when (%node-within-area-p area geom)
+        (push node result)))
     (nreverse result)))
 
-(defun find-nodes-intersecting (scope area &key (graph *graph*))
-  "Live nodes in SCOPE whose geometry INTERSECTS AREA (any geometry kind).  Exact
-with the graph-db/geos add-on; without it, extended-geometry candidates use a
-COARSE bounding-box overlap test (point candidates are always exact).  SCOPE is as
-for FIND-NODES-WITHIN."
+(defun find-nodes-intersecting (scope area &key slot (graph *graph*))
+  "Live nodes in SCOPE whose SLOT geometry INTERSECTS AREA (any geometry kind).
+Exact with the graph-db/geos add-on; without it, extended-geometry candidates
+use a COARSE bounding-box overlap test (point candidates are always exact).
+SCOPE and SLOT are as for FIND-NODES-WITHIN."
   (let ((result '()))
-    (%do-scoped-candidates (node scope graph
+    (%do-scoped-candidates (node geom scope graph :slot slot
                             :guard (geometryp area)
                             :bbox (multiple-value-bind (mnl mnt mxl mxt)
                                       (geometry-bbox area)
                                     (list mnl mnt mxl mxt)))
-      (let ((geom (node-geometry node)))
-        (when (and geom (geometry-intersects-p area geom))
-          (push node result))))
+      (when (geometry-intersects-p area geom)
+        (push node result)))
     (nreverse result)))
 
-(defun find-nodes-near (scope lat lon radius &key (graph *graph*))
-  "(NODE . DISTANCE-METRES) for live nodes in SCOPE within RADIUS of (LAT, LON),
-nearest first.  SCOPE is as for FIND-NODES-WITHIN."
+(defun find-nodes-near (scope lat lon radius &key slot (graph *graph*))
+  "(NODE . DISTANCE-METRES) for live nodes in SCOPE whose SLOT geometry lies
+within RADIUS of (LAT, LON), nearest first; the distance is to that geometry's
+representative point.  SCOPE and SLOT are as for FIND-NODES-WITHIN."
   ;; Clamp ONCE, here, so the index window and the exact GEODESIC-DISTANCE
   ;; refinement below agree on the same numbers -- and so neither
   ;; overflows on a bignum or ratio argument (GH #279).
@@ -185,16 +198,14 @@ nearest first.  SCOPE is as for FIND-NODES-WITHIN."
           lon (clamp-longitude lon)
           radius (clamp-radius-metres radius)))
   (let ((result '()))
-    (%do-scoped-candidates (node scope graph
+    (%do-scoped-candidates (node geom scope graph :slot slot
                             :guard (and (numberp lat) (numberp lon)
                                         (numberp radius))
                             :radius (list lat lon radius))
-      (let ((geom (node-geometry node)))
-        (when geom
-          (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
-            (let ((d (geodesic-distance lat lon nlat nlon)))
-              (when (<= d radius)
-                (push (cons node d) result)))))))
+      (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
+        (let ((d (geodesic-distance lat lon nlat nlon)))
+          (when (<= d radius)
+            (push (cons node d) result)))))
     (sort result #'< :key #'cdr)))
 
 (def-global-prolog-functor find-within/3 (?node ?scope ?area cont)
@@ -234,10 +245,11 @@ nearest first.  SCOPE is as for FIND-NODES-WITHIN."
             (funcall cont))
           (undo-bindings old-trail))))))
 
-(defun find-nearest-k (scope lat lon k &key (graph *graph*) (max-radius 2.5d4))
-  "The K nodes in SCOPE nearest (LAT, LON) as (NODE . DISTANCE-METRES), nearest
-first (fewer than K if SCOPE holds fewer within MAX-RADIUS).  SCOPE is as for
-FIND-NODES-WITHIN.
+(defun find-nearest-k (scope lat lon k &key slot (graph *graph*)
+                                            (max-radius 2.5d4))
+  "The K nodes in SCOPE nearest (LAT, LON) by their SLOT geometry, as
+ (NODE . DISTANCE-METRES), nearest first (fewer than K if SCOPE holds fewer
+within MAX-RADIUS).  SCOPE and SLOT are as for FIND-NODES-WITHIN.
 
 Correctness: FIND-NODES-NEAR returns every node within a radius sorted by distance,
 so once a radius encloses at least K nodes, those K are the global K nearest --
@@ -250,7 +262,7 @@ MAX-RADIUS\".  Each widening re-runs the window query, whose cost grows with the
 number of indexed nodes the window encloses (the bbox query covers a window with
 a bounded set of coarse cells and range-scans them, so empty space is free);
 widen MAX-RADIUS only if you accept scanning the larger candidate set."
-  (let ((indexes (%resolve-spatial-scope scope graph))
+  (let ((indexes (%resolve-spatial-scope scope graph :slot slot))
         ;; GH #410: with no index built yet, the open transaction's own
         ;; nodes can still be the answer; the default grid seeds then.
         (ov (current-overlay graph)))
@@ -272,7 +284,8 @@ widen MAX-RADIUS only if you accept scanning the larger candidate set."
              (r (max 1d0 (* (nth-value 1 (geohash-cell-size prec)) 111320d0)))
              (found '()))
         (loop
-          (setf found (find-nodes-near scope lat lon r :graph graph))
+          (setf found (find-nodes-near scope lat lon r :slot slot
+                                                       :graph graph))
           (when (or (>= (length found) k) (>= r max-radius))
             (return))
           (setf r (min max-radius (* r 2d0))))

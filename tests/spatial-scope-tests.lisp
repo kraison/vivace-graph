@@ -473,14 +473,21 @@ every A point, and scoping to B returns no A nodes."
         (is (every #'scope-zone-p zones))))))
 
 (test scope-accepts-a-class-list-and-dedups
-  "A list scope unions the named classes; :ALL unions everything."
+  "A list scope unions the named classes; :ALL unions everything.
+
+The integration schema now holds multi-slot classes (#60), so an unnamed :ALL
+signals under the default policy; :FIRST-DECLARED is the documented way to
+keep the pre-#60 reading of :ALL, and that is what this pins."
   (with-test-graph (g)
     (with-transaction ()
       (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
       (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
-    (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0)))
-      (is (= 2 (length (find-nodes-within '(scope-probe scope-zone) window :graph g))))
-      (is (= 2 (length (find-nodes-within :all window :graph g)))))))
+    (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0))
+          (graph-db::*spatial-unnamed-slot-policy* :first-declared))
+      (is (= 2 (length (find-nodes-within '(scope-probe scope-zone) window
+                                          :graph g))))
+      (handler-bind ((warning #'muffle-warning))
+        (is (= 2 (length (find-nodes-within :all window :graph g))))))))
 
 ;; A vertex with no geometry of any kind -- neither an :INDEX-marked geometry
 ;; slot nor a NODE-GEOMETRY method.  This, not GEO-PLACE, is what "not a spatial
@@ -621,9 +628,13 @@ the narrow-radius symbol case above cannot distinguish."
                                                     45.6720d0 12.3424d0
                                                         1.0d6))))
           "a one-element literal list still resolves to a valid scope")
-      (is (<= 1 (length (select-flat (?n) (find-near ?n :all
-                                                     45.6720d0 12.3424d0
-                                                         500.0d0))))))))
+      ;; Unnamed :ALL under the pre-#60 reading; see
+      ;; SCOPE-ACCEPTS-A-CLASS-LIST-AND-DEDUPS.
+      (let ((graph-db::*spatial-unnamed-slot-policy* :first-declared))
+        (handler-bind ((warning #'muffle-warning))
+          (is (<= 1 (length (select-flat (?n) (find-near ?n :all
+                                                         45.6720d0 12.3424d0
+                                                         500.0d0))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Eager scope validation (§6).  Signalling on an unscopeable class is the whole

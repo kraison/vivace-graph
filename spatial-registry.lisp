@@ -208,6 +208,103 @@ method) lands in the method owner's index, not a per-subclass one."
                   (cons t (class-spatial-index-keys class nil))
                   (cons nil nil))))))
 
+(defvar *spatial-scope-keys-memo*
+  #+sbcl (make-hash-table :test 'equal :synchronized t)
+  #+ccl (make-hash-table :test 'equal :shared t)
+  #+lispworks (make-hash-table :test 'equal :single-thread nil)
+  #+ecl (make-hash-table :test 'equal
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "Memo of %SCOPE-KEYS: (NAME :SLOT SLOT) or (NAME :UNNAMED POLICY) -> keys.
+The policy is part of the unnamed key so a binding change is never answered
+from a memo made under the other policy.  Cleared with *SPATIAL-SCOPE-MEMO*.")
+
+(defun %invalidate-spatial-scope-keys-memo (name)
+  (declare (ignore name))
+  (clrhash *spatial-scope-keys-memo*))
+(pushnew '%invalidate-spatial-scope-keys-memo *node-type-definition-hooks*)
+
+(defun %class-and-subclasses (class)
+  "CLASS and its transitive subclasses that are finalized NODE-CLASSes, CLASS
+first.  MOP-based (CLASS-DIRECT-SUBCLASSES): the memo is keyed by name without
+a graph, so the schema registry cannot be the source (#60, spec §5.3)."
+  (let ((seen '()))
+    (labels ((walk (c)
+               (unless (member c seen)
+                 (when (and (typep c 'node-class) (class-finalized-p c))
+                   (push c seen))
+                 (mapc #'walk (class-direct-subclasses c)))))
+      (walk class))
+    (nreverse seen)))
+
+(defun %class-keys-for-slot (class slot)
+  "The (OWNER . SLOT) keys for CLASS and every subclass declaring geometry slot
+SLOT; empty when none does.  A class with an application NODE-GEOMETRY method
+contributes its key when it declares SLOT (a two-value method may key nodes
+there) and nothing otherwise (#60, spec §5.3)."
+  (let ((keys '()))
+    (dolist (c (%class-and-subclasses class) (nreverse keys))
+      (when (member slot (node-geometry-index-slots c))
+        (pushnew (cons (%indexed-slot-owner-name c slot) slot) keys
+                 :test #'equalp)))))
+
+(defun %class-unnamed-keys (class)
+  "The keys an UNNAMED scope on CLASS covers: for CLASS and each subclass, a
+custom-method class's own keys (CLASS-SPATIAL-INDEX-KEYS), else the key of its
+unnamed resolution (%UNNAMED-SPATIAL-SLOT -- which applies the policy to a
+multi-slot class, signalling under :ERROR) (#60, spec §5.3)."
+  (let ((keys '()))
+    (dolist (c (%class-and-subclasses class) (nreverse keys))
+      (dolist (k (if (%node-geometry-method-owner-name c)
+                     (class-spatial-index-keys c nil)
+                     (when (node-geometry-index-slots c)
+                       (let ((slot (%unnamed-spatial-slot c)))
+                         (list (cons (%indexed-slot-owner-name c slot)
+                                     slot))))))
+        (pushnew k keys :test #'equalp)))))
+
+(defun %class-geometry-slot-names (class)
+  "Every geometry slot name CLASS or a subclass declares, for error text."
+  (let ((names '()))
+    (dolist (c (%class-and-subclasses class) (nreverse names))
+      (dolist (n (node-geometry-index-slots c)) (pushnew n names)))))
+
+(defun %scope-keys (class-name slot &key (signal-missing t))
+  "The (OWNER . SLOT) keys a scope naming CLASS-NAME covers, with SLOT (a slot
+name) or unnamed (NIL), memoized.  With SIGNAL-MISSING, signals
+QUERY-PRECONDITION-ERROR when SLOT names a geometry slot neither the class nor
+a subclass declares; :ALL passes NIL, since a class without the slot simply
+contributes nothing there (#60, spec §5.3)."
+  (let* ((memo-key (if slot
+                       (list class-name :slot slot)
+                       (list class-name :unnamed
+                             *spatial-unnamed-slot-policy*)))
+         (keys (multiple-value-bind (val present)
+                   (gethash memo-key *spatial-scope-keys-memo*)
+                 (if present
+                     val
+                     (let ((class (find-class class-name)))
+                       (setf (gethash memo-key *spatial-scope-keys-memo*)
+                             (if slot
+                                 (%class-keys-for-slot class slot)
+                                 (%class-unnamed-keys class))))))))
+    (when (and slot signal-missing (null keys))
+      (error 'query-precondition-error
+             :reason (format nil "~S declares no geometry slot named ~S ~
+(its geometry slots: ~S)." class-name slot
+                             (%class-geometry-slot-names
+                              (find-class class-name)))))
+    keys))
+
+(defun %all-scope-classes (graph)
+  "The finalized node classes of GRAPH's type registry, VERTEX and EDGE
+excluded: what :ALL names (#60, spec §5.3)."
+  (loop for name in (all-node-types graph)
+        for class = (and (symbolp name) (find-class name nil))
+        when (and class (typep class 'node-class) (class-finalized-p class)
+                  (not (member name '(vertex edge))))
+          collect name))
+
 (defun %class-geometry-slots-declared-p (class-name)
   "True when CLASS-NAME is a scopeable spatial class: it declares at least one
 :INDEX-marked slot, OR it carries an application-supplied NODE-GEOMETRY method.
@@ -242,46 +339,56 @@ through to TYPEP leaves such a query as correct, and as slow, as it was."
         (setf (gethash (%spatial-type-tag id t) tags) t)))
     (when (plusp (hash-table-count tags)) tags)))
 
-(defun %resolve-spatial-scope (scope graph)
+(defun %resolve-spatial-scope (scope graph &key slot)
   "Resolve SCOPE -- a class name, a list of class names, or :ALL -- to
  (values INDEXES TYPE-NAMES TAGS KEYS).  KEYS is every (OWNER . SLOT) the
-scope covers, whether or not its index exists yet, or :ALL -- what the
-transaction overlay matches an own node's index key against (GH #410).
+scope covers, whether or not its index exists yet -- what the transaction
+overlay matches an own node's keys against (GH #410) and what the refine picks
+a candidate's geometry by (%SCOPE-GEOMETRY, #60).
+
+SLOT names the geometry slot the query tests: a named class contributes the
+keys of that slot on itself and its subclasses, :ALL every such key in the type
+registry, and a class that declares no such slot anywhere signals.  Without
+SLOT each class resolves to ONE slot (%CLASS-UNNAMED-KEYS): its only geometry
+slot, a custom method's keys, or what *SPATIAL-UNNAMED-SLOT-POLICY* says for
+several (#60, spec §5.3).
 
 INDEXES is the set of live spatial indexes to scan; TYPE-NAMES is the class list
 results must satisfy, or NIL for :ALL (no filtering); TAGS is the same filter
 expressed as index-entry type tags, applied inside the scan (see
-%SCOPE-TYPE-TAGS), or NIL when it cannot be resolved.  A named class contributes
-every (owner . slot) index covering its geometry, so a slot declared on a mixin
-resolves to the ancestor's shared index -- and the type filter is what then keeps
-a sibling subclass's nodes out of the answer.  Indexes are deduped by KEY, not by
-struct identity, so two classes sharing an ancestor's index scan it once.
+%SCOPE-TYPE-TAGS), or NIL when it cannot be resolved.  Indexes are deduped by
+KEY, so two classes sharing an ancestor's index scan it once.
 
-An index that does not exist yet contributes nothing: indexes are created lazily on
-the first geometry-valued write, so a declared-but-empty index is a legitimate
-empty result, not a fault.
+An index that does not exist yet contributes nothing: indexes are created
+lazily on the first geometry-valued write, so a declared-but-empty index is a
+legitimate empty result, not a fault.
 
-Signals when a named class is not spatially indexed at all: that is a programming
-error, and catching it is the reason the scope is required."
-  (if (eq scope :all)
-      (values (all-spatial-indexes graph) nil nil :all)
-      (let* ((names (if (listp scope) scope (list scope)))
-             (keys (make-hash-table :test 'equalp))
-             (indexes '()))
-        (dolist (name names)
-          (unless (%class-geometry-slots-declared-p name)
-            ;; The caller's error, typed (GH #286).
-            (error 'query-precondition-error
-                   :reason (format nil "~S is not a spatially indexed class ~
+Signals when a named class is not spatially indexed at all: that is a
+programming error, and catching it is the reason the scope is required."
+  (let* ((all-p (eq scope :all))
+         (names (cond (all-p (%all-scope-classes graph))
+                      ((listp scope) scope)
+                      (t (list scope))))
+         (keys (make-hash-table :test 'equalp))
+         (indexes '()))
+    (dolist (name names)
+      (cond ((%class-geometry-slots-declared-p name)
+             (dolist (key (%scope-keys name slot :signal-missing (not all-p)))
+               (unless (gethash key keys)
+                 (setf (gethash key keys) t)
+                 (let ((idx (spatial-index-for graph (car key) (cdr key))))
+                   (when idx (push idx indexes))))))
+            (all-p nil)                 ; an aspatial class is not in :ALL
+            (t
+             ;; The caller's error, typed (GH #286).
+             (error 'query-precondition-error
+                    :reason (format nil "~S is not a spatially indexed class ~
 in ~S: it declares no :INDEX-marked geometry slot and has no NODE-GEOMETRY ~
-method." name (graph-name graph))))
-          (dolist (key (cdr (%spatial-scope-entry name)))
-            (unless (gethash key keys)
-              (setf (gethash key keys) t)
-              (let ((idx (spatial-index-for graph (car key) (cdr key))))
-                (when idx (push idx indexes))))))
-        (values indexes names (%scope-type-tags names graph)
-                (loop for k being the hash-keys of keys collect k)))))
+method." name (graph-name graph))))))
+    (values indexes
+            (if all-p nil names)
+            (if all-p nil (%scope-type-tags names graph))
+            (loop for k being the hash-keys of keys collect k))))
 
 (defun %scope-admits-p (node type-names)
   "True when NODE satisfies the scope's type filter (always, for :ALL)."

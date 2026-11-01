@@ -118,15 +118,217 @@ NEW window only."
 (test overlay-own-node-is-a-candidate-under-either-slot
   "GH #410 inside #60: an own node written in the open transaction is a
 candidate under whichever slot the query names."
-  (if t
-      (skip "Task 4 adds :SLOT")
-      (with-test-graph (g)
-        (declare (ignore g))
-        (with-transaction ()
-          (let ((n (ms-make-area)))
-            (is (member n (find-nodes-within 'ms-area
-                                             (ms-rect 29d0 49d0 31d0 51d0)
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-transaction ()
+      (let ((n (ms-make-area)))
+        (is (member n (find-nodes-within 'ms-area
+                                         (ms-rect 29d0 49d0 31d0 51d0)
+                                         :slot 'centroid)))
+        (is (member n (find-nodes-within 'ms-area
+                                         (ms-rect 34d0 54d0 37d0 57d0)
+                                         :slot 'outline)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Spec §5.3-5.4, §6.1: a query names the slot it tests.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex ms-base () ((loc :type geometry :index t))
+  :graph-db-integration-test)
+(def-vertex ms-special (ms-base)
+  ((precise-loc :type geometry :index t))
+  :graph-db-integration-test)
+(def-vertex ms-only-sub (ms-base) () :graph-db-integration-test)
+
+(defparameter *ms-area-of-interest* (list 29.8d0 49.8d0 30.2d0 50.2d0))
+
+(defun ms-area-of-interest () (apply #'ms-rect *ms-area-of-interest*))
+
+(defmacro ms-signals-naming (class-name &body body)
+  "True when BODY signals QUERY-PRECONDITION-ERROR whose text names CLASS-NAME."
+  `(handler-case (progn ,@body nil)
+     (query-precondition-error (c)
+       (and (search ,class-name (string-upcase (princ-to-string c))) t))))
+
+(test within-by-centroid-and-by-outline-differ
+  "Spec §2: a centroid query is a centroid query.  B's outline crosses the area
+but its centroid lies far outside it."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (a b (area (ms-area-of-interest)))
+      (with-transaction ()
+        (setq a (make-ms-area :centroid (make-point 30d0 50d0)
+                              :outline (ms-rect 29d0 49d0 31d0 51d0))
+              b (make-ms-area :centroid (make-point 40d0 60d0)
+                              :outline (ms-rect 29.5d0 49.5d0 30.5d0 50.5d0))))
+      (is (equal (list a) (find-nodes-within 'ms-area area :slot 'centroid)))
+      (is (equal (list a)
+                 (find-nodes-intersecting 'ms-area area :slot 'centroid)))
+      (is (= 2 (length (find-nodes-intersecting 'ms-area area
+                                                :slot 'outline))))
+      (if graph-db::*geos-available-p*
+          (is (null (find-nodes-within 'ms-area area :slot 'outline))
+              "neither outline lies within the area")
+          (skip "GEOS not available: exact containment of outlines")))))
+
+(test near-distance-is-measured-to-the-named-slot
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-transaction ()
+      (make-ms-area :centroid (make-point 30d0 50d0)
+                    :outline (ms-rect 30.5d0 50.5d0 30.7d0 50.7d0)))
+    (let ((by-centroid (find-nodes-near 'ms-area 50d0 30d0 1d5
+                                        :slot 'centroid))
+          (by-outline (find-nodes-near 'ms-area 50d0 30d0 1d5
+                                       :slot 'outline))
+          (expected (geodesic-distance 50d0 30d0 50.6d0 30.6d0)))
+      (is (= 1 (length by-centroid)))
+      (is (< (cdr (first by-centroid)) 1d0))
+      (is (= 1 (length by-outline)))
+      (is (< (abs (- (cdr (first by-outline)) expected)) (* 0.01 expected))
+          "distance to the outline's representative point"))))
+
+(test nearest-k-orders-by-the-named-slot
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (p q)
+      (with-transaction ()
+        (setq p (make-ms-area :centroid (make-point 30.01d0 50.01d0)
+                              :outline (ms-rect 30.1d0 50.1d0 30.2d0 50.2d0))
+              q (make-ms-area :centroid (make-point 30.1d0 50.1d0)
+                              :outline (ms-rect 29.99d0 49.99d0
+                                                30.03d0 50.03d0))))
+      (is (equal (list p q)
+                 (mapcar #'car (find-nearest-k 'ms-area 50d0 30d0 2
+                                               :slot 'centroid))))
+      (is (equal (list q p)
+                 (mapcar #'car (find-nearest-k 'ms-area 50d0 30d0 2
+                                               :slot 'outline)))))))
+
+(test unnamed-query-on-a-multi-slot-class-follows-the-policy
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((area (ms-area-of-interest)))
+      (with-transaction () (ms-make-area))
+      (let ((graph-db::*spatial-unnamed-slot-policy* :error))
+        (is-true (ms-signals-naming "MS-AREA"
+                   (find-nodes-within 'ms-area area)))
+        (is-true (ms-signals-naming "MS-AREA"
+                   (find-nodes-intersecting 'ms-area area)))
+        (is-true (ms-signals-naming "MS-AREA"
+                   (find-nodes-near 'ms-area 50d0 30d0 1d4)))
+        (is-true (ms-signals-naming "MS-AREA"
+                   (find-nearest-k 'ms-area 50d0 30d0 1))))
+      (let ((graph-db::*spatial-unnamed-slot-policy* :first-declared)
+            (warnings 0))
+        (remhash (find-class 'ms-area)
+                 graph-db::*spatial-first-declared-warned*)
+        (handler-bind ((warning (lambda (c)
+                                  (when (search "FIRST-DECLARED"
+                                                (string-upcase
+                                                 (princ-to-string c)))
+                                    (incf warnings))
+                                  (muffle-warning c))))
+          (is (equal (find-nodes-within 'ms-area area :slot 'centroid)
+                     (find-nodes-within 'ms-area area)))
+          (is (equal (find-nodes-near 'ms-area 50d0 30d0 1d4 :slot 'centroid)
+                     (find-nodes-near 'ms-area 50d0 30d0 1d4))))
+        (is (= 1 warnings) "one warning per class")))))
+
+(test single-slot-class-is-unchanged-with-or-without-slot
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((area (ms-rect 12.3d0 45.6d0 12.4d0 45.7d0)) (warned nil))
+      (with-transaction ()
+        (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
+      (handler-bind ((warning (lambda (c) (setf warned c) (muffle-warning c))))
+        (dolist (policy '(:error :first-declared))
+          (let ((graph-db::*spatial-unnamed-slot-policy* policy))
+            (is (= 1 (length (find-nodes-within 'scope-probe area))))
+            (is (equal (find-nodes-within 'scope-probe area)
+                       (find-nodes-within 'scope-probe area :slot 'geom)))
+            (is (equal (find-nodes-near 'scope-probe 45.672d0 12.3424d0 100d0)
+                       (find-nodes-near 'scope-probe 45.672d0 12.3424d0 100d0
+                                        :slot 'geom))))))
+      (is (null warned)))))
+
+(test parent-scope-reaches-a-subclass-slot
+  "The asymmetry folded into #60: a scope on the parent reaches an index a
+subclass declares on its own slot, by name."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (special only-sub (area (ms-area-of-interest)))
+      (with-transaction ()
+        (setq special (make-ms-special :loc (make-point 40d0 60d0)
+                                       :precise-loc (make-point 30d0 50d0))
+              only-sub (make-ms-only-sub :loc (make-point 30.05d0 50.05d0))))
+      (is (equal (list special)
+                 (find-nodes-within 'ms-base area :slot 'precise-loc)))
+      (is (equal (list only-sub)
+                 (find-nodes-within 'ms-base area :slot 'loc)))
+      (let ((graph-db::*spatial-unnamed-slot-policy* :error))
+        (is-true (ms-signals-naming "MS-SPECIAL"
+                   (find-nodes-within 'ms-base area))
+                 "the subclass is multi-slot: unnamed parent scope signals"))
+      (is (member special (find-nodes-within :all area :slot 'precise-loc)))
+      (is (equal (list only-sub) (find-nodes-within 'ms-only-sub area))
+          "a subclass with one inherited slot works unnamed"))))
+
+(test bad-slot-signals
+  "Review Focus 3: a slot nothing declares, in any spelling, signals."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((area (ms-area-of-interest)))
+      (with-transaction () (ms-make-area))
+      (is-true (ms-signals-naming "MS-AREA"
+                 (find-nodes-within 'ms-area area :slot 'nothing)))
+      (is-true (ms-signals-naming "MS-AREA"
+                 (find-nodes-within 'ms-area area :slot :centroid)))
+      (is-true (ms-signals-naming "MS-AREA"
+                 (find-nodes-within 'ms-area area :slot "centroid"))))))
+
+(test custom-method-class-with-slot
+  "Spec §5.1/§5.3: an application NODE-GEOMETRY method keys each node once; a
+:SLOT reaches the nodes keyed under that declared slot and nothing else."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (n (area (ms-area-of-interest)))
+      (with-transaction ()
+        (setq n (make-scope-two-geoms-reporting
+                 :centroid (make-point 30d0 50d0)
+                 :outline (scope-rect 35d0 55d0 36d0 56d0))))
+      (is (equal (list n) (find-nodes-within 'scope-two-geoms-reporting area
                                              :slot 'centroid)))
-            (is (member n (find-nodes-within 'ms-area
-                                             (ms-rect 34d0 54d0 37d0 57d0)
-                                             :slot 'outline))))))))
+      (is (null (find-nodes-within 'scope-two-geoms-reporting
+                                   (scope-rect 34d0 54d0 37d0 57d0)
+                                   :slot 'outline))
+          "the method never keys a node under OUTLINE")
+      (is-true (ms-signals-naming "SCOPE-TWO-GEOMS-REPORTING"
+                 (find-nodes-within 'scope-two-geoms-reporting area
+                                    :slot 'nothing)))
+      (is-true (ms-signals-naming "SCOPE-SITE"
+                 (find-nodes-within 'scope-site area :slot 'where))
+               "a one-value method class has no named slot")
+      (finishes (find-nodes-within :all area :slot 'precise-loc)))))
+
+(def-vertex ms-redef () ((a :type geometry :index t))
+  :graph-db-integration-test)
+
+(test redefining-a-class-to-two-slots-flips-the-unnamed-rule
+  "Review Focus 4: the memo follows the class."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((area (ms-area-of-interest))
+          (graph-db::*spatial-unnamed-slot-policy* :error))
+      (with-transaction () (make-ms-redef :a (make-point 30d0 50d0)))
+      (is (= 1 (length (find-nodes-within 'ms-redef area))))
+      (unwind-protect
+           (progn
+             (def-vertex ms-redef ()
+               ((a :type geometry :index t) (b :type geometry :index t))
+               :graph-db-integration-test)
+             (is-true (ms-signals-naming "MS-REDEF"
+                        (find-nodes-within 'ms-redef area))))
+        (def-vertex ms-redef () ((a :type geometry :index t))
+          :graph-db-integration-test))
+      (is (= 1 (length (find-nodes-within 'ms-redef area)))))))
