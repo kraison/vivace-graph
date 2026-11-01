@@ -1363,15 +1363,26 @@ two-value method naming a declared geometry slot keys it (CLASS . SLOT).
 By default the geometry is the class's UNNAMED resolution
  (%UNNAMED-SPATIAL-SLOT): its one declared geometry slot, or, with several,
 what *SPATIAL-UNNAMED-SLOT-POLICY* says -- so this signals on a multi-slot
-class under :ERROR exactly as an unnamed query does.  Engine maintenance reads
+class under :ERROR exactly as an unnamed query does.  The default reads the
+slot itself (%DECLARED-SLOT-GEOMETRY), never through NODE-GEOMETRIES, so an
+application method may CALL-NEXT-METHOD.  Engine maintenance reads
 NODE-GEOMETRIES, never this (#60, spec §5.1).")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
     (let ((class (class-of node)))
       (if (node-geometry-index-slots class)
           (let ((slot (%unnamed-spatial-slot class)))
-            (values (node-slot-geometry node slot) slot))
+            (values (%declared-slot-geometry node slot) slot))
           (values nil nil)))))
+
+(defun %declared-slot-geometry (node slot)
+  "The geometry NODE's declared SLOT holds, or NIL.  A direct slot read: the
+default NODE-GEOMETRY must not go through NODE-GEOMETRIES, which defers to an
+application NODE-GEOMETRY method that may CALL-NEXT-METHOD (#60)."
+  ;; NB: no SLOT-BOUNDP -- persistent slots read through
+  ;; SLOT-VALUE-USING-CLASS; the backing CLOS slot is always unbound.
+  (let ((v (ignore-errors (slot-value node slot))))
+    (and (geometryp v) v)))
 
 (defgeneric node-geometries (node)
   (:documentation
@@ -1388,11 +1399,9 @@ class.  Specialize this directly for a computed plural geometry.")
       (if (%node-geometry-method-owner-name class)
           (multiple-value-bind (geom slot) (node-geometry node)
             (when geom (list (cons slot geom))))
-          ;; NB: no SLOT-BOUNDP -- persistent slots read through
-          ;; SLOT-VALUE-USING-CLASS; the backing CLOS slot is always unbound.
           (loop for slot in (node-geometry-index-slots class)
-                for v = (ignore-errors (slot-value node slot))
-                when (geometryp v) collect (cons slot v))))))
+                for v = (%declared-slot-geometry node slot)
+                when v collect (cons slot v))))))
 
 (defun node-slot-geometry (node slot-name)
   "The geometry NODE holds under SLOT-NAME per NODE-GEOMETRIES, or NIL.  A NIL

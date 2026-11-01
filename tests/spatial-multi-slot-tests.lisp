@@ -311,6 +311,28 @@ subclass declares on its own slot, by name."
                "a one-value method class has no named slot")
       (finishes (find-nodes-within :all area :slot 'precise-loc)))))
 
+(def-vertex ms-fallthrough () ((where :type geometry :index t))
+  :graph-db-integration-test)
+
+(defmethod graph-db:node-geometry ((n ms-fallthrough))
+  "The register-tests shape: a method that falls through to the default."
+  (call-next-method))
+
+(test a-node-geometry-method-may-call-next-method
+  "Spec §5.1: an application method that falls through to the default
+terminates -- the default reads the declared slot itself and never re-enters
+NODE-GEOMETRIES, which would defer back to the method."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let (n (area (ms-area-of-interest)))
+      (with-transaction ()
+        (setq n (make-ms-fallthrough :where (make-point 30d0 50d0))))
+      (is (equal '(where) (mapcar #'car (node-geometries n))))
+      (is-true (geometryp (graph-db:node-geometry n)))
+      (is (equal (list n) (find-nodes-within 'ms-fallthrough area)))
+      (is (equal (list n)
+                 (find-nodes-within 'ms-fallthrough area :slot 'where))))))
+
 (def-vertex ms-redef () ((a :type geometry :index t))
   :graph-db-integration-test)
 
