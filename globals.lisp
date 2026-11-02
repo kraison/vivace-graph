@@ -121,7 +121,8 @@ are not checked against the registry.")
 ;; independent of +STORAGE-VERSION+.  v8 (#187) widens type-id from 2 to 4
 ;; bytes; v5/v6/v7 stay readable, because a cleanly-closed memory graph's
 ;; image is its ONLY durable copy -- the journal is cleared on checkpoint.
-(alexandria:define-constant +native-image-version+ 8)
+;; 9 since #60 (see memory-graph.lisp's writer).
+(alexandria:define-constant +native-image-version+ 9)
 (alexandria:define-constant +image-type-id-bytes+  4)
 (alexandria:define-constant +fixed-integer-64+    #x01)
 (alexandria:define-constant +data-magic-byte+     #x17)
@@ -492,6 +493,17 @@ not match established segment dimension ~D"
 ;;; index arity.  Distinct from SIMPLE-ERROR / TYPE-ERROR so a server can
 ;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
 ;;; (query/dsl.lisp) is its DSL-level subclass.
+
+;;; #60 spec §4.4: what an UNNAMED spatial query does on a class with several
+;;; geometry slots.  :ERROR (default) signals QUERY-PRECONDITION-ERROR;
+;;; :FIRST-DECLARED tests the first declared slot and warns once per class.
+;;; A transition switch for consumers porting to :SLOT; removed in the next
+;;; major release after they have.  Defined here so every file binds the
+;;; same special (the GH #92 trap).
+(defvar *spatial-unnamed-slot-policy* :error
+  "How an unnamed spatial query resolves on a class with several geometry
+slots: :ERROR (default) or :FIRST-DECLARED (first declared slot, one warning
+per class).  Transitional (#60).")
 
 (define-condition query-precondition-error (error)
   ((reason :initarg :reason :reader query-precondition-error-reason))

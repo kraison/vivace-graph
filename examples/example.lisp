@@ -49,11 +49,14 @@
   :test-graph)
 
 ;; A geometry slot marked :index t opts the type into the spatial index: every
-;; merchant is automatically (re)indexed by its LOCATION on commit, with no
-;; hand-written node-geometry method.  (make-point takes lon, lat in WGS84.)
+;; merchant is automatically (re)indexed on commit, with no hand-written
+;; node-geometry method.  (make-point takes lon, lat in WGS84.)  A class may
+;; declare several geometry slots; a node is indexed under every one it binds,
+;; and a query names the slot it tests (#60).
 (def-vertex merchant ()
   ((name :type string)
-   (location :type geometry :index t))
+   (location :type geometry :index t)
+   (service-area :type geometry :index t :spatial-precision 5))
   :test-graph)
 
 (def-edge likes ()
@@ -117,15 +120,25 @@
         (c2 (make-customer :first-name "Jill" :last-name "Blow" :email "jill@blow.com"))
         ;; m1 carries a LOCATION (lon, lat); committing it indexes it spatially.
         (m1 (make-merchant :name "Snake Oil, Inc."
-                           :location (make-point 12.3424d0 45.6720d0)))
+                           :location (make-point 12.3424d0 45.6720d0)
+                           :service-area (make-polygon
+                                          '(((12.30d0 45.64d0) (12.40d0 45.64d0)
+                                             (12.40d0 45.70d0) (12.30d0 45.70d0)
+                                             (12.30d0 45.64d0))))))
         (p1 (make-product :name "Oil of Longevity" :upc "1234567890"
                           :embedding #(0.9 0.1 0.0)))
         (p2 (make-product :name "Oil of Slipperiness" :upc "abcdefghijk"
                           :embedding #(0.7 0.6 0.1))))
     ;; Two more merchants: one ~1 km away, one in another city -- so the
     ;; proximity queries below have something to discriminate.
+    ;; Elixir Emporium also serves an area; Faraway Tonics has none, so it is
+    ;; indexed under LOCATION only.
     (make-merchant :name "Elixir Emporium" :location (make-point 12.3520d0
-                                                       45.6780d0))
+                                                       45.6780d0)
+                   :service-area (make-polygon
+                                  '(((12.34d0 45.67d0) (12.37d0 45.67d0)
+                                     (12.37d0 45.69d0) (12.34d0 45.69d0)
+                                     (12.34d0 45.67d0)))))
     (make-merchant :name "Faraway Tonics"  :location (make-point 2.4683d0
                                                        41.7763d0))
     (make-sells :from m1 :to p1)
@@ -243,37 +256,47 @@
 
 ;;; Spatial queries
 ;;;
-;;; Because MERCHANT has a (location :type geometry :index t) slot, every
-;;; merchant was placed in the graph's spatial index on commit.  No extra
-;;; bookkeeping is needed -- the transaction write-path maintains it.
+;;; Because MERCHANT has two geometry slots marked :index t, every merchant
+;;; was placed in the LOCATION index and, when it has one, the SERVICE-AREA
+;;; index on commit.  No extra bookkeeping is needed -- the transaction
+;;; write-path maintains both.
 
 ;; Every spatial query takes a SCOPE first: a node-class name, a list of them,
 ;; or :ALL.  The scope picks which per-class index is scanned AND filters the
 ;; results by type, so a query for merchants can never return anything else.
+;; A class with several geometry slots names the one the query tests with
+;; :SLOT; leaving it out on such a class signals (a one-slot class needs no
+;; :SLOT).
 
-;; Merchants within 2 km of a downtown point (lat, lon, radius-metres).
-;; Returns (merchant . distance-metres) pairs, nearest first.
-(find-nodes-near 'merchant 45.6720d0 12.3424d0 2000d0)
+;; Merchants within 2 km of a downtown point (lat, lon, radius-metres), by
+;; their LOCATION.  Returns (merchant . distance-metres) pairs, nearest first.
+(find-nodes-near 'merchant 45.6720d0 12.3424d0 2000d0 :slot 'location)
 ;; => Snake Oil, Inc. (~0 m) and Elixir Emporium (~1 km); Faraway Tonics
 ;;    (another city) is excluded.
 
 ;; The two nearest merchants to that same point, nearest first.
-(find-nearest-k 'merchant 45.6720d0 12.3424d0 2)
+(find-nearest-k 'merchant 45.6720d0 12.3424d0 2 :slot 'location)
 
 ;; Merchants whose location falls inside an area of interest (a polygon, given
 ;; as rings of (lon lat) -- the first ring is the outer boundary).
-(find-nodes-within
- 'merchant
- (make-polygon '(((12.335d0 45.666d0) (12.365d0 45.666d0)
-                  (12.365d0 45.682d0) (12.335d0 45.682d0)
-                  (12.335d0 45.666d0)))))
+(defparameter *downtown*
+  (make-polygon '(((12.335d0 45.666d0) (12.365d0 45.666d0)
+                   (12.365d0 45.682d0) (12.335d0 45.682d0)
+                   (12.335d0 45.666d0)))))
+(find-nodes-within 'merchant *downtown* :slot 'location)
 
-;; The same proximity query, composed in Prolog.  find-near/5 takes the scope as
-;; its second argument and yields nodes, so it cooperates with the rest of the
-;; query language.  (The scope already restricts the answer to merchants, so the
-;; is-a goal the pre-scope API needed is no longer required.)
+;; The same area against the other geometry: merchants whose SERVICE-AREA
+;; overlaps downtown.  Faraway Tonics has no service area and is not in that
+;; index at all.
+(find-nodes-intersecting 'merchant *downtown* :slot 'service-area)
+
+;; The same proximity query, composed in Prolog.  find-near/6 takes the scope
+;; and then the slot, and yields nodes, so it cooperates with the rest of the
+;; query language.  (The scope already restricts the answer to merchants, so
+;; the is-a goal the pre-scope API needed is no longer required; a one-slot
+;; class may use find-near/5 without the slot.)
 (select-flat (?m)
-  (find-near ?m merchant 45.6720d0 12.3424d0 2000d0))
+  (find-near ?m merchant location 45.6720d0 12.3424d0 2000d0))
 
 ;;; Updating a node ------------------------------------------------------
 ;;;

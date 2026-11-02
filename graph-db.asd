@@ -700,6 +700,7 @@ cl-temporal-extent."
                (:file "spatial-query-tests")
                (:file "spatial-intersect-tests")
                (:file "spatial-scope-tests")
+               (:file "spatial-multi-slot-tests")  ; #60
                (:file "subset-replication-tests")
                (:file "peer-lamport-tests")
                (:file "peer-merge-tests")

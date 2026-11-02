@@ -126,6 +126,19 @@ not the keyword ~S" key v)))
                  ((not (and (symbolp v) v))
                   (bad (format nil "~S must be a symbol, not ~S" key v))))
                v))
+           (opt-symbol (key &key nil-ok)
+             "An optional sub-key: absent is fine; present, it must be a
+non-keyword symbol -- NIL too only when NIL-OK (#60, spec §6.3)."
+             (let ((v (%facet-value value key)))
+               (cond
+                 ((eq v +facet-absent+) nil)
+                 ((keywordp v)
+                  (bad (format nil "~S must be a slot or function name, ~
+not the keyword ~S" key v)))
+                 ((and (null v) nil-ok) nil)
+                 ((not (and (symbolp v) v))
+                  (bad (format nil "~S must be a symbol, not ~S" key v)))
+                 (t v))))
            (req-scope (key)
              "A required sub-key naming a spatial SCOPE: a class name, or
 a non-empty proper list of class names -- what REGISTER-GEOMETRY takes.
@@ -194,7 +207,9 @@ non-empty list of class names, not ~S" key v))))
          (req-string :rule-version)
          (req :precision-fn)
          (req :confidence-fn)
-         (req :method-fn))
+         (req :method-fn)
+         (opt-symbol :registry-slot)
+         (opt-symbol :geometry-fn :nil-ok t))
         (:indexed-text
          (req-symbol :text-fn))))
     value))

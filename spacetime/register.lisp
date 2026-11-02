@@ -67,8 +67,12 @@ reporting a larger overlap."
               subject-measure))))
 
 (defun register-geometry (geometry registry
-                          &key (registry-graph graph-db:*graph*))
+                          &key slot (registry-graph graph-db:*graph*))
   "Registrations of GEOMETRY against REGISTRY's regions in REGISTRY-GRAPH.
+
+SLOT names the regions' geometry slot the scan tests and measures, as
+FIND-NODES-INTERSECTING's :SLOT; NIL is the unnamed resolution, which
+signals on a registry class with several geometry slots (#60, spec §6.3).
 
 REGISTRY is a spatial SCOPE -- a node-class name, a list of them, or
 :ALL (spatial-query.lisp).  ⚠ REGISTRY-GRAPH is the REGISTRY'S graph, not
@@ -128,12 +132,15 @@ region drops as a touch."
                  (registrations '())
                  (unmeasured '()))
             (dolist (region (graph-db:find-nodes-intersecting
-                             registry geometry :graph registry-graph))
+                             registry geometry :graph registry-graph
+                             :slot slot))
               ;; ONLY geos-error, and only around THIS region's measure:
               ;; a refusal here is one region's, not the scan's (GH #164).
               ;; Broader would swallow the node-escape class (GH #53).
               (handler-case
-                  (let* ((g (graph-db:node-geometry region))
+                  (let* ((g (if slot
+                                (graph-db:node-slot-geometry region slot)
+                                (graph-db:node-geometry region)))
                          (f (and g (%overlap-fraction subject g measure
                                                       subject-measure))))
                     ;; A zero fraction is a TOUCH, not an overlap: dropped
@@ -408,7 +415,12 @@ anyway."
         (values 0 t nil nil 0)
         (let (geometry subject-ns subject-key precision confidence method)
           (let ((graph-db:*graph* graph))
-            (setf geometry (graph-db:node-geometry node)
+            ;; A :GEOMETRY-FN picks the record's geometry when the source
+            ;; has several; else the class's unnamed one (#60, spec §6.3).
+            (setf geometry (let ((fn (getf facet :geometry-fn)))
+                             (if fn
+                                 (funcall fn node)
+                                 (graph-db:node-geometry node)))
                   precision (%call-or-nil (getf facet :precision-fn) node)
                   confidence (%call-or-nil (getf facet :confidence-fn)
                                            node)
@@ -424,6 +436,7 @@ anyway."
               (values 0 nil nil nil 0)
               (multiple-value-bind (regs evaluated unmeasured)
                   (register-geometry geometry (getf facet :registry)
+                                     :slot (getf facet :registry-slot)
                                      :registry-graph registry-graph)
                 (if (not evaluated)
                     (values 0 nil nil nil 0)
