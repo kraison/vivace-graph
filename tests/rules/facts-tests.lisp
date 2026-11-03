@@ -754,3 +754,86 @@ no fixture: every store this suite makes carries the axis."
                                    (claim-touched-at ?c ?t)
                                    (lisp ?cur *cursor*)
                                    (instant> ?t ?cur)))))))
+
+;;; ---------------------------------------------------------------------
+;;; claim-after/9: claim/7 with strict lower bounds on the keys, whose
+;;; namespace route skips a key before reading its claims (GH #451).
+;;; ---------------------------------------------------------------------
+
+(test claim-after-with-no-bounds-answers-claim-rows
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("h1" "h1" "h2" "h2")
+               (select-flat (?k)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o nil nil))))))
+
+(test claim-after-skips-subject-keys-at-or-below-the-bound
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("h2" "h2")
+               (select-flat (?k)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o "h1" nil))))
+    (is (null (select-flat (?k)
+                (claim-after ?c rt-claim "host" ?k ?r ?ons ?o "h2" nil))))
+    (is (= 4 (length (select-flat (?k)
+                       (claim-after ?c rt-claim "host" ?k ?r ?ons ?o
+                                    "" nil)))))
+    ;; >/2 fails on a string against a number: nothing qualifies.
+    (is (null (select-flat (?k)
+                (claim-after ?c rt-claim "host" ?k ?r ?ons ?o 5 nil))))))
+
+(test claim-after-bounds-the-object-key-on-the-object-route
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("web" "web")
+               (select-flat (?o)
+                 (claim-after ?c rt-claim ?sns ?s ?r "app" ?o nil "db"))))))
+
+(test claim-after-filters-on-the-routes-it-cannot-skip
+  "Both namespaces bound: the subject route, the object bound a filter.
+Subject key bound: the bound-key route, same."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("h1" "web") ("h2" "web"))
+               (sort (select () (?s ?o)
+                       (claim-after ?c rt-claim "host" ?s "runs" "app" ?o
+                                    nil "db"))
+                     #'string< :key #'first)))
+    (is (equal '("web")
+               (select-flat (?o)
+                 (claim-after ?c rt-claim "host" "h1" "runs" "app" ?o
+                              nil "db"))))
+    ;; An object bound excludes a unary claim: > on NIL fails.
+    (is (equal '("runs" "runs" "runs")
+               (select-flat (?r)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o nil ""))))))
+
+(test an-unbound-bound-is-no-bound
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (length (select-flat (?k)
+                       (claim-after ?c rt-claim "host" ?k ?r ?ons ?o
+                                    ?after nil)))))))
+
+(test a-bounded-namespace-route-costs-its-own-keys
+  "60 keys, bound at k55: the route reads four keys -- four index
+lookups, not sixty -- and answers under a budget of 30, which covers
+four keys' goals and not sixty.  The same bound as a separate goal
+after a TRUE still reads every key and blows the budget.  The lookup
+count is what sees the skip: a claim the filter drops never reaches a
+goal, so the budget alone cannot tell skip from filter."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (claim-after ?c rt-claim "host" ?k "up" ?ons ?o
+                                "k55" nil))))
+      (is (= 4 n)))
+    (counting-lookups (n)
+      (signals graph-db::prolog-resource-error
+        (select (:flat t :max-inferences 30) (?k)
+          (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+          (true)
+          (> ?k "k55")))
+      (is (< 4 n)))))

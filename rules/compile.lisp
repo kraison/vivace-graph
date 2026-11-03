@@ -287,6 +287,14 @@ them leaves the relation unbound (ruling P6)."
               (pushnew rel reads :test #'string=)
               (return-from %body-reads :any)))))))
 
+(defun %mentions-claim-after-p (goals)
+  "A CLAIM-AFTER/9 goal anywhere in GOALS, at any nesting: the reads
+and strata analyses recognise CLAIM/7 by name, so a rule writes that
+and the comparison (#451)."
+  (and (consp goals)
+       (or (%engine-goal-p goals "CLAIM-AFTER" 9)
+           (some #'%mentions-claim-after-p goals))))
+
 (defun %not-goal-p (goal)
   "(not G): the guard admits only a full goal as G."
   (and (consp goal) (symbolp (first goal))
@@ -453,6 +461,9 @@ by both a stored rule and a DEF-RULE is a collision, refused."
       (%refuse spec "the head must be exactly one claim/7 pattern"))
     (multiple-value-bind (vars goals) (%guard spec graph)
       (declare (ignore vars))
+      (when (%mentions-claim-after-p goals)
+        (%refuse spec "claim-after/9 is not a rule premise: write ~
+claim/7 and the comparison, the compiler fuses them (#451)"))
       (let* ((head (first goals))
              (body (%order-body (rest goals)))
              (body-vars (%body-variables spec body)))

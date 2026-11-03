@@ -103,6 +103,9 @@ scan route's own union (GH #333)."
 alone when it is NIL."
   (or *claim-scope* (list *graph*)))
 
+;; NOTINLINE: the #451 cost tests count calls by swapping it (ECL would
+;; otherwise compile same-file calls directly, CLAUDE.md engine traps).
+(declaim (notinline %scope-lookup))
 (defun %scope-lookup (class-name slots value)
   "INDEX-LOOKUP over every store in scope, in scope order.  A FOREIGN
 store whose schema does not carry CLASS-NAME contributes nothing --
@@ -260,47 +263,44 @@ the own store still signals."
                              (query-precondition-error () '()))))
        nil))))
 
-(defun %namespace-route (family role namespace rel emit)
+(defun %key-after-p (key bound)
+  "T when BOUND is NIL, else when KEY is > BOUND by >/2's own predicate:
+the one test CLAIM-AFTER/9 skips and filters by, so a skipped claim is
+always one the comparison rejects (#451)."
+  (or (null bound) (%ordered-p #'> #'string> key bound)))
+
+(defun %namespace-route (family role namespace rel emit &key after)
   "GH #389: every claim whose ROLE endpoint sits in NAMESPACE, key by
 key -- the keys from the vocabulary index, each key's claims from the
 same subject or object index the bound-key routes read, in ascending
 key order.  Bounded, unlike the walk: the work between two %TICKs is
-one key's claims, so a budget preempts between keys.  This run's own
+one key's claims, so a budget preempts between keys.  A key not
+%KEY-AFTER-P AFTER is skipped before its lookup (#451).  This run's own
 derivation follows, unfiltered; %UNIFY-CLAIM re-filters (GH #333)."
   (let ((parent (graph-db.spacetime:claim-family-parent family))
         (binary (graph-db.spacetime:claim-family-binary family)))
     (dolist (key (%scope-keys family role namespace))
-      (mapc emit
-            (%exclude-producers
-             (ecase role
-               (:subject
-                (if rel
-                    (%scope-lookup parent
-                                   +claim-subject-relation-index-slots+
-                                   (list namespace key rel))
-                    (%scope-lookup parent +claim-subject-index-slots+
-                                   (list namespace key))))
-               (:object
-                (%scope-lookup binary +claim-object-index-slots+
-                               (list namespace key)))))))
+      (when (%key-after-p key after)
+        (mapc emit
+              (%exclude-producers
+               (ecase role
+                 (:subject
+                  (if rel
+                      (%scope-lookup parent
+                                     +claim-subject-relation-index-slots+
+                                     (list namespace key rel))
+                      (%scope-lookup parent +claim-subject-index-slots+
+                                     (list namespace key))))
+                 (:object
+                  (%scope-lookup binary +claim-object-index-slots+
+                                 (list namespace key))))))))
     (mapc emit (%derived-all))))
 
-(def-global-prolog-functor claim/7
-    (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
-  "Claims of ?FAMILY (a parent class name) as facts: subject namespace
-and key, relation, object namespace and key.  A namespace answers as the
-lowercase wire string, or as the keyword when the argument was already
-bound to one; a unary claim's object pair is NIL.  Generates from the
-subject index when the subject is bound, the object index when the object
-is, the producer index through CLAIM-PRODUCER/2 in the same body; a
-namespace bound without its key generates key by key from the
-vocabulary index (GH #389).  A bound namespace naming no keyword answers
-empty; every other goal the routes miss reaches the COND's last clause,
-which walks the family or is refused as cost-unbounded under a resource
-bound (GH #285, spec §4).  The indexed routes and the walk read every
-store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
-NIL; a bound ?C and the empty fast paths read no store at all (spec
-§10, GH #332).  Solution order: docs/rules.md \"Solution order\"."
+(defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
+                    skey-after okey-after cont)
+  "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
+bound) applied as %KEY-AFTER-P filters on every route and as skips on
+the namespace routes (#451)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
@@ -316,8 +316,19 @@ NIL; a bound ?C and the empty fast paths read no store at all (spec
     ;; keyed like the index it substitutes for (GH #333, C1);
     ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
     (flet ((emit (claim)
-             (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
-                           cont)))
+             ;; The bounds filter on every route; the namespace routes
+             ;; also skip by them (#451).
+             (when (or (not (typep claim parent))
+                       (and (%key-after-p
+                             (graph-db.spacetime:claim-subject-key claim)
+                             skey-after)
+                            (%key-after-p
+                             (and (typep claim binary)
+                                  (graph-db.spacetime:claim-object-key
+                                   claim))
+                             okey-after)))
+               (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
+                             cont))))
       (cond ((node-p c) (emit c))
             ((and sns skey rel)
              (mapc #'emit
@@ -350,12 +361,50 @@ NIL; a bound ?C and the empty fast paths read no store at all (spec
             ;; A namespace without its key: the vocabulary routes
             ;; (GH #389).  Subject first, so a goal binding both
             ;; namespaces and neither key enumerates subjects.
-            (sns (%namespace-route family :subject sns rel #'emit))
-            (ons (%namespace-route family :object ons nil #'emit))
+            (sns (%namespace-route family :subject sns rel #'emit
+                                   :after skey-after))
+            (ons (%namespace-route family :object ons nil #'emit
+                                   :after okey-after))
             (t (mapc #'emit
                      (append (%exclude-producers
                               (%unbound-claim-scan family))
                              (%derived-all))))))))
+
+(def-global-prolog-functor claim/7
+    (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
+  "Claims of ?FAMILY (a parent class name) as facts: subject namespace
+and key, relation, object namespace and key.  A namespace answers as the
+lowercase wire string, or as the keyword when the argument was already
+bound to one; a unary claim's object pair is NIL.  Generates from the
+subject index when the subject is bound, the object index when the object
+is, the producer index through CLAIM-PRODUCER/2 in the same body; a
+namespace bound without its key generates key by key from the
+vocabulary index (GH #389).  A bound namespace naming no keyword answers
+empty; every other goal the routes miss reaches the COND's last clause,
+which walks the family or is refused as cost-unbounded under a resource
+bound (GH #285, spec §4).  The indexed routes and the walk read every
+store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
+NIL; a bound ?C and the empty fast paths read no store at all (spec
+§10, GH #332).  Solution order: docs/rules.md \"Solution order\".
+A > on the key right after this goal compiles to CLAIM-AFTER/9, which
+starts the namespace route at the bound (#451)."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil cont))
+
+(def-global-prolog-functor claim-after/9
+    (?c ?family ?sns ?skey ?rel ?ons ?okey ?skey-after ?okey-after cont)
+  "CLAIM/7's rows whose subject key is > ?SKEY-AFTER and whose object
+key is > ?OKEY-AFTER, by >/2's own predicate (two strings lexically,
+anything else fails); an unbound or NIL bound admits every row, and an
+object bound excludes a unary claim.  The namespace route for a bound
+key skips the earlier keys before reading their claims, so a page by
+key costs its own keys' claims at any depth.  The compiler writes this
+goal for a CLAIM/7 followed at once by a > on its key (spec §2); it may
+be written by hand, except in a rule body, which COMPILE-RULE refuses
+(#451)."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey
+               (%prolog-index-bound ?skey-after)
+               (%prolog-index-bound ?okey-after)
+               cont))
 
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which

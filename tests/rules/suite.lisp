@@ -164,6 +164,29 @@ keywords.  Returns the record."
                            :standing :observed
                            :extent (interval (ts 2026 4 1) (ts 2026 12 31)))))
 
+(defun seed-keys (g n &key (relation "up"))
+  "N unary rt-claims under :HOST, keys \"k00\" upward, zero padded to
+two digits so string order is numeric order (GH #451 cost tests)."
+  (with-transaction ((graph-db::transaction-manager g))
+    (dotimes (i n)
+      (make-rt-claim-unary :graph g :subject-namespace :host
+                           :subject-key (format nil "k~2,'0D" i)
+                           :relation relation :producer "p"
+                           :standing :observed))))
+
+(defmacro counting-lookups ((counter) &body body)
+  "BODY with COUNTER bound to a place counting %SCOPE-LOOKUP calls: the
+index reads a claim route pays, one per key on a namespace route
+(GH #451).  The swap is undone on exit."
+  (let ((orig (gensym "ORIG")) (cell (gensym "CELL")))
+    `(let* ((,cell (list 0))
+            (,orig (fdefinition 'graph-db::%scope-lookup)))
+       (setf (fdefinition 'graph-db::%scope-lookup)
+             (lambda (&rest args) (incf (car ,cell)) (apply ,orig args)))
+       (unwind-protect
+            (symbol-macrolet ((,counter (car ,cell))) ,@body)
+         (setf (fdefinition 'graph-db::%scope-lookup) ,orig)))))
+
 ;; S3: a second store the scope tests read from (spec §10, GH #332).  The
 ;; same families, declared under B's name too -- the registry is per
 ;; family symbol, the indexes per store (S2 recon A4) -- and every
