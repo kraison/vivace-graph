@@ -215,7 +215,7 @@ method) lands in the method owner's index, not a per-subclass one."
   #+ecl (make-hash-table :test 'equal
                          #+graph-db-ecl-sync-hash :synchronized
                          #+graph-db-ecl-sync-hash t)
-  "Memo of %SCOPE-KEYS: (NAME :SLOT SLOT) or (NAME :UNNAMED POLICY) -> keys.
+  "Memo of %SPATIAL-SCOPE-KEYS: (NAME :SLOT SLOT) or (NAME :UNNAMED POLICY) -> keys.
 The policy is part of the unnamed key so a binding change is never answered
 from a memo made under the other policy.  Cleared with *SPATIAL-SCOPE-MEMO*.")
 
@@ -279,7 +279,10 @@ multi-slot class, signalling under :ERROR) (#60, spec §5.3)."
     (dolist (c (%class-and-subclasses class) (nreverse names))
       (dolist (n (node-geometry-index-slots c)) (pushnew n names)))))
 
-(defun %scope-keys (class-name slot &key (signal-missing t))
+;; Not %SPATIAL-SCOPE-KEYS: rules/facts.lisp, also homed in GRAPH-DB, defines one
+;; with that name, and the later load won in any image holding both
+;; (#451, found by CI).
+(defun %spatial-scope-keys (class-name slot &key (signal-missing t))
   "The (OWNER . SLOT) keys a scope naming CLASS-NAME covers, with SLOT (a slot
 name) or unnamed (NIL), memoized.  With SIGNAL-MISSING, signals
 QUERY-PRECONDITION-ERROR when SLOT names a geometry slot neither the class nor
@@ -392,7 +395,8 @@ programming error, and catching it is the reason the scope is required."
          (indexes '()))
     (dolist (name names)
       (cond ((%class-geometry-slots-declared-p name)
-             (dolist (key (%scope-keys name slot :signal-missing (not all-p)))
+             (dolist (key (%spatial-scope-keys name slot
+                                               :signal-missing (not all-p)))
                (unless (gethash key keys)
                  (setf (gethash key keys) t)
                  (let ((idx (spatial-index-for graph (car key) (cdr key))))
