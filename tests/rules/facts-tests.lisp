@@ -886,6 +886,14 @@ fused it."
                  (select (:flat t :max-inferences 30) (?k)
                    (claim ?c rt-claim "host" ?k "up" ?ons ?o)
                    (> ?k "k55"))))
+      (is (= 4 n)))
+    ;; The bound through a variable bound at run time.
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (= ?b "k55")
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k ?b))))
       (is (= 4 n)))))
 
 (test the-guard-path-is-fused
@@ -906,11 +914,15 @@ fused it."
 so the bound-key route runs and the bound only filters."
   (with-rules-graph (g)
     (seed-keys g 60)
-    (is (equal '("k57")
-               (select (:flat t :max-inferences 1000) (?k)
-                 (= ?k "k57")
-                 (claim ?c rt-claim "host" ?k "up" ?ons ?o)
-                 (> ?k "k55"))))
+    (counting-lookups (n)
+      (is (equal '("k57")
+                 (select (:flat t :max-inferences 1000) (?k)
+                   (= ?k "k57")
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k "k55"))))
+      ;; One lookup: the bound-key route, not four from the namespace
+      ;; route with its k55 bound.
+      (is (= 1 n)))
     (is (null (select (:flat t :max-inferences 1000) (?k)
                 (= ?k "k50")
                 (claim ?c rt-claim "host" ?k "up" ?ons ?o)

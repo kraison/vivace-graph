@@ -659,13 +659,13 @@ inline, composing with cut and the control constructs.  When Goal is a variable
   (rest list))
 
 (defvar *clause-body-rewriters* '()
-  "Functions (GOALS) -> GOALS applied in order to a clause body before
-it compiles.  A rewriter returns an equivalent body: same solutions,
-same order.  Subsystems register (rules/facts.lisp, #451); core
-registers none.")
+  "Functions (GOALS) -> GOALS applied in list order -- PUSHNEW puts the
+most recently registered first -- to a clause body before it compiles.
+A rewriter returns an equivalent body: same solutions, same order.
+Subsystems register (rules/facts.lisp, #451); core registers none.")
 
 (defun %rewrite-clause-body (goals)
-  "GOALS through every registered rewriter, in registration order."
+  "GOALS through every registered rewriter, in list order."
   (reduce (lambda (goals f) (funcall f goals))
           *clause-body-rewriters* :initial-value goals))
 

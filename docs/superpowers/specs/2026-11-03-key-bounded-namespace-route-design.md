@@ -170,10 +170,11 @@ is compiled. A rewriter returns an equivalent body: same solutions, same
 order. Registered by subsystems (rules/facts.lisp); core registers none.")
 ```
 
-applied to the clause's body before `compile-body`. Rules pushes
-`%fuse-key-bounds` onto it at load time, once (`pushnew`). A rewriter
-runs on every clause compiled, so it must be cheap on bodies it does not
-touch: one pass, no consing when nothing matches.
+applied to the clause's body before `compile-body`, in list order,
+most recently registered first. Rules pushes `%fuse-key-bounds` onto it
+at load time, once (`pushnew`). A rewriter runs on every clause
+compiled, so it must be cheap on bodies it does not touch: one pass,
+and it returns the input list itself when nothing matches.
 
 Compile-time only, and `select` compiles its clause at macroexpansion
 time: a `select` in a source file is rewritten when that file compiles,

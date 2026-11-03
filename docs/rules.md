@@ -35,7 +35,8 @@ cost-unbounded rule below.
 
 The subsystem's package is `graph-db.rules` (spec §3), but
 `rules/facts.lisp` is `(in-package #:graph-db)` and the `name/arity`
-symbols -- `claim/7`, `claim-current/1`, `claim-valid-at/2`,
+symbols -- `claim/7`, `claim-after/9`, `claim-current/1`,
+`claim-valid-at/2`,
 `claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
 `claim-retracted-at/2`, `claim-touched-at/2`,
 `claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
@@ -58,6 +59,7 @@ pathname and its `graph-db.rules` package are unchanged.
 
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
+(claim-after ?c family ?sns ?skey ?rel ?ons ?okey skey-after okey-after)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
 (claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
@@ -71,6 +73,7 @@ pathname and its `graph-db.rules` package are unchanged.
 | functor | answers |
 |---|---|
 | `claim/7` | a claim of `family`, and its endpoints |
+| `claim-after/9` | `claim/7`'s rows with strict lower bounds on both keys, the namespace route started at the bound; "Solution order" (GH #451) |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
 | `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
@@ -308,7 +311,8 @@ costs one comparison per earlier key plus its own keys' claims, at any
 depth (GH #451). The comparison stays in the body, so a claim the route
 skips is always one the comparison would have rejected. Not fused, and
 so paid for by the comparison alone: `>=`, `<`, a numeric bound, any
-goal or cut between the two, a comparison inside `or`, `not` or `if`.
+goal or cut between the two, a comparison inside `or`, `not`, `if`,
+`once` or `forall`.
 A `select` is rewritten when its file compiles, so a file compiled
 before `graph-db/rules` loaded is not fused until recompiled; a guarded
 query is compiled per request and always is.

@@ -276,7 +276,8 @@ same subject or object index the bound-key routes read, in ascending
 key order.  Bounded, unlike the walk: the work between two %TICKs is
 one key's claims, so a budget preempts between keys.  A key not
 %KEY-AFTER-P AFTER is skipped before its lookup (#451).  This run's own
-derivation follows, unfiltered; %UNIFY-CLAIM re-filters (GH #333)."
+derivation follows, whatever its namespace or role; %UNIFY-CLAIM
+re-filters (GH #333)."
   (let ((parent (graph-db.spacetime:claim-family-parent family))
         (binary (graph-db.spacetime:claim-family-binary family)))
     (dolist (key (%scope-keys family role namespace))
@@ -317,7 +318,9 @@ the namespace routes (#451)."
     ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
     (flet ((emit (claim)
              ;; The bounds filter on every route; the namespace routes
-             ;; also skip by them (#451).
+             ;; also skip by them (#451).  A non-PARENT node (a bound
+             ;; ?c, another family's derivation) has no key to read
+             ;; and is left to %UNIFY-CLAIM's own TYPEP.
              (when (or (not (typep claim parent))
                        (and (%key-after-p
                              (graph-db.spacetime:claim-subject-key claim)
