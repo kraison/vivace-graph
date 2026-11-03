@@ -1016,6 +1016,7 @@ Measurement-only; always returns T."
            (bench-peer-replication)
            (bench-vector-search)
            (bench-claim-linking)
+           (bench-claim-key-paging)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).
