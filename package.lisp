@@ -575,6 +575,7 @@
            #:init-prolog
            #:*prolog-graph*
            #:*prolog-trace*
+           #:*clause-body-rewriters*
            #:trace-prolog
            #:untrace-prolog
            #:make-node-table

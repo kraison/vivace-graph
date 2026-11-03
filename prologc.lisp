@@ -658,6 +658,17 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defmethod clause-body ((list list))
   (rest list))
 
+(defvar *clause-body-rewriters* '()
+  "Functions (GOALS) -> GOALS applied in order to a clause body before
+it compiles.  A rewriter returns an equivalent body: same solutions,
+same order.  Subsystems register (rules/facts.lisp, #451); core
+registers none.")
+
+(defun %rewrite-clause-body (goals)
+  "GOALS through every registered rewriter, in registration order."
+  (reduce (lambda (goals f) (funcall f goals))
+          *clause-body-rewriters* :initial-value goals))
+
 (defun compile-clause (parms clause cont)
   "Transform away the head, and compile the resulting body."
   (let ((body
@@ -666,7 +677,7 @@ inline, composing with cut and the control constructs.  When Goal is a variable
           (compile-body
            (nconc
             (mapcar #'make-= parms (args (clause-head clause)))
-            (clause-body clause))
+            (%rewrite-clause-body (clause-body clause)))
            cont
            (mapcar #'self-cons parms)))))
     (when *prolog-trace*
