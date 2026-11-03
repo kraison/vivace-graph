@@ -56,6 +56,16 @@ storage formats (#60).
   says which of a registry's geometries it registers against and which of
   its own geometries it registers.
 
+### Fixed
+
+- **Spatial queries in an image that also loads `graph-db/rules`**
+  (#451, found by CI). Since #60 landed, spatial-registry.lisp and
+  rules/facts.lisp each defined a `%scope-keys` in the `graph-db`
+  package; the later load replaced the spatial one, and every spatial
+  finder then failed with "invalid number of arguments: 4". The spatial
+  reader is now `%spatial-scope-keys`. An image loading only one of the
+  two systems was never affected.
+
 ### Removed
 
 - `audit-spatial-slots`, `node-geometry-slots-with-values`,

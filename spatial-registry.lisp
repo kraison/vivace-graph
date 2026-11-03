@@ -279,9 +279,9 @@ multi-slot class, signalling under :ERROR) (#60, spec §5.3)."
     (dolist (c (%class-and-subclasses class) (nreverse names))
       (dolist (n (node-geometry-index-slots c)) (pushnew n names)))))
 
-;; Not %SPATIAL-SCOPE-KEYS: rules/facts.lisp, also homed in GRAPH-DB, defines one
-;; with that name, and the later load won in any image holding both
-;; (#451, found by CI).
+;; Not %SCOPE-KEYS: rules/facts.lisp, also homed in GRAPH-DB, defines
+;; one with that name, and the later load won in any image holding
+;; both (#451, found by CI).
 (defun %spatial-scope-keys (class-name slot &key (signal-missing t))
   "The (OWNER . SLOT) keys a scope naming CLASS-NAME covers, with SLOT (a slot
 name) or unnamed (NIL), memoized.  With SIGNAL-MISSING, signals
