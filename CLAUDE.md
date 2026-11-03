@@ -114,7 +114,10 @@ Scratch locations differ between the two generations of tests:
   and never run the full suite by hand.
 - **PRs merge into `experiment`, but the default branch is `master`,** so
   `Closes #N` in a PR body never fires: close the issue by hand with the
-  landing SHA (PR #393).
+  landing SHA (PR #393). **A PR's green check is the fast tier**: the
+  slow suites run only on the push after the merge, so read that run
+  (`gh run list --branch experiment`) before calling the unit landed;
+  two merges sat red for a day unread (#453).
 - **A worktree loads the main checkout's code** unless told otherwise:
   Quicklisp's `local-projects` links `graph-db.asd` to the main checkout. In
   an image started in a `.worktrees/` tree, first run

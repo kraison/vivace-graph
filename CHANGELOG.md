@@ -65,6 +65,12 @@ storage formats (#60).
   finder then failed with "invalid number of arguments: 4". The spatial
   reader is now `%spatial-scope-keys`. An image loading only one of the
   two systems was never affected.
+- **The main suite's slow tier on `experiment`** (#453). The v2
+  migration test fingerprinted the source store's spatial sidecar, which
+  every `close-graph` rewrites and which sidecar format 6 (#60) changed
+  for the first time since the fixture was made; red on every push since
+  c1411c8, invisible to pull requests, which run the fast tier. The
+  fingerprint now excludes the sidecar beside schema.dat and tx/.
 
 ### Removed
 
