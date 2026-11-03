@@ -837,3 +837,88 @@ goal, so the budget alone cannot tell skip from filter."
           (true)
           (> ?k "k55")))
       (is (< 4 n)))))
+
+;;; ---------------------------------------------------------------------
+;;; The rewrite: a > on the key right after claim/7 compiles to
+;;; claim-after/9 (GH #451, spec §2).
+;;; ---------------------------------------------------------------------
+
+(defun fused (goals) (graph-db::%fuse-key-bounds goals))
+
+(test the-rewrite-fuses-an-adjacent-key-bound
+  (let* ((body '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?k "h1")))
+         (out (fused body)))
+    (is (= 2 (length out)))
+    (is (string= "CLAIM-AFTER" (symbol-name (first (first out)))))
+    (is (equal '(?c rt-claim "host" ?k ?r ?ons ?o "h1" nil)
+               (rest (first out))))
+    (is (equal '(> ?k "h1") (second out))))
+  ;; The object key, and a bound through a variable.
+  (is (equal '(?c rt-claim ?sns ?s ?r "app" ?o nil ?b)
+             (rest (first (fused '((claim ?c rt-claim ?sns ?s ?r "app" ?o)
+                                   (> ?o ?b)))))))
+  ;; Both keys, two comparisons in a row.
+  (is (equal '(?c rt-claim "host" ?s ?r "app" ?o "h1" "db")
+             (rest (first (fused '((claim ?c rt-claim "host" ?s ?r "app" ?o)
+                                   (> ?s "h1") (> ?o "db"))))))))
+
+(test the-rewrite-leaves-every-other-shape-alone
+  (flet ((same (body) (is (eq body (fused body)))))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (true) (> ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) ! (> ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (>= ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (< ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?k 5)))
+    (same '((claim ?c rt-claim "host" "h1" ?r "app" "db") (> ?o "db")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?z "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o)))
+    (same '((claim-current ?c) (> ?k "h1")))
+    (same '())))
+
+(test the-recommended-paging-shape-costs-its-own-keys
+  "The goal text docs/guarded-query.md recommends, under the budget and
+lookup count Task 2's cost test fixed: it answers only if the rewrite
+fused it."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k "k55"))))
+      (is (= 4 n)))))
+
+(test the-guard-path-is-fused
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (let ((graph-db::*query-default-max-inferences* 30))
+      (counting-lookups (n)
+        (multiple-value-bind (columns rows)
+            (graph-db.query:run-guarded-prolog
+             "(claim ?c rt-claim \"host\" ?k \"up\" ?ons ?o) (> ?k \"k55\")"
+             g)
+          (declare (ignore columns))
+          (is (= 4 (length rows))))
+        (is (= 4 n))))))
+
+(test a-key-bound-at-run-time-takes-its-own-route
+  "Syntactically a variable, so it fuses; bound by = before the goal,
+so the bound-key route runs and the bound only filters."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (is (equal '("k57")
+               (select (:flat t :max-inferences 1000) (?k)
+                 (= ?k "k57")
+                 (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                 (> ?k "k55"))))
+    (is (null (select (:flat t :max-inferences 1000) (?k)
+                (= ?k "k50")
+                (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                (> ?k "k55"))))))
+
+(test an-unbound-bound-variable-answers-as-before
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:flat t :max-inferences 1000) (?k)
+                (claim ?c rt-claim "host" ?k ?r ?ons ?o)
+                (> ?k ?b))))))

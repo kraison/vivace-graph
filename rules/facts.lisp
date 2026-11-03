@@ -406,6 +406,81 @@ be written by hand, except in a rule body, which COMPILE-RULE refuses
                (%prolog-index-bound ?okey-after)
                cont))
 
+;;; The rewrite (#451, spec §2): a > on the key right after a CLAIM/7
+;;; goal compiles to CLAIM-AFTER/9, the comparison kept.  Registered on
+;;; *CLAUSE-BODY-REWRITERS* below; runs on every clause body compiled.
+
+(defun %foreign-functor-in-p (package name arity)
+  "PACKAGE resolves NAME/ARITY to a registered functor of its own, not
+the engine's symbol inherited or imported."
+  (let ((s (find-symbol (format nil "~A/~D" name arity) package)))
+    (and s
+         (not (eq (symbol-package s) (symbol-package 'claim/7)))
+         (or (gethash s *prolog-global-functors*)
+             (gethash s *user-functors*))
+         t)))
+
+(defun %engine-functor-goal-p (goal name arity)
+  "GOAL calls the engine's NAME/ARITY as the compiler will resolve it: a
+symbol head so named with ARITY arguments, from the engine's package or
+from one registering no NAME/ARITY of its own -- MAKE-FUNCTOR-SYMBOL's
+lookup order without its interning."
+  (and (consp goal)
+       (symbolp (first goal))
+       (string= (symbol-name (first goal)) name)
+       (eql arity (1- (list-length goal)))
+       (let ((pkg (symbol-package (first goal))))
+         (or (null pkg)
+             (eq pkg (symbol-package 'claim/7))
+             (not (%foreign-functor-in-p pkg name arity))))))
+
+(defun %named-variable-p (x)
+  "A Prolog variable other than the anonymous ?, which names nothing
+twice."
+  (and (variable-p x) (string/= (symbol-name x) "?")))
+
+(defun %key-bound-goal-p (goal var)
+  "(> VAR B) with B a string literal or a variable."
+  (and (%engine-functor-goal-p goal ">" 2)
+       (eq (second goal) var)
+       (let ((b (third goal)))
+         (or (stringp b) (variable-p b)))))
+
+(defun %fuse-key-bounds (goals)
+  "GOALS with each CLAIM/7 goal that is followed at once by a > on its
+subject or object key variable (one each, in either order) replaced by
+the CLAIM-AFTER/9 carrying that bound; the comparisons stay.  Returns
+GOALS itself when nothing fuses (#451, spec §2)."
+  (let ((out '()) (changed nil) (rest goals))
+    (loop while rest
+          do (let ((goal (pop rest)))
+               (if (not (%engine-functor-goal-p goal "CLAIM" 7))
+                   (push goal out)
+                   ;; (claim ?c family sns skey rel ons okey): the
+                   ;; keys are the fourth and seventh ARGUMENTS.
+                   (let ((skey (fifth goal)) (okey (eighth goal))
+                         (sa nil) (oa nil))
+                     (flet ((take (g)
+                              (cond ((and (null sa) (%named-variable-p skey)
+                                          (%key-bound-goal-p g skey))
+                                     (setf sa (third g)))
+                                    ((and (null oa) (%named-variable-p okey)
+                                          (%key-bound-goal-p g okey))
+                                     (setf oa (third g))))))
+                       (when (and (take (first rest)) (second rest))
+                         (take (second rest))))
+                     (if (or sa oa)
+                         (progn
+                           (setf changed t)
+                           (push (list* (intern "CLAIM-AFTER"
+                                                (symbol-package 'claim/7))
+                                        (append (rest goal) (list sa oa)))
+                                 out))
+                         (push goal out))))))
+    (if changed (nreverse out) goals)))
+
+(pushnew '%fuse-key-bounds *clause-body-rewriters*)
+
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
 %PROLOG-INDEX-BOUND folds into the same value (S1's deferred gate,
