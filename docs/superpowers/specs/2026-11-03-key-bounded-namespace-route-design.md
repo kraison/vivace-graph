@@ -84,12 +84,19 @@ cost-unbounded refusal. The last two are strict lower bounds on the
 subject key and the object key, read through `%prolog-index-bound`, so
 an unbound variable or an explicit `NIL` is "no bound".
 
-A bound is consulted in exactly one place: the namespace route for its
-own key. The subject route (`sns` bound, `skey` unbound) applies
-`?skey-after`; the object route applies `?okey-after`. Every other
-route ignores both, so a key that turns out bound at run time behaves
-as `claim/7` does, and the `>` goal that is still in the body does the
-filtering.
+The contract: `claim-after/9` answers exactly the `claim/7` rows whose
+subject key is `>` `?skey-after` and whose object key is `>`
+`?okey-after`, by `>/2`'s own predicate, a `NIL` bound admitting every
+row. It filters every emitted claim against both bounds on every route,
+one comparison each, so writing it by hand is complete without a
+comparison goal after it. A unary claim has no object key, so an object
+bound excludes it, as `>` on `NIL` would.
+
+The skip is an optimisation of that contract in one place: the
+namespace route for its own key. The subject route (`sns` bound, `skey`
+unbound) skips by `?skey-after`; the object route by `?okey-after`.
+Every other route reads as `claim/7` does and relies on the filter; a
+key that turns out bound at run time takes its bound-key route.
 
 The route's skip predicate is the `>` goal's own predicate: a key is
 read when `(%ordered-p #'> #'string> key bound)` is true, where `key`
@@ -110,7 +117,11 @@ two bounds, and `claim/7` calls it with both `NIL`.
 
 Writing `claim-after` directly in goal text is allowed and documented.
 It is the issue's option 2, for free: a caller who wants the bound
-visible writes it; nobody has to.
+visible writes it; nobody has to. One place refuses it: a rule body
+(`compile-rule`), at any nesting, because the rules compiler's reads and
+stratification analysis recognise `claim/7` goals by name and a
+`claim-after/9` premise would slip past them. A rule writes `claim/7`
+and the comparison; the rewrite below fuses them when the rule runs.
 
 ### 2. The rewrite
 
@@ -122,15 +133,19 @@ skip.
 
 Conditions, all required:
 
-- A goal is a call of `claim/7`, recognised as rules/compile.lisp's
-  `%engine-goal-p` recognises it: a symbol head named `CLAIM`, homed in
-  `claim/7`'s package, with seven arguments.
+- A goal is a call of `claim/7`, recognised as the compiler will
+  resolve it: a symbol head named `CLAIM` with seven arguments, whose
+  package is `claim/7`'s or registers no functor of that name and arity
+  of its own (`make-functor-symbol`'s lookup order, without its
+  interning). The guard's canonical heads and a `select` written in any
+  package both qualify; a schema package with its own `claim/7` does
+  not.
 - Its fourth argument (`?skey`) or its seventh (`?okey`) is a Prolog
   variable, by `variable-p`.
 - The very next goal in the same conjunction is `(> V B)` with `V` that
   same variable, by `eq`, and `B` a string literal or a Prolog
-  variable. `>` is recognised the way the compiler will resolve it: a
-  symbol named `>`.
+  variable. `>` is recognised by the same rule: a symbol named `>` with
+  two arguments, from a package that registers no `>/2` of its own.
 - The two goals are top-level goals of the body being compiled. The
   rewriter sees only that list; a body nested in `or`, `not`, `if`,
   `once` or `forall` is compiled by that construct's compiler macro
@@ -160,8 +175,13 @@ applied to the clause's body before `compile-body`. Rules pushes
 runs on every clause compiled, so it must be cheap on bodies it does not
 touch: one pass, no consing when nothing matches.
 
-Compile-time only. The rewrite happens before the guard's cost refusal
-and after the guard's validation, so a free-text query is validated as
+Compile-time only, and `select` compiles its clause at macroexpansion
+time: a `select` in a source file is rewritten when that file compiles,
+with whatever rewriters are registered then. A file compiled before
+`graph-db/rules` loaded is not fused until it is recompiled; the docs
+say so. A guarded query is compiled per request (`run-query-goals`
+evaluates its `select`), so it is always fused. The rewrite happens
+after the guard's validation, so a free-text query is validated as
 written and compiled as fused.
 
 ### 4. Budget and timeout
