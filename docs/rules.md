@@ -301,8 +301,27 @@ write between two pages can shift a row across the boundary. A caller
 who wants a boundary a write cannot move pages by **key** instead: on
 a vocabulary route, `(> ?k "last-key-seen")` after the `claim/7` goal
 -- `>/2` orders two strings lexically since GH #387 -- restarts after
-that key, at the price of generating the earlier keys' claims and
-discarding them. Neither offset nor key bound is a snapshot cursor;
+that key. When the `>` goal is the very next goal after the `claim/7`
+goal, the compiler fuses the two into `claim-after/9`, whose namespace
+route skips the earlier keys before reading their claims, so a page
+costs one comparison per earlier key plus its own keys' claims, at any
+depth (GH #451). The comparison stays in the body, so a claim the route
+skips is always one the comparison would have rejected. Not fused, and
+so paid for by the comparison alone: `>=`, `<`, a numeric bound, any
+goal or cut between the two, a comparison inside `or`, `not` or `if`.
+A `select` is rewritten when its file compiles, so a file compiled
+before `graph-db/rules` loaded is not fused until recompiled; a guarded
+query is compiled per request and always is.
+
+`claim-after/9` may be written by hand:
+`(claim-after ?c family sns ?skey rel ons ?okey skey-after okey-after)`
+answers the `claim/7` rows whose subject key is `>` `skey-after` and
+whose object key is `>` `okey-after`, by `>/2`'s predicate; a `nil` or
+unbound bound admits every row, and an object bound excludes a unary
+claim. A rule body may not name it -- `compile-rule` refuses, since its
+reads and strata analyses recognise `claim/7` by name -- and writes
+`claim/7` and the comparison instead, which the rule's run fuses.
+Neither offset nor key bound is a snapshot cursor;
 `docs/guarded-query.md` "Paging" has the trade-off.
 
 ## Unknown names
