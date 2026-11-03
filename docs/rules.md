@@ -35,7 +35,8 @@ cost-unbounded rule below.
 
 The subsystem's package is `graph-db.rules` (spec §3), but
 `rules/facts.lisp` is `(in-package #:graph-db)` and the `name/arity`
-symbols -- `claim/7`, `claim-current/1`, `claim-valid-at/2`,
+symbols -- `claim/7`, `claim-after/9`, `claim-current/1`,
+`claim-valid-at/2`,
 `claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
 `claim-retracted-at/2`, `claim-touched-at/2`,
 `claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
@@ -58,6 +59,7 @@ pathname and its `graph-db.rules` package are unchanged.
 
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
+(claim-after ?c family ?sns ?skey ?rel ?ons ?okey skey-after okey-after)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
 (claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
@@ -71,6 +73,7 @@ pathname and its `graph-db.rules` package are unchanged.
 | functor | answers |
 |---|---|
 | `claim/7` | a claim of `family`, and its endpoints |
+| `claim-after/9` | `claim/7`'s rows with strict lower bounds on both keys, the namespace route started at the bound; "Solution order" (GH #451) |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
 | `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
@@ -301,8 +304,28 @@ write between two pages can shift a row across the boundary. A caller
 who wants a boundary a write cannot move pages by **key** instead: on
 a vocabulary route, `(> ?k "last-key-seen")` after the `claim/7` goal
 -- `>/2` orders two strings lexically since GH #387 -- restarts after
-that key, at the price of generating the earlier keys' claims and
-discarding them. Neither offset nor key bound is a snapshot cursor;
+that key. When the `>` goal is the very next goal after the `claim/7`
+goal, the compiler fuses the two into `claim-after/9`, whose namespace
+route skips the earlier keys before reading their claims, so a page
+costs one comparison per earlier key plus its own keys' claims, at any
+depth (GH #451). The comparison stays in the body, so a claim the route
+skips is always one the comparison would have rejected. Not fused, and
+so paid for by the comparison alone: `>=`, `<`, a numeric bound, any
+goal or cut between the two, a comparison inside `or`, `not`, `if`,
+`once` or `forall`.
+A `select` is rewritten when its file compiles, so a file compiled
+before `graph-db/rules` loaded is not fused until recompiled; a guarded
+query is compiled per request and always is.
+
+`claim-after/9` may be written by hand:
+`(claim-after ?c family sns ?skey rel ons ?okey skey-after okey-after)`
+answers the `claim/7` rows whose subject key is `>` `skey-after` and
+whose object key is `>` `okey-after`, by `>/2`'s predicate; a `nil` or
+unbound bound admits every row, and an object bound excludes a unary
+claim. A rule body may not name it -- `compile-rule` refuses, since its
+reads and strata analyses recognise `claim/7` by name -- and writes
+`claim/7` and the comparison instead, which the rule's run fuses.
+Neither offset nor key bound is a snapshot cursor;
 `docs/guarded-query.md` "Paging" has the trade-off.
 
 ## Unknown names

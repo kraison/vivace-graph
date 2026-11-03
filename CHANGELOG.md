@@ -16,6 +16,14 @@ storage formats (#60).
 
 ### Changed
 
+- **Paging a claim namespace by key costs the same at any depth**
+  (#451). `(> ?k "last-key")` written immediately after a `claim/7`
+  goal with the namespace bound and the key unbound compiles to
+  `claim-after/9`, whose namespace route skips the earlier keys before
+  reading their claims. On 20,000 keys the last 500-row page through
+  `run-guarded-prolog` went from 30 times the first page's cost to
+  1.1 times. Existing goal text gets this with no edit; `docs/rules.md`
+  "Solution order" lists the shapes that are not fused.
 - **A node is indexed under every declared geometry slot, and a spatial
   query names the slot it tests** (#60). `find-nodes-near`,
   `find-nearest-k`, `find-nodes-within` and `find-nodes-intersecting`
@@ -48,6 +56,16 @@ storage formats (#60).
   says which of a registry's geometries it registers against and which of
   its own geometries it registers.
 
+### Fixed
+
+- **Spatial queries in an image that also loads `graph-db/rules`**
+  (#451, found by CI). Since #60 landed, spatial-registry.lisp and
+  rules/facts.lisp each defined a `%scope-keys` in the `graph-db`
+  package; the later load replaced the spatial one, and every spatial
+  finder then failed with "invalid number of arguments: 4". The spatial
+  reader is now `%spatial-scope-keys`. An image loading only one of the
+  two systems was never affected.
+
 ### Removed
 
 - `audit-spatial-slots`, `node-geometry-slots-with-values`,
@@ -56,6 +74,14 @@ storage formats (#60).
 
 ### Added
 
+- **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
+  subject and object keys, tested with `>/2`'s own predicate as a filter
+  on every route and as a skip on the namespace route; a `nil` or
+  unbound bound admits every row. The compiler writes it for a `claim/7`
+  followed at once by a `>` on its key; it may be written by hand, and
+  a rule body is refused it (`compile-rule`). The engine hook is
+  `*clause-body-rewriters*`, functions a subsystem registers to rewrite
+  a clause body before it compiles.
 - `node-geometries` (every `(slot . geometry)` a node occupies) and
   `node-slot-geometry`; an application `node-geometry` method stays the
   authority for its class and, on a single-slot class, may

@@ -126,8 +126,13 @@ What this is and is not:
   produced -- and still count against `max-inferences` and `timeout`,
   which bind per call -- so a deep page of a large answer costs what
   every page before it cost. Size the budget for the deepest page, or
-  page by key, whose cost is the discarded keys' claims rather than
-  every earlier solution.
+  page by key: with the `>` goal written immediately after the
+  `claim/7` goal, the pair compiles to `claim-after/9`, whose route
+  starts at the bound, and a deep page costs
+  its own keys' claims plus one string comparison per earlier key
+  (GH #451; the condition and what is not fused are in `docs/rules.md`
+  "Solution order"). A `>` separated from the goal still works, at the
+  old price of the discarded keys' claims.
 - **Not a snapshot cursor.** Each call runs under its own read
   snapshot; nothing is held between pages, so nothing expires and
   nothing needs a token. A resumable cursor -- a suspended run holding

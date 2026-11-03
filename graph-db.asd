@@ -417,8 +417,8 @@ and read-only neighborhood exploration."
 (defsystem graph-db/perf-test
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
-  :depends-on (:graph-db :graph-db/spacetime :graph-db/test-scratch
-               :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/spacetime :graph-db/rules
+               :graph-db/test-scratch :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
@@ -430,7 +430,9 @@ and read-only neighborhood exploration."
                ;; trace both read paths); entry point (graph-db::bplus-bench).
                (:file "bplus-bench")
                ;; edges under claims, spec sec.9 (GH #372)
-               (:file "spacetime-bench"))
+               (:file "spacetime-bench")
+               ;; paging a namespace by key, first page vs last (GH #451)
+               (:file "rules-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 

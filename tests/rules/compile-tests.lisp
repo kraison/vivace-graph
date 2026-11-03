@@ -138,6 +138,23 @@
   (refuses "empty" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body "   "))
 
+(defparameter *body-claim-after*
+  "(claim-after ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h nil nil)")
+(defparameter *body-claim-after-under-not*
+  (concatenate 'string *web-hosts-body*
+               " (not (claim-after ?q rt-claim \"app\" \"web\" \"z\""
+               " \"host\" ?h nil nil))"))
+
+(test claim-after-is-not-a-rule-premise
+  "GH #451: the reads and strata analyses recognise claim/7 by name; a
+rule writes claim/7 and the comparison, and the rewrite fuses them."
+  ;; "not a rule premise", not "claim-after/9": the guard's own refusal
+  ;; of an unregistered functor names the functor too.
+  (refuses "not a rule premise" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *body-claim-after*)
+  (refuses "not a rule premise" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *body-claim-after-under-not*))
+
 (test a-rule-that-reads-its-own-relation-compiles-as-its-own-stratum
   "GH #333: recursion is a stratum, not a refusal; an unbound relation
 still reads everything and is refused (P6)."
