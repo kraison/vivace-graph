@@ -1,8 +1,8 @@
 # Forward evaluation of rules: derive and fire at commit
 
 **Status:** design, awaiting Kevin's approval (2026-11-04). Builder
-check done; its findings are folded in, and two questions it raised are
-marked **Open (Kevin)** in §4.2 and §6.
+check done; its findings are folded in, and the two questions it left
+for Kevin are decided (D4, D5 in §1).
 **Prior specs:** `2026-09-04-rules-as-producers-design.md` (the rule
 record, `run-rule`, the derivation family),
 `2026-09-06-recursive-rules-fixpoint-design.md` (strata, semi-naive
@@ -35,6 +35,8 @@ more when a match is lost. Three decisions were taken in discussion on
 | D1 | Derived claims are written in a **follow-on transaction** with the rule as producer, started as soon as the committing transaction has returned. Readers may see premises without conclusions for that window. | Per-stratum `:atomic`, derived inside the committing transaction. Not in this unit; the hook point (§6) is chosen so it can be added without moving anything. |
 | D2 | **Two negations.** `not/1` stays negation as failure. A new goal, `claim-absent/7`, succeeds only on a current claim whose standing is a determined absence (`:searched-empty`, `:determined-empty`); `:uncovered`, `:indeterminate` and no claim at all answer nothing. | The well-founded three-valued model. Documented as a later option; no rule written against D2 would change. |
 | D3 | **Self-scheduling thresholds.** `now/1` binds the evaluation instant; a comparison against it compiles to one agenda timer per match at the instant the comparison flips. A comparison the compiler cannot bound is a compile-time refusal. | Tick facts. Rejected: wholesale re-evaluation per tick, resolution equal to the tick, churn in the store. |
+| D4 | **A lost derivation is retracted, not deleted** (§4.2): the sweep becomes `retract-claim`, in forward mode and in `run-rules` alike, with a re-open path when the identity is derived again. | `mark-deleted`, today's sweep. Rejected: the store could not say why a derivation is gone. |
+| D5 | **Concurrent steps queue** (§6): a per-graph delta queue, the first thread in is the runner and drains it, later entrants enqueue and return. | A per-graph step lock. Rejected: commits would wait on another thread's step. |
 
 ## 2. Goals and non-goals
 
@@ -67,8 +69,8 @@ Non-goals (named so a builder does not build them):
 - Multi-store scope for the forward step; `run-rule`'s snapshot scope
   (S3) is unchanged and remains the way to read another store.
 - Recency or specificity heuristics in conflict resolution.
-- CHR-style simpagation syntax; geometric functors; anything from the
-  conceptual-spaces discussion.
+- CHR-style simpagation syntax, geometric functors, or any new body
+  vocabulary beyond the three functors in §5.
 - Peers and slaves. The forward step runs where the commit happened; a
   replica applying the feed does not run rules.
 - A core open hook. Core does not know `graph-db/rules` exists and this
@@ -158,19 +160,19 @@ then undo forward results. `docs/rules.md` tells rule authors in so
 many words that a rule meant to track retraction says `claim-current`
 on each premise it tracks.
 
-**Open (Kevin): sweep as deletion or as retraction.** Today the
-reconcile's sweep is `mark-deleted`: the derived claim and its
-`derived-from` records vanish, so "why is this no longer derived" has
-no answer in the store. The alternative is `retract-claim` on the
-derived claim, keeping it and its provenance with a transaction-period
-end, which is what the consumers in the audit asked for. Retraction
-needs a re-open path: today "a retracted derived claim whose identity
-is derived again stays retracted" (`docs/rules.md`), so when the premise
-returns the conclusion must be re-opened (as `register-node` re-opens a
-registration), and downstream bodies must say `claim-current` to stop
-reading the retracted conclusion. Whichever is chosen applies to
-`run-rules` as well, so the two modes agree. Recommendation in the
-hand-over message.
+**The sweep retracts (D4).** Today the reconcile's sweep is
+`mark-deleted`: the derived claim and its `derived-from` records vanish,
+and "why is this no longer derived" has no answer in the store. The
+sweep becomes `retract-claim` on the derived claim, keeping it and its
+provenance with a transaction-period end; the `derived-from` records
+are retracted with it, not deleted. This applies to `run-rules` as
+well, so the two modes agree. It needs a re-open path: today "a
+retracted derived claim whose identity is derived again stays
+retracted" (`docs/rules.md`), so when a swept identity is in `desired`
+again the reconcile re-opens it (as `register-node` re-opens a
+registration) rather than constructing a second claim, and the
+`docs/rules.md` sentence changes to say so. Downstream bodies that must
+not read a retracted conclusion say `claim-current`, as for any claim.
 
 ### 4.3 The loop and its bounds
 
@@ -227,8 +229,8 @@ The flip instant is a function of the premises, never of the evaluation
 instant, so both modes compute it identically. A derived claim whose
 body has a gain threshold takes its validity start from the flip
 instant under the `:premises` extent policy; one whose body has a loss
-threshold is swept at the flip instant (its validity end is the instant
-if §4.2's open question resolves to retraction).
+threshold is retracted at the flip instant, with that instant as its
+validity end.
 
 Timers: when a step or a `run-rules` evaluates a threshold goal for a
 match, it schedules a timer for that match at its flip instant if the
@@ -271,18 +273,20 @@ engine's existing retry-exhausted fallback under the manager lock,
 exactly as `run-rules` can today. That is the engine's existing
 behaviour, not a form this design adds; acceptance 10 is read that way.
 
-**Open (Kevin): how concurrent steps meet.** Two threads committing
-claim writes on one graph, or a timer firing while a step runs, are
-three entrants. Three designs: *skip* (the second entrant drops its
-delta: silently loses derivations, rejected), *serialise* (a per-graph
-step lock: a committing thread waits the length of another thread's
-step, so D1's window becomes the queue), or *queue* (a per-graph delta
-queue; the thread that finds no step running becomes the runner and
-drains the queue until it is empty; a thread that finds one running
-enqueues and returns at once). Under *queue* the caller's next read on
-its own thread is not guaranteed to see its derivations when another
-thread was the runner; `forward-rules-status` reports the queue depth.
-Recommendation in the hand-over message.
+**Concurrent steps queue (D5).** Two threads committing claim writes
+on one graph, a timer firing, and a nested commit deferred to its
+outermost are all entrants to one per-graph delta queue. The thread
+that finds no step running becomes the runner and drains the queue
+until it is empty, re-checking under the queue's lock before it leaves
+so a delta enqueued during its last iteration is not stranded; a thread
+that finds a step running enqueues and returns at once. No entrant ever
+drops a delta, and no commit waits on another thread's step. The cost
+is read-after-derive: a caller whose delta another thread ran is not
+guaranteed to see its derivations on its next read; a caller that needs
+that guarantee calls `run-rules` on its own thread, which stays
+idempotent. `forward-rules-status` reports the queue depth and the
+running step. The alternatives, skip (loses deltas) and a per-graph
+step lock (commits wait), are rejected.
 
 The `:atomic` option held in reserve under D1 would hook before
 `%commit` instead, with the same step function; nothing here precludes
@@ -325,10 +329,11 @@ re-derived or deleted and re-registered; node ids do not). The step
 records each firing as a claim of a new unary family `firing`
 (relation = production name, subject key = a digest of those identity
 keys, producer = the production), so refraction is durable, auditable,
-and survives restart without a side table. A match that is lost removes
-its `firing` claim by the same mechanism §4.2's open question chooses
-for derived claims, and delivers `:lost`; a match regained delivers
-`:added` again. The action is called once per transition.
+and survives restart without a side table. A match that is lost
+retracts its `firing` claim (D4) and delivers `:lost`; a match regained
+re-opens it and delivers `:added` again, so the firing history of an
+instantiation is readable as the claim's transaction periods. The
+action is called once per transition.
 
 **The agenda.** Fired instantiations are queued, not run inline: the
 Datalog strata of the iteration finish and commit, then the agenda
@@ -361,16 +366,20 @@ equal the set differences of full re-evaluation after each commit.
 `docs/rules.md` (a new section, "Forward evaluation"; `claim-absent/7`,
 `now/1`, `instant-offset/3` in the functor table; the currency
 paragraph for rule authors); the manual's rules chapter;
-`CHANGELOG.md` Added; the fixpoint spec's R7 and R10 get a note that
-forward mode inverts them.
+`CHANGELOG.md` Added, and Changed for the sweep becoming a retraction
+in `run-rules` (D4, a visible change for anyone reading swept
+derivations back); the fixpoint spec's R7 and R10 get a note that
+forward mode inverts them, and its R5 that the sweep retracts.
 
 ## 10. Acceptance
 
 1. A rule whose body says `claim-current` on a premise derives after
    the commit that supplies its last premise, without `run-rules`, and
    loses the derivation after the commit that retracts that premise;
-   both carry provenance as today. A `run-rules` after either commit
-   changes nothing.
+   the lost derivation is a retracted claim whose provenance still
+   names the premise, and a third commit restoring the premise re-opens
+   it rather than constructing a second claim. A `run-rules` after any
+   of the three changes nothing.
 2. A chain through two strata derives in the same forward step; a
    derivation lost in one stratum is lost in the stratum that read it.
 3. A rule with a `not` derives after the commit that retracts its
@@ -398,7 +407,12 @@ forward mode inverts them.
 11. A commit from a nested `with-transaction` defers its step to the
     outermost commit on that thread; a recursive stratum touched by a
     −1 delta reaches the same fixpoint `run-rules` reaches.
-12. The existing rules, fixpoint and scope suites stay green.
+12. Two threads committing premises concurrently both get their
+    derivations, no commit blocks on the other's step, and
+    `forward-rules-status` showed a queue depth above zero at some
+    point (a test with a slow production holding the runner).
+13. The existing rules, fixpoint and scope suites stay green, with
+    their sweep assertions updated from deleted to retracted.
 
 ## 11. Calls I made
 
