@@ -3807,13 +3807,18 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
     :accessor writes)))
 
 (defun load-recovery-transaction (file)
-  ;; The transaction-id is authoritative in the FILENAME (~16,'0X hex), set by the
-  ;; rename in FINALIZE-TX-PERSISTENCE; the .txn header id is a deliberate
-  ;; placeholder (0).  recovery-transaction-files already replays in filename
-  ;; (= id) order.  See the TODO above FINALIZE-TX-PERSISTENCE.
-  (let ((tx-header (load-tx-file file)))
+  ;; The filename (~16,'0X hex, set by the rename in
+  ;; FINALIZE-TX-PERSISTENCE) is the replay key; the header id is written
+  ;; after the lock and cross-checked here, 0 being the crash window
+  ;; between the two (#422, the 2026-11-04 txn-header-id spec).
+  (let* ((tx-header (load-tx-file file))
+         (header-id (transaction-id tx-header))
+         (filename-id (parse-integer (pathname-name file) :radix 16)))
+    (unless (or (zerop header-id) (= header-id filename-id))
+      (error 'transaction-file-id-mismatch
+             :file file :header-id header-id :filename-id filename-id))
     (make-instance 'recovery-transaction
-                   :transaction-id (parse-integer (pathname-name file) :radix 16)
+                   :transaction-id filename-id
                    :writes (writes tx-header))))
 
 (defmethod call-with-transaction-lock ((transaction recovery-transaction) fun)

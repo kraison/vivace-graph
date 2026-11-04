@@ -248,6 +248,7 @@
            #:transaction-p
            #:graph-name
            #:transaction-error
+           #:transaction-file-id-mismatch
            #:cross-graph-transaction-error
            #:duplicate-node-class-error
            #:master-host
