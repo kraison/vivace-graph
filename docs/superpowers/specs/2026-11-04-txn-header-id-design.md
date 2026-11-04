@@ -76,13 +76,22 @@ renames the file to `.committed` (on-disk graphs), and before anything
 can read a memory graph's journal entry back, since both happen after
 `%commit` returns.
 
-A failure in the patch (disk full, permissions) is signalled as the
-commit's error after the commit point. The transaction is durable and
-applied; the caller learns the file could not be patched. **Call I
-made:** not swallowing it. A silently unpatched file is exactly the
-state the cross-check exists to make visible, and an I/O error on the
-store's own directory right after a successful rename is not a
-condition to paper over.
+The transaction's state turns `:committed` **before** the patch: the
+apply is complete, and `:committed` is what keeps the transaction in
+the manager's table for OCC validation until it is pruned (a
+`:committing` leftover is removed at once, which would let a
+concurrent reader of the old value validate; final review, 2026-11-04).
+`cleanup-transaction` then deletes or `.committed`-renames the file as
+for every commit.
+
+A failure in the patch (disk full, permissions) is re-signalled as
+`transaction-file-patch-error`, a `transaction-error` carrying the
+file, the id and the original condition, whose report says the
+transaction is committed and applied. A file that no longer exists is
+not a failure: a memory graph's `checkpoint-memory-graph` may clear the
+journal in the window, and a cleared entry is superseded by the image.
+**Call I made:** not swallowing a real I/O error. A silently unpatched
+file is exactly the state the cross-check exists to make visible.
 
 ## 2. The cross-check
 

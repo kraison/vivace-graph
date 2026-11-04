@@ -2574,27 +2574,32 @@ crash orphans one."
 
 (defun patch-tx-file-header-id (transaction)
   "Write TRANSACTION's id over the header placeholder in its .txn file.
-Runs after the manager lock: the rename in FINALIZE-TX-PERSISTENCE is
-the commit point, this makes the file self-describing, and recovery
-cross-checks the two (#422).  Returns the id, or NIL when the graph is
-WAL-suppressed and no file exists.  An I/O error here propagates: the
-transaction is durable and applied, the caller learns the file was not
-patched, and the file keeps header 0, which recovery accepts."
+Runs after the manager lock, with the transaction already :COMMITTED:
+the rename in FINALIZE-TX-PERSISTENCE is the commit point, this makes
+the file self-describing, and recovery cross-checks the two (#422).
+Returns the id; NIL when the graph is WAL-suppressed (no file) or the
+file is gone (a memory graph's checkpoint cleared the journal in the
+window, so nothing needs it).  Any other failure is re-signalled as
+TRANSACTION-FILE-PATCH-ERROR, whose report says the transaction is
+committed; the file keeps header 0, which recovery accepts."
   (unless (wal-suppressed-p (graph transaction))
     (let ((id (transaction-id transaction))
+          (file (transaction-pathname transaction))
           (bytes (make-byte-vector 8)))
       (serialize-uint64 bytes id 0)
-      (with-open-file (stream (transaction-pathname transaction)
-                              :direction :io
-                              :if-exists :overwrite
-                              :element-type '(unsigned-byte 8))
-        (file-position stream +tx-header-id-offset+)
-        (write-sequence bytes stream))
-      id)))
-
-;;; The .txn header id is written after the manager lock
-;;; (PATCH-TX-FILE-HEADER-ID) and cross-checked by recovery against the
-;;; filename (#422, docs/superpowers/specs/2026-11-04-txn-header-id-design.md).
+      (handler-case
+          (with-open-file (stream file
+                                  :direction :io
+                                  :if-exists :overwrite
+                                  :if-does-not-exist nil
+                                  :element-type '(unsigned-byte 8))
+            (when stream
+              (file-position stream +tx-header-id-offset+)
+              (write-sequence bytes stream)
+              id))
+        (error (e)
+          (error 'transaction-file-patch-error
+                 :file file :transaction-id id :cause e))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Peer replication (WP-0): the peer-meta packet.
@@ -2822,6 +2827,9 @@ into the wire vector."
       (initialize-bytes-from-components transaction))
     tmp))
 
+;;; The .txn header id is written after the manager lock
+;;; (PATCH-TX-FILE-HEADER-ID) and cross-checked by recovery against the
+;;; filename (#422, docs/superpowers/specs/2026-11-04-txn-header-id-design.md).
 (defun finalize-tx-persistence (transaction tmp)
   "Under the transaction-manager lock, once TRANSACTION-ID is assigned: make the
 durable, recovery-visible record by renaming the prepared temp file to its final
@@ -3760,12 +3768,14 @@ concurrent commit, and no public path reaches it.  An id with no head yet
                ;;     this tx-id) reads the committed value rather than a stale
                ;;     pre-apply snapshot.
                (apply-transaction tx (graph tx)))
+             ;; :COMMITTED first: the apply is complete, and the state
+             ;; keeps the transaction in the manager's table for OCC
+             ;; even if the patch below signals (#422).
+             (setf (state tx) :committed)
              ;; Off the lock: the file's header id, cross-checked by
-             ;; recovery (#422).  Before :COMMITTED, so a failure here
-             ;; leaves the file for recovery instead of deleting it.
+             ;; recovery (#422).
              (when renamed
-               (patch-tx-file-header-id tx))
-             (setf (state tx) :committed))
+               (patch-tx-file-header-id tx)))
         ;; On validation conflict (retry) or any error before the rename, drop
         ;; the orphan temp file so prepared-but-not-committed attempts don't leak.
         (when (and tmp (not renamed))

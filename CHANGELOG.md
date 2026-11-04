@@ -23,7 +23,9 @@ storage formats (#60).
   `transaction-file-id-mismatch`, so a renamed or misplaced file fails
   `open-graph` instead of replaying under the wrong id. Files written
   by earlier versions, and by a crash between the rename and the patch,
-  have header 0 and are accepted as before.
+  have header 0 and are accepted as before. If the patch itself fails,
+  the commit is already durable and applied; the caller gets
+  `transaction-file-patch-error`, whose report says so.
 - **Paging a claim namespace by key costs the same at any depth**
   (#451). `(> ?k "last-key")` written immediately after a `claim/7`
   goal with the namespace bound and the key unbound compiles to
