@@ -250,3 +250,99 @@ replaying it under the filename's id (#422)."
                 "the report names the file")))
         (is-true signalled
                  "open-graph must refuse the mismatched file (#422)")))))
+
+(test a-committed-transaction-file-carries-its-id
+  "After commit the .txn file's header id equals its filename's id,
+written after the manager lock is released; the patch precedes the
+rename to .committed (#422)."
+  (with-temp-directory (dir)
+    (let ((graph-db::*delete-committed-transaction-files* nil)
+          (path (namestring dir)))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (define-acid-views)
+               (with-transaction ()
+                 (make-ac-item :value 1 :label "patched"))
+               (let ((files (directory
+                             (merge-pathnames "tx/*.committed" path))))
+                 (is (= 1 (length files)) "one .committed file")
+                 (when files
+                   (let ((file (first files)))
+                     (is (= (parse-integer (pathname-name file) :radix 16)
+                            (graph-db::transaction-id
+                             (graph-db::load-tx-file file)))
+                         "header id must equal the filename id")))))
+          (close-graph g :snapshot-p nil))))))
+
+(test a-memory-graph-journal-entry-carries-its-id
+  "The retained journal of a memory graph is patched too (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *acid-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ac-item :value 2 :label "journaled"))
+               (let ((files (directory (merge-pathnames "tx/*.txn" path))))
+                 (is (= 1 (length files)) "one retained journal entry")
+                 (when files
+                   (let ((file (first files)))
+                     (is (= (parse-integer (pathname-name file) :radix 16)
+                            (graph-db::transaction-id
+                             (graph-db::load-tx-file file)))
+                         "journal header id must equal the filename id")))))
+          (ignore-errors (close-graph g :snapshot-p nil)))))))
+
+(test a-wal-suppressed-commit-patches-nothing
+  "No file, no patch: a WAL-suppressed graph commits without a .txn
+file and without an error from the patch step (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (setf (graph-db::wal-suppressed-p g) t)
+               (finishes
+                 (with-transaction ()
+                   (make-ac-item :value 3 :label "unjournaled")))
+               (is (null (directory (merge-pathnames "tx/*.txn" path)))
+                   "no .txn file")
+               (is (null (directory (merge-pathnames "tx/*.committed" path)))
+                   "no .committed file"))
+          (setf (graph-db::wal-suppressed-p g) nil)
+          (close-graph g :snapshot-p nil))))))
+
+(test a-patch-failure-after-the-commit-point-propagates
+  "The file is made read-only inside the lock, after the rename and
+before the patch; the commit is durable and applied, and the caller
+still learns the file could not be patched (#422).  Runs as a user:
+root ignores the mode."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir))
+          (txfile nil)
+          (vid nil))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (setf *after-apply-tx-writes-hook*
+                     (lambda ()
+                       (setf txfile (graph-db::transaction-pathname
+                                     graph-db::*transaction*))
+                       (uiop:run-program
+                        (list "chmod" "0400" (namestring txfile)))))
+               (signals file-error
+                 (with-transaction ()
+                   (setq vid (id (make-ac-item :value 4 :label "ro")))))
+               (is (null *after-apply-tx-writes-hook*)
+                   "Hook must have self-cleared after firing")
+               (is-true (lookup-vertex vid)
+                        "the transaction was applied before the patch")
+               (when (and txfile (probe-file txfile))
+                 (is (= 0 (graph-db::transaction-id
+                           (graph-db::load-tx-file txfile)))
+                     "the unpatched file keeps header 0, the crash window")))
+          (setf *after-apply-tx-writes-hook* nil)
+          (when (and txfile (probe-file txfile))
+            (uiop:run-program (list "chmod" "0600" (namestring txfile))))
+          (ignore-errors (close-graph g :snapshot-p nil)))))))
