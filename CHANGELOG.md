@@ -16,6 +16,16 @@ storage formats (#60).
 
 ### Changed
 
+- **A `.txn` file's header carries its transaction-id** (#422). The id
+  is written after the commit lock, so nothing new runs inside it and
+  the rename stays the commit point. Recovery cross-checks a nonzero
+  header id against the filename and refuses a mismatch with
+  `transaction-file-id-mismatch`, so a renamed or misplaced file fails
+  `open-graph` instead of replaying under the wrong id. Files written
+  by earlier versions, and by a crash between the rename and the patch,
+  have header 0 and are accepted as before. If the patch itself fails,
+  the commit is already durable and applied; the caller gets
+  `transaction-file-patch-error`, whose report says so.
 - **Paging a claim namespace by key costs the same at any depth**
   (#451). `(> ?k "last-key")` written immediately after a `claim/7`
   goal with the namespace bound and the key unbound compiles to

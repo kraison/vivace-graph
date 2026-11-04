@@ -13,6 +13,33 @@
              (with-slots (reason) error
                (format stream "Transaction error: ~A." reason)))))
 
+(define-condition transaction-file-id-mismatch (transaction-error)
+  ((file :initarg :file :reader mismatch-file)
+   (header-id :initarg :header-id :reader header-id)
+   (filename-id :initarg :filename-id :reader filename-id))
+  (:documentation "Recovery met a .txn file whose header id is neither 0
+nor its filename's id: the file was renamed or does not belong to this
+store (#422).")
+  (:report (lambda (error stream)
+             (with-slots (file header-id filename-id) error
+               (format stream "Transaction file ~A carries id ~16,'0X in ~
+its header but ~16,'0X in its name: the file was renamed or does not ~
+belong to this store (#422)."
+                       (namestring file) header-id filename-id)))))
+
+(define-condition transaction-file-patch-error (transaction-error)
+  ((file :initarg :file :reader patch-file)
+   (transaction-id :initarg :transaction-id :reader patch-transaction-id)
+   (cause :initarg :cause :reader patch-cause))
+  (:documentation "The transaction IS committed and applied; writing its
+id into its .txn file's header afterwards failed (#422).  CAUSE is the
+original condition.")
+  (:report (lambda (error stream)
+             (with-slots (file transaction-id cause) error
+               (format stream "Transaction ~16,'0X is committed and ~
+applied, but its file ~A could not be patched with its id: ~A (#422)."
+                       transaction-id (namestring file) cause)))))
+
 (define-condition cross-graph-transaction-error (error)
   ((node :initarg :node)
    (transaction-graph :initarg :transaction-graph)

@@ -2101,11 +2101,10 @@ With no FILTER, returns WRITES unchanged."
 (defun make-tx-header-vector ()
   (make-byte-vector +tx-header-size+))
 
-;; The transaction-id lives at this byte offset within the serialized header
-;; (and thus at the start of the tx file): 8-byte size + 1 flag + 1 type code.
-;; In a .txn file this is left at the placeholder 0 (the authoritative id is the
-;; filename; see the TODO above FINALIZE-TX-PERSISTENCE).  Master graphs patch
-;; the real id into the in-memory bytes at this offset for the replication log.
+;; The transaction-id's byte offset in the serialized header (and so in
+;; the tx file): 8-byte size + 1 flag + 1 type code.  PREPARE writes 0
+;; here; PATCH-TX-FILE-HEADER-ID writes the id after the commit lock,
+;; and feed-journaling graphs patch it into the in-memory bytes (#422).
 (defconstant +tx-header-id-offset+ 10)
 
 (defun serialize-tx-header (tx vector offset &optional (id (transaction-id tx)))
@@ -2573,21 +2572,34 @@ crash orphans one."
                  :defaults (persistent-transaction-directory
                             (graph transaction))))
 
-;;; -------------------------------------------------------------------------
-;;; TODO (revisit — correctness/maintainability): the transaction file's HEADER
-;;; transaction-id is intentionally left at a placeholder 0; the AUTHORITATIVE id
-;;; for a .txn file is its FILENAME (~16,'0X hex), and recovery reads it from
-;;; there (LOAD-RECOVERY-TRANSACTION).  This is what lets FINALIZE do a single
-;;; rename under the manager lock instead of an in-lock header write — the only
-;;; form measured to actually relieve the CCL/ECL commit-lock convoy at high
-;;; thread counts (any in-lock file write reconvoys; see
-;;; docs/concurrency-scaling-investigation.md).  The smell: the same header
-;;; layout means two different things — placeholder 0 in a .txn file vs. the real
-;;; id in a replication-log entry (masters patch it into the in-memory bytes
-;;; below).  Replication is unaffected (it reads the replication-log, never the
-;;; .txn files).  Revisit for a cleaner design (e.g. drop the id from the .txn
-;;; header format entirely, or a stable-id scheme) once the rw-lock work lands.
-;;; -------------------------------------------------------------------------
+(defun patch-tx-file-header-id (transaction)
+  "Write TRANSACTION's id over the header placeholder in its .txn file.
+Runs after the manager lock, with the transaction already :COMMITTED:
+the rename in FINALIZE-TX-PERSISTENCE is the commit point, this makes
+the file self-describing, and recovery cross-checks the two (#422).
+Returns the id; NIL when the graph is WAL-suppressed (no file) or the
+file is gone (a memory graph's checkpoint cleared the journal in the
+window, so nothing needs it).  Any other failure is re-signalled as
+TRANSACTION-FILE-PATCH-ERROR, whose report says the transaction is
+committed; the file keeps header 0, which recovery accepts."
+  (unless (wal-suppressed-p (graph transaction))
+    (let ((id (transaction-id transaction))
+          (file (transaction-pathname transaction))
+          (bytes (make-byte-vector 8)))
+      (serialize-uint64 bytes id 0)
+      (handler-case
+          (with-open-file (stream file
+                                  :direction :io
+                                  :if-exists :overwrite
+                                  :if-does-not-exist nil
+                                  :element-type '(unsigned-byte 8))
+            (when stream
+              (file-position stream +tx-header-id-offset+)
+              (write-sequence bytes stream)
+              id))
+        (error (e)
+          (error 'transaction-file-patch-error
+                 :file file :transaction-id id :cause e))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Peer replication (WP-0): the peer-meta packet.
@@ -2792,10 +2804,10 @@ op-class).  Asserts the packet's type byte."
 (defun prepare-tx-persistence (transaction)
   "Serialize TRANSACTION to a temp file and populate its BYTES slot.  Runs BEFORE
 the transaction-manager lock, so the bulk serialization + disk write (and the
-flush at close) are off the serialized commit path.  The header id is written as
-the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
-FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
-pathname.
+flush at close) are off the serialized commit path.  The header id is written
+as 0: it is not assigned yet.  The rename in FINALIZE-TX-PERSISTENCE puts it in
+the FILENAME and PATCH-TX-FILE-HEADER-ID writes it into the header after the
+lock (#422).  Returns the temp pathname.
 
 WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
 is set, no temp file is written and BYTES is left unpopulated -- FINALIZE-TX-
@@ -2815,17 +2827,20 @@ into the wire vector."
       (initialize-bytes-from-components transaction))
     tmp))
 
+;;; The .txn header id is written after the manager lock
+;;; (PATCH-TX-FILE-HEADER-ID) and cross-checked by recovery against the
+;;; filename (#422, docs/superpowers/specs/2026-11-04-txn-header-id-design.md).
 (defun finalize-tx-persistence (transaction tmp)
   "Under the transaction-manager lock, once TRANSACTION-ID is assigned: make the
 durable, recovery-visible record by renaming the prepared temp file to its final
 id-keyed name.  For a non-replicated graph this is a SINGLE rename — the only
 file I/O left in the commit critical section, which is what relieves the
 commit-lock convoy (the bulk write happened in PREPARE-TX-PERSISTENCE before the
-lock).  Recovery reads the id from this filename, so the file's header id stays
-at its placeholder 0.  Master graphs additionally patch the real id into the
-in-memory bytes and append them to the replication log in commit order for
-downstream slaves (the replication path is the only consumer of the header id,
-and it reads these patched bytes, never the .txn files).
+lock).  The filename is recovery's replay key; the header id follows after
+the lock (PATCH-TX-FILE-HEADER-ID, #422).  Master graphs additionally patch
+the real id into the in-memory bytes and append them to the replication log
+in commit order for downstream slaves (replication reads these patched
+bytes, never the .txn files).
 
 WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
 is set, this whole body is skipped -- no rename (PREPARE-TX-PERSISTENCE wrote
@@ -3753,7 +3768,14 @@ concurrent commit, and no public path reaches it.  An id with no head yet
                ;;     this tx-id) reads the committed value rather than a stale
                ;;     pre-apply snapshot.
                (apply-transaction tx (graph tx)))
-             (setf (state tx) :committed))
+             ;; :COMMITTED first: the apply is complete, and the state
+             ;; keeps the transaction in the manager's table for OCC
+             ;; even if the patch below signals (#422).
+             (setf (state tx) :committed)
+             ;; Off the lock: the file's header id, cross-checked by
+             ;; recovery (#422).
+             (when renamed
+               (patch-tx-file-header-id tx)))
         ;; On validation conflict (retry) or any error before the rename, drop
         ;; the orphan temp file so prepared-but-not-committed attempts don't leak.
         (when (and tmp (not renamed))
@@ -3807,13 +3829,18 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
     :accessor writes)))
 
 (defun load-recovery-transaction (file)
-  ;; The transaction-id is authoritative in the FILENAME (~16,'0X hex), set by the
-  ;; rename in FINALIZE-TX-PERSISTENCE; the .txn header id is a deliberate
-  ;; placeholder (0).  recovery-transaction-files already replays in filename
-  ;; (= id) order.  See the TODO above FINALIZE-TX-PERSISTENCE.
-  (let ((tx-header (load-tx-file file)))
+  ;; The filename (~16,'0X hex, set by the rename in
+  ;; FINALIZE-TX-PERSISTENCE) is the replay key; the header id is written
+  ;; after the lock and cross-checked here, 0 being the crash window
+  ;; between the two (#422, the 2026-11-04 txn-header-id spec).
+  (let* ((tx-header (load-tx-file file))
+         (header-id (transaction-id tx-header))
+         (filename-id (parse-integer (pathname-name file) :radix 16)))
+    (unless (or (zerop header-id) (= header-id filename-id))
+      (error 'transaction-file-id-mismatch
+             :file file :header-id header-id :filename-id filename-id))
     (make-instance 'recovery-transaction
-                   :transaction-id (parse-integer (pathname-name file) :radix 16)
+                   :transaction-id filename-id
                    :writes (writes tx-header))))
 
 (defmethod call-with-transaction-lock ((transaction recovery-transaction) fun)
