@@ -8,9 +8,10 @@
 LOCK, RUNNING-P while a step drains it (D5), FAILURES as (name .
 text) newest first, COMPILED the rule set cached while CACHE-STAMP
 matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS the threshold
-timers (thresholds.lisp)."
+timers (thresholds.lisp), LAST-REPORTS the last delta's RULE-REPORTs."
   graph
   (queue '())
+  (last-reports '())
   (lock (bordeaux-threads:make-lock "forward rules"))
   (running-p nil)
   (failures '())
@@ -65,8 +66,9 @@ cached rule set.  Returns nothing."
                          ((forward-state-lock state))
                        (pop (forward-state-queue state)))))
           (unless delta (return))
-          (run-forward-strata graph (%forward-compiled graph state)
-                              delta))))))
+          (setf (forward-state-last-reports state)
+                (run-forward-strata graph (%forward-compiled graph state)
+                                    delta)))))))
 
 (defun %forward-hook (tx)
   "The *AFTER-COMMIT-HOOKS* entry: a committed TX on an enabled graph

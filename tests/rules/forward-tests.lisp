@@ -116,9 +116,9 @@ hook still runs after that lock is released (spec §6)."
     (is (every (lambda (r) (zerop (graph-db.rules:rule-report-derived r)))
                (graph-db.rules:run-rules g)))))
 
-(defparameter *hosts-web-head*
+(defparameter *hosts-web-fwd-head*
   "(claim ?c rt-claim \"host\" ?h \"hosts-web\" nil nil)")
-(defparameter *hosts-web-body*
+(defparameter *hosts-web-fwd-body*
   "(claim ?a rt-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)")
 
 (test a-forward-rule-derives-through-two-strata-in-one-step
@@ -129,7 +129,7 @@ cache is refreshed by its commit."
     (write-web-hosts g)
     (graph-db.rules:enable-forward-rules g)
     (write-rule g :name "hosts-web" :version "1" :family "rt-claim"
-                  :head *hosts-web-head* :body *hosts-web-body*)
+                  :head *hosts-web-fwd-head* :body *hosts-web-fwd-body*)
     (seed g)
     (is (= 2 (length (derived g 'rt-claim "web-hosts"))))
     (is (equal '("h1" "h2")
@@ -145,3 +145,193 @@ cache is refreshed by its commit."
     (is (null (derived g 'rt-claim "web-hosts")))
     (is (= 2 (graph-db.rules:rule-report-derived
               (graph-db.rules:run-rule g "web-hosts"))))))
+
+;;; Lost derivations (spec §4.2, plan Task 5)
+
+(defun runs-web-premise (g host)
+  "HOST's \"runs web\" rt-claim."
+  (find "web" (claims-touching g 'rt-claim :host host :role :subject
+                               :relation "runs")
+        :key #'claim-object-key :test #'string=))
+
+(defun reopen-claim (g claim)
+  "CLAIM asserted again: its transaction period re-opened as of now, in
+its own transaction.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (let ((c (copy (graph-db:lookup-vertex (graph-db:id claim)))))
+      (setf (claim-transaction-extent-sexp c)
+            (extent->sexp
+             (graph-db.spacetime::%open-transaction-extent
+              (graph-db.spacetime::%st-now))))
+      (save c))))
+
+(defun derived-object (g name key &key (current t))
+  "Rule NAME's derived rt-claim whose object key is KEY."
+  (find key (derived g 'rt-claim name :current current)
+        :key #'claim-object-key :test #'string=))
+
+(defun derived-subject (g name key &key (current t))
+  "Rule NAME's derived rt-claim whose subject key is KEY."
+  (find key (derived g 'rt-claim name :current current)
+        :key #'claim-subject-key :test #'string=))
+
+(defun run-rules-is-quiet (g)
+  "RUN-RULES derives and sweeps nothing: the forward step left the
+store at the fixpoint."
+  (every (lambda (r) (and (zerop (graph-db.rules:rule-report-derived r))
+                          (zerop (graph-db.rules:rule-report-swept r))))
+         (graph-db.rules:run-rules g)))
+
+(test a-forward-rule-loses-its-derivation-when-a-current-premise-is-retracted
+  (with-rules-graph (g)
+    (write-web-hosts-current g)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)
+    (retract-claim (runs-web-premise g "h2"))
+    (is (equal '("h1") (mapcar #'claim-object-key
+                               (derived g 'rt-claim "web-hosts"))))
+    (let ((h2 (derived-object g "web-hosts" "h2" :current nil)))
+      (is (not (null h2)))
+      (when h2
+        (is-false (claim-current-p h2))
+        (is (= 1 (length (graph-db.rules:premises-of g h2))))))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-restored-premise-re-opens-the-lost-derivation
+  (with-rules-graph (g)
+    (write-web-hosts-current g)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)
+    (let ((premise (runs-web-premise g "h2"))
+          (before (graph-db:id (derived-object g "web-hosts" "h2"))))
+      (retract-claim premise)
+      (is (null (derived-object g "web-hosts" "h2")))
+      (reopen-claim g premise)
+      (let ((after (derived-object g "web-hosts" "h2")))
+        (is (not (null after)))
+        (when after
+          (is (equalp before (graph-db:id after)))))
+      (is (= 2 (length (derived g 'rt-claim "web-hosts" :current nil))))
+      (is-true (run-rules-is-quiet g)))))
+
+(defparameter *hosts-web-current-body*
+  "(claim ?a rt-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)
+   (claim-current ?a)")
+
+(test a-derivation-lost-in-one-stratum-is-lost-in-the-next
+  (with-rules-graph (g)
+    (write-web-hosts-current g)
+    (write-rule g :name "hosts-web" :version "1" :family "rt-claim"
+                  :head *hosts-web-fwd-head* :body *hosts-web-current-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)
+    (is (= 2 (length (derived g 'rt-claim "hosts-web"))))
+    (retract-claim (runs-web-premise g "h2"))
+    (is (equal '("h1") (mapcar #'claim-subject-key
+                               (derived g 'rt-claim "hosts-web"))))
+    (is-false (claim-current-p
+               (derived-subject g "hosts-web" "h2" :current nil)))
+    (is-true (run-rules-is-quiet g))))
+
+(defparameter *unreached-head*
+  "(claim ?c rt-claim \"host\" ?h \"unreached\" nil nil)")
+(defparameter *unreached-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (not (claim ?r rt-claim \"host\" ?h \"reachable\" nil nil))")
+
+(defun unreached-hosts (g)
+  (sort (mapcar #'claim-subject-key (derived g 'rt-claim "unreached"))
+        #'string<))
+
+(test a-not-rule-follows-its-blocker-retracted-then-restored
+  (with-rules-graph (g)
+    (write-rule g :name "unreached" :version "1" :family "rt-claim"
+                  :head *unreached-head* :body *unreached-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)                             ; h2 is reachable, h1 is not
+    (is (equal '("h1") (unreached-hosts g)))
+    (with-transaction ((graph-db::transaction-manager g))
+      (mark-deleted (first (claims-touching g 'rt-claim :host "h2"
+                                            :role :subject
+                                            :relation "reachable"))))
+    (is (equal '("h1" "h2") (unreached-hosts g)))
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rt-claim-unary :graph g :subject-namespace :host
+                           :subject-key "h1" :relation "reachable"
+                           :producer "scan-b" :standing :inferred))
+    (is (equal '("h2") (unreached-hosts g)))
+    (is-true (run-rules-is-quiet g))))
+
+(defun reach-pairs (g)
+  (sort (mapcar (lambda (c) (concatenate 'string (claim-subject-key c)
+                                         (claim-object-key c)))
+                (append (derived g 'rt-claim "tc-base")
+                        (derived g 'rt-claim "tc-step")))
+        #'string<))
+
+(test a-recursive-stratum-reaches-run-rules-fixpoint-after-a-retraction
+  (with-rules-graph (g)
+    (write-closure g)
+    (graph-db.rules:enable-forward-rules g)
+    (link g "a" "b")
+    (link g "b" "c")
+    (link g "c" "d")
+    (is (equal '("ab" "ac" "ad" "bc" "bd" "cd") (reach-pairs g)))
+    (retract-claim (first (claims-touching g 'rt-claim :node "b"
+                                           :role :subject
+                                           :relation "next")))
+    (is (equal '("ab" "cd") (reach-pairs g)))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-hand-retracted-derived-claim-is-re-opened
+  "Review Focus 2: the derivation is still supported, so the step the
+retraction's own commit triggers re-opens it; RUN-RULES agrees."
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)
+    (let* ((h1 (derived-object g "web-hosts" "h1"))
+           (before (graph-db:id h1)))
+      (retract-claim h1)
+      (let ((again (derived-object g "web-hosts" "h1")))
+        (is (not (null again)))
+        (when again
+          (is (equalp before (graph-db:id again)))))
+      (is (= 2 (length (derived g 'rt-claim "web-hosts" :current nil))))
+      (is-true (run-rules-is-quiet g)))))
+
+(defparameter *flagged-head*
+  "(claim ?c rt-claim \"host\" ?h \"flagged\" nil nil)")
+(defparameter *flagged-body*
+  "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+   (claim ?m rt-claim \"sys\" \"s\" \"mode\" \"val\" \"strict\")
+   (claim-current ?m)")
+
+(test a-premise-with-many-dependents-takes-the-targeted-path
+  "Review Focus 5: one retracted premise cited by 300 derivations is
+handled through provenance, each dependent re-derived with its head
+bound, not by a full re-run of the rule."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 300 :relation "up")
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rt-claim-binary :graph g :subject-namespace :sys
+                            :subject-key "s" :relation "mode"
+                            :object-namespace :val :object-key "strict"
+                            :producer "ops" :standing :asserted))
+    (is (= 300 (length (derived g 'rt-claim "flagged"))))
+    (retract-claim (first (claims-touching g 'rt-claim :sys "s"
+                                           :role :subject
+                                           :relation "mode")))
+    (is (null (derived g 'rt-claim "flagged")))
+    (is (= 300 (length (derived g 'rt-claim "flagged" :current nil))))
+    (let ((reports (graph-db.rules::forward-state-last-reports
+                    (graph-db.rules::%forward-state g))))
+      (is (= 1 (length reports)))
+      (when reports
+        (is (eq :targeted (graph-db.rules:rule-report-path
+                           (first reports))))
+        (is (= 300 (graph-db.rules:rule-report-swept (first reports))))))
+    (is-true (run-rules-is-quiet g))))

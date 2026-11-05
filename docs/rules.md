@@ -1100,11 +1100,32 @@ of the store (the fixpoint machinery's `rule-delta/2`, now generated
 for every claim goal, not only the recursive ones), no producer is
 excluded, and the reconcile sweeps nothing and only adds provenance:
 the step derived from a delta, not from the whole store, so a claim it
-did not meet is not thereby lost. A stratum touched by a −1, by a
-write to a relation it reads under `not`, or whose rule reads an
-unbound relation runs the **full path**, `run-rule` or the fixpoint
-with the full sweep. What a stratum constructed, re-opened or
-retracted joins the delta the later strata see. Each stratum commits
+did not meet is not thereby lost. What a stratum constructed, re-opened or
+retracted joins the delta the later strata see.
+
+**Lost derivations.** A −1 entry (a deleted or retracted claim) is
+handled by one of three cases, the spec's §4.2 table:
+
+| the lost claim is read by | what runs |
+|---|---|
+| a non-recursive rule, positively | the **targeted path**: `dependents-of` names the derived claims whose provenance cites it; each is re-derived with its head bound and kept, re-opened, or retracted; provenance is reconciled for those claims alone |
+| a recursive stratum, positively | the stratum re-runs in full through the fixpoint, with the full sweep; provenance cannot bound a closure's loss |
+| any rule under `not`, or a rule reading an unbound relation (a +1 there too) | that stratum runs the **full path**, `run-rule` or the fixpoint with the full sweep |
+
+A lost claim a stratum itself derived -- a derived claim somebody
+retracted by hand -- is re-checked on the targeted path too, and
+re-opened when its premises still stand (D4: the derivation is
+supported, so it is believed). A retracted premise loses its
+dependents only if their bodies notice: **currency is the body's
+business**. A rule meant to track retraction says `claim-current` on
+each premise it tracks, exactly as it must under `run-rules`; a body
+that does not says that a retracted premise still supports its
+conclusion, and the targeted re-derivation honours that. Lost derived
+claims re-enter the step as −1 entries for the later strata, so a loss
+propagates down the strata in the same step.
+
+Each step's reports carry `rule-report-path`: `:forward`, `:targeted`
+or `:full`. Each stratum commits
 its own transaction, as `run-rules` does, and those commits do not
 queue themselves again.
 

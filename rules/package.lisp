@@ -39,6 +39,7 @@
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
+   #:rule-report-path
    ;; provenance (spec §9)
    #:premises-of #:dependents-of
    ;; forward evaluation (forward-rules design, #456)
