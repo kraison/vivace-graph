@@ -108,31 +108,83 @@ recorded on the status, never signalled into the step."
 
 (setf *threshold-scheduler* '%schedule-thresholds)
 
-(defun %same-timer-p (a instant claims direction)
-  (and (eq (threshold-timer-direction a) direction)
-       (local-time:timestamp= (threshold-timer-instant a) instant)
-       (= (length (threshold-timer-claims a)) (length claims))
-       (every (lambda (c)
-                (find (graph-db:id c) (threshold-timer-claims a)
-                      :key #'graph-db:id :test #'equalp))
-              claims)))
+(defun %timer-key (instant claims direction)
+  "The dedupe key of a timer: direction, instant, the premises'
+identity keys sorted."
+  (list direction (graph-db::%instant-string instant)
+        (sort (mapcar #'graph-db.spacetime:claim-identity-key claims)
+              #'string<)))
+
+;; A binary min-heap by instant on the TIMER-HEAP's adjustable vector:
+;; O(log n) per schedule and per fire, where a list was O(n) each and
+;; ENABLE-FORWARD-RULES schedules every pending match at once (final
+;; review, finding 4).
+(defun %heap-earlier-p (a b)
+  (local-time:timestamp< (threshold-timer-instant a)
+                         (threshold-timer-instant b)))
+
+(defun %heap-push (heap timer)
+  (let ((v (timer-heap-items heap)))
+    (vector-push-extend timer v)
+    (loop with i = (1- (fill-pointer v))
+          while (plusp i)
+          do (let ((parent (floor (1- i) 2)))
+               (if (%heap-earlier-p (aref v i) (aref v parent))
+                   (progn (rotatef (aref v i) (aref v parent))
+                          (setf i parent))
+                   (return))))))
+
+(defun %heap-peek (heap)
+  (let ((v (timer-heap-items heap)))
+    (and (plusp (fill-pointer v)) (aref v 0))))
+
+(defun %heap-pop (heap)
+  "The earliest timer, removed; NIL when empty."
+  (let* ((v (timer-heap-items heap))
+         (n (fill-pointer v)))
+    (when (plusp n)
+      (let ((top (aref v 0))
+            (last (vector-pop v)))
+        (when (> n 1)
+          (setf (aref v 0) last)
+          (loop with i = 0
+                with count = (fill-pointer v)
+                do (let* ((l (+ 1 (* 2 i))) (r (+ 2 (* 2 i))) (m i))
+                     (when (and (< l count)
+                                (%heap-earlier-p (aref v l) (aref v m)))
+                       (setf m l))
+                     (when (and (< r count)
+                                (%heap-earlier-p (aref v r) (aref v m)))
+                       (setf m r))
+                     (if (= m i)
+                         (return)
+                         (progn (rotatef (aref v i) (aref v m))
+                                (setf i m))))))
+        (remhash (threshold-timer-key top) (timer-heap-keys heap))
+        top))))
+
+(defun threshold-timer-key (timer)
+  (%timer-key (threshold-timer-instant timer)
+              (threshold-timer-claims timer)
+              (threshold-timer-direction timer)))
 
 (defun schedule-threshold (state instant claims direction)
   "A timer on STATE at INSTANT for the match CLAIMS, unless one like it
 is already pending; starts the state's timer thread if need be.
 Returns nothing."
   (bordeaux-threads:with-lock-held ((forward-state-lock state))
-    (unless (find-if (lambda (tm) (%same-timer-p tm instant claims direction))
-                     (forward-state-timers state))
-      (setf (forward-state-timers state)
-            (merge 'list
-                   (list (%make-threshold-timer :instant instant
+    (let* ((heap (or (forward-state-timers state)
+                     (setf (forward-state-timers state)
+                           (%make-timer-heap))))
+           (key (%timer-key instant claims direction)))
+      (unless (gethash key (timer-heap-keys heap))
+        (setf (gethash key (timer-heap-keys heap)) t)
+        (%heap-push heap (%make-threshold-timer :instant instant
                                                 :claims claims
                                                 :direction direction))
-                   (forward-state-timers state)
-                   #'local-time:timestamp< :key #'threshold-timer-instant))
-      (%ensure-timer-thread state)
-      (bordeaux-threads:condition-notify (forward-state-timer-cv state))))
+        (%ensure-timer-thread state)
+        (bordeaux-threads:condition-notify
+         (forward-state-timer-cv state)))))
   (values))
 
 (defun %fire-threshold (state timer)
@@ -158,7 +210,8 @@ leaves when TIMER-STOP is set (DISABLE-FORWARD-RULES)."
           (loop
             (when (forward-state-timer-stop state)
               (return-from %timer-loop nil))
-            (let ((next (first (forward-state-timers state))))
+            (let* ((heap (forward-state-timers state))
+                   (next (and heap (%heap-peek heap))))
               (cond ((null next)
                      (bordeaux-threads:condition-wait cv lock))
                     (t
@@ -166,8 +219,7 @@ leaves when TIMER-STOP is set (DISABLE-FORWARD-RULES)."
                                   (threshold-timer-instant next)
                                   (local-time:now))))
                        (cond ((<= wait 0)
-                              (pop (forward-state-timers state))
-                              (setf due next)
+                              (setf due (%heap-pop heap))
                               (return))
                              (t (bordeaux-threads:condition-wait
                                  cv lock :timeout wait)))))))))
@@ -191,7 +243,7 @@ leaves when TIMER-STOP is set (DISABLE-FORWARD-RULES)."
 unless called from it.  Returns nothing."
   (let ((th (bordeaux-threads:with-lock-held ((forward-state-lock state))
               (setf (forward-state-timer-stop state) t
-                    (forward-state-timers state) '())
+                    (forward-state-timers state) nil)
               (bordeaux-threads:condition-notify
                (forward-state-timer-cv state))
               (forward-state-timer-thread state))))

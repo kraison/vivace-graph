@@ -835,3 +835,76 @@ re-evaluating the query from scratch, as sets, with no duplicate."
       (is (null mismatches) "mismatches: ~S" mismatches)
       (is (plusp total))
       (is-true (run-rules-is-quiet g)))))
+
+;;; Final review fixes (plan ledger, Final:)
+
+(test a-nested-commit-is-drained-by-a-claim-free-outer-commit
+  "Review finding 1: the outermost commit drains whatever is queued,
+even when it wrote no claim itself."
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (commit-runs-web g "h2")          ; nested: queued, not run
+      ;; The outer transaction writes a rule record, not a claim.
+      (let ((c (copy (first (graph-db:index-lookup
+                             g 'graph-db.rules:rule
+                             '(graph-db.rules::name) "web-hosts")))))
+        (setf (graph-db.rules:rule-version c) "2")
+        (save c)))
+    (is (equal '("h2") (mapcar #'claim-object-key
+                               (derived g 'rt-claim "web-hosts"))))
+    (is (eql 0 (getf (graph-db.rules:forward-rules-status g)
+                     :queue-depth)))))
+
+(test a-retried-derive-starts-its-change-list-afresh
+  "Review finding 2: the derive thunk a VALIDATION-CONFLICT re-runs
+clears the changes its aborted attempt noted, so a step never reports
+an uncommitted claim or fires an action twice."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts g)))
+      (let ((graph-db.rules::*forward-changes*
+              (list (cons :stale-from-an-aborted-attempt 1))))
+        (graph-db.rules:run-rule g r)
+        (is (= 2 (length graph-db.rules::*forward-changes*)))
+        (is (notany (lambda (ch) (eq :stale-from-an-aborted-attempt
+                                     (car ch)))
+                    graph-db.rules::*forward-changes*))))))
+
+(defparameter *echo-body*
+  "(claim ?p rt-claim \"host\" ?h \"ping\" nil nil) (claim-current ?p)")
+
+(test a-step-that-never-quiesces-is-stopped-at-the-rounds-bound
+  "Review finding 3 (spec §4.3): an action that keeps writing what it
+reads cannot pin the committing thread; the step stops after
+*RULES-MAX-ROUNDS* drains and the status says so."
+  (with-rules-graph (g)
+    (let ((*fired* '())
+          (graph-db.rules:*rules-max-rounds* 5))
+      (with-production
+          ("echo" :version "1" :family rt-claim :body *echo-body*
+                  :writes '()
+                  :action (lambda (event match)
+                            (when (eq event :added)
+                              (push (list "echo" event (getf match :key))
+                                    *fired*)
+                              (with-transaction
+                                  ((graph-db::transaction-manager g))
+                                (make-rt-claim-unary
+                                 :graph g :subject-namespace :host
+                                 :subject-key (format nil "h~D"
+                                                      (length *fired*))
+                                 :relation "ping" :producer "echo"
+                                 :standing :inferred)))))
+        (graph-db.rules:enable-forward-rules g)
+        (finishes
+          (with-transaction ((graph-db::transaction-manager g))
+            (make-rt-claim-unary :graph g :subject-namespace :host
+                                 :subject-key "h0" :relation "ping"
+                                 :producer "scan-t" :standing :observed)))
+        (let ((status (graph-db.rules:forward-rules-status g)))
+          (is (<= (length *fired*) 7))
+          (is (find :rounds (getf status :failures) :key #'car))
+          (is (eql 0 (getf status :queue-depth)))
+          (is-false (getf status :running-p)))))))

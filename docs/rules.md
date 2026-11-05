@@ -1144,8 +1144,14 @@ caveat that follows: **do not expect a derivation the moment your
 poll `forward-rules-status` for an empty queue, or read the derived
 claims on the next commit's step. A commit made inside another
 transaction (a nested `with-transaction`) queues only; the outermost
-commit's hook drains, so a body that opened a transaction never has
-a step run inside it.
+commit's hook, whatever graph it committed on and whether or not it
+wrote a claim, drains every enabled graph's queue, so a body that
+opened a transaction never has a step run inside it. A body that
+unwinds after a nested commit leaves that delta queued until the next
+outermost commit in the image, or an explicit `forward-step`. A step
+that never quiesces -- an action that keeps writing what the
+production reads -- is stopped after `*rules-max-rounds*` drains with
+the queue dropped and a `:rounds` failure on the status.
 
 **Failure (spec §4.4).** A rule that refuses in a step -- the rails,
 a constraint, a bad instant, a functor's own refusal -- is reported
@@ -1263,6 +1269,6 @@ defect in the step.
 **Cost.** A step reads the touched rules' producers' claims once per
 stratum (`claims-by-producer`, the same read `run-rules` makes), so a
 step on a store with many derived claims costs a read of them even
-when the delta is one claim; a per-key lookup is the optimisation
-left for a later unit. The derivation itself is proportional to the
-delta's solutions.
+when the delta is one claim; the per-key lookup is #457, the next
+unit, and a consumer with a large derived set should wait for it. The
+derivation itself is proportional to the delta's solutions.

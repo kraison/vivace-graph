@@ -3,14 +3,23 @@
 
 (in-package #:graph-db.rules)
 
+(defstruct (timer-heap (:constructor %make-timer-heap))
+  "Pending THRESHOLD-TIMERs: ITEMS a binary min-heap by instant, KEYS
+the dedupe set (thresholds.lisp)."
+  (items (make-array 16 :adjustable t :fill-pointer 0))
+  (keys (make-hash-table :test 'equal)))
+
+(defun %timer-count (heap)
+  (if heap (fill-pointer (timer-heap-items heap)) 0))
+
 (defstruct (forward-state (:constructor %make-forward-state))
   "One enabled graph's forward evaluation: QUEUE of pending deltas under
 LOCK, RUNNING-P while a step drains it (D5), FAILURES as (name .
 text) newest first, COMPILED the rule set cached while CACHE-STAMP
-matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS the pending
-THRESHOLD-TIMERs by instant with TIMER-THREAD, TIMER-CV and TIMER-STOP
-driving them (thresholds.lisp), LAST-REPORTS the last delta's
-RULE-REPORTs."
+matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS a TIMER-HEAP of
+pending THRESHOLD-TIMERs or NIL, with TIMER-THREAD, TIMER-CV and
+TIMER-STOP driving them (thresholds.lisp), LAST-REPORTS the last
+delta's RULE-REPORTs."
   graph
   (queue '())
   (last-reports '())
@@ -19,7 +28,7 @@ RULE-REPORTs."
   (failures '())
   (compiled '())
   (cache-stamp nil)
-  (timers '())
+  (timers nil)
   (timer-thread nil)
   (timer-cv (bordeaux-threads:make-condition-variable))
   (timer-stop nil))
@@ -106,21 +115,43 @@ returns (docs/rules.md).  Returns nothing."
           (return-from forward-step nil))
         (setf (forward-state-running-p state) t))
       (unwind-protect
-           (loop
-             (let ((deltas
-                     (bordeaux-threads:with-lock-held
-                         ((forward-state-lock state))
-                       (if (forward-state-queue state)
-                           (prog1 (forward-state-queue state)
-                             (setf (forward-state-queue state) '()))
-                           (progn
-                             (setf (forward-state-running-p state) nil)
-                             (return-from forward-step nil))))))
-               (dolist (delta deltas)
-                 (%run-delta graph state delta))))
-        ;; Only an abnormal exit reaches this with RUNNING-P still set.
+           (loop for drains from 0
+                 do (let ((deltas
+                            (bordeaux-threads:with-lock-held
+                                ((forward-state-lock state))
+                              (cond ((null (forward-state-queue state))
+                                     (return))
+                                    ;; Spec §4.3: a step that never
+                                    ;; quiesces -- an action feeding its
+                                    ;; own read -- stops here.
+                                    ((>= drains *rules-max-rounds*)
+                                     (setf (forward-state-queue state) '())
+                                     :rounds)
+                                    (t (prog1 (forward-state-queue state)
+                                         (setf (forward-state-queue state)
+                                               '())))))))
+                      (when (eq deltas :rounds)
+                        (%note-failure state :rounds
+                                       (format nil "no quiescence after ~
+~D drains; the queue was dropped" *rules-max-rounds*))
+                        (return))
+                      (dolist (delta deltas)
+                        (%run-delta graph state delta))))
+        ;; Every exit, normal or not: the queue is empty or dropped.
         (bordeaux-threads:with-lock-held ((forward-state-lock state))
           (setf (forward-state-running-p state) nil))))))
+
+(defun %drain-queues ()
+  "Every enabled graph with a queued delta gets its step: what the
+outermost commit on any graph does, so a nested commit's delta is not
+stranded behind a claim-free or foreign outer transaction (final
+review, finding 1)."
+  (dolist (g (bordeaux-threads:with-lock-held (*forward-states-lock*)
+               (alexandria:hash-table-keys *forward-states*)))
+    (let ((s (%forward-state g)))
+      (when (and s (bordeaux-threads:with-lock-held ((forward-state-lock s))
+                     (forward-state-queue s)))
+        (forward-step g)))))
 
 (defun forward-rules-status (graph)
   "What forward evaluation on GRAPH is doing: a plist (:ENABLED T
@@ -134,17 +165,23 @@ n), newest failure first; (:ENABLED NIL) for a graph not opted in."
                 :queue-depth (length (forward-state-queue state))
                 :running-p (forward-state-running-p state)
                 :failures (copy-list (forward-state-failures state))
-                :timers (length (forward-state-timers state)))))))
+                :timers (%timer-count (forward-state-timers state)))))))
 
 (defun %forward-hook (tx)
   "The *AFTER-COMMIT-HOOKS* entry: a committed TX on an enabled graph
-queues its claim delta and runs the step -- unless a transaction is
-still open around it, when the outermost commit's hook will; a
-committed RULE record invalidates the compiled cache.  A commit
-forward evaluation made itself (*FORWARD-HOOK-SUPPRESSED*) is
-ignored."
+queues its claim delta; an outermost commit -- no transaction still
+open around it -- then drains every enabled graph's queue, a nested
+one leaves that to the outermost; a committed RULE or PRODUCTION
+record invalidates the compiled cache.  A commit forward evaluation
+made itself (*FORWARD-HOOK-SUPPRESSED*) is ignored."
+  (unless *forward-hook-suppressed*
+    (%queue-commit tx)
+    (unless graph-db::*transaction*
+      (%drain-queues))))
+
+(defun %queue-commit (tx)
   (let ((state (%forward-state (graph-db::graph tx))))
-    (when (and state (not *forward-hook-suppressed*))
+    (when state
       (let ((writes (graph-db::writes tx))
             (rule-class (find-class 'rule nil))
             (production-class (find-class 'production nil)))
@@ -159,11 +196,7 @@ ignored."
           (when *agenda-production*
             (%check-production-writes state *agenda-production* delta))
           (when (plusp (hash-table-count delta))
-            (%enqueue-delta state delta)
-            ;; A nested commit (spec §6): queue only; the outermost
-            ;; commit's hook, outside every *TRANSACTION*, drains.
-            (unless graph-db::*transaction*
-              (forward-step (forward-state-graph state)))))))))
+            (%enqueue-delta state delta)))))))
 
 (defun %check-production-writes (state compiled delta)
   "An action's commit wrote DELTA: a relation outside the production's

@@ -72,6 +72,25 @@ listening."
   (when (listp *forward-changes*)
     (push (cons claim weight) *forward-changes*)))
 
+(defun %reset-changes ()
+  "Forget the changes noted so far: called at the top of every
+transaction thunk CALL-WITH-TRANSACTION may re-run on a
+VALIDATION-CONFLICT, so an aborted attempt's uncommitted claims never
+reach a later stratum or the agenda (final review, finding 2)."
+  (when (listp *forward-changes*)
+    (setf *forward-changes* '())))
+
+(defun %call-collecting-changes (fn)
+  "FN under a fresh change list: (VALUES FN's-value CHANGES), CHANGES
+in arrival order.  One retried unit of work per call, so %RESET-CHANGES
+inside FN cannot discard a neighbour's changes."
+  (let ((*forward-changes* '()))
+    (let ((value (funcall fn)))
+      (values value (reverse *forward-changes*)))))
+
+(defun %note-changes (changes)
+  (dolist (ch changes) (%note-change (car ch) (cdr ch))))
+
 (defstruct (rule-report (:constructor %make-rule-report))
   "What one RUN-RULE did (spec §7).  OUTCOME is :DERIVED or :REFUSED.
 DERIVED counts claims constructed this run, KEPT the previous
@@ -639,6 +658,7 @@ is %DESIRED's for the same reason."
   (setf (rule-report-derived report) 0
         (rule-report-kept report) 0
         (rule-report-swept report) 0)
+  (%reset-changes)
   (multiple-value-bind (standing swept)
       (%reconcile-claims compiled graph report desired order)
     (%reconcile-provenance compiled graph desired standing :swept swept)
@@ -1203,6 +1223,7 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              ;; cross-store per-round reset), so a VALIDATION-CONFLICT
              ;; retry starts genuinely from scratch.
              (mapc #'reset-run runs)
+             (%reset-changes)
              (setf derived-table (make-hash-table :test 'equal)
                    round 0
                    delta nil)
@@ -1657,6 +1678,7 @@ RULE-REPORT with PATH :TARGETED."
             (setf (rule-report-derived report) 0
                   (rule-report-kept report) 0
                   (rule-report-swept report) 0)
+            (%reset-changes)
             (let ((desired (make-hash-table :test 'equal))
                   (order '())
                   (tail nil)
@@ -1720,8 +1742,11 @@ per rule with something to re-derive."
             (take p)
             (mapc #'take (dependents-of graph p))))
         (when claims
-          (push (%rederive-dependents graph c (nreverse claims))
-                reports))))))
+          (multiple-value-bind (report changes)
+              (%call-collecting-changes
+               (lambda () (%rederive-dependents graph c (nreverse claims))))
+            (%note-changes changes)
+            (push report reports)))))))
 
 (defun %merge-delta (delta changes)
   "DELTA plus CHANGES, a list of (claim . weight), each under its
@@ -1772,26 +1797,37 @@ post-commit hook.  => the RULE-REPORTs, in the order run."
           (setf mode :full))
         (when mode
           (let* ((*forward-changes* '())
-                 (rs (ecase mode
-                       (:forward
-                        (let ((positive (%positive-delta pending reads)))
-                          (append
-                           (%targeted-reports graph stratum lost)
-                           (when (plusp (hash-table-count positive))
-                             (mapc (lambda (r)
-                                     (setf (rule-report-path r) :forward))
-                                   (%run-stratum graph stratum scope
-                                                 :forward-delta
-                                                 positive))))))
-                       (:full
-                        (mapc (lambda (r) (setf (rule-report-path r) :full))
-                              (if (some #'%compiled-recursive-p stratum)
-                                  (%run-stratum graph stratum scope)
-                                  (mapcar (lambda (c)
-                                            (run-rule
-                                             graph
-                                             (compiled-rule-spec c)))
-                                          stratum)))))))
+                 (rs (flet ((unit (fn)
+                              ;; Each retried unit under its own list.
+                              (multiple-value-bind (v changes)
+                                  (%call-collecting-changes fn)
+                                (%note-changes changes)
+                                v)))
+                       (ecase mode
+                         (:forward
+                          (let ((positive (%positive-delta pending reads)))
+                            (append
+                             (%targeted-reports graph stratum lost)
+                             (when (plusp (hash-table-count positive))
+                               (mapc (lambda (r)
+                                       (setf (rule-report-path r) :forward))
+                                     (unit (lambda ()
+                                             (%run-stratum
+                                              graph stratum scope
+                                              :forward-delta positive))))))))
+                         (:full
+                          (mapc (lambda (r) (setf (rule-report-path r) :full))
+                                (if (some #'%compiled-recursive-p stratum)
+                                    (unit (lambda ()
+                                            (%run-stratum graph stratum
+                                                          scope)))
+                                    (mapcar (lambda (c)
+                                              (unit
+                                               (lambda ()
+                                                 (run-rule
+                                                  graph
+                                                  (compiled-rule-spec c)))))
+                                            stratum))))))))
             (dolist (r rs) (push r reports))
             (unless (some (lambda (r)
                             (eq (rule-report-outcome r) :refused))
