@@ -804,24 +804,26 @@ longer be the one its own premises give (I1)."
     (values
      (mapcar (lambda (key)
                (let ((args (car (gethash key desired)))
-                     (have (gethash key existing)))
-                 (if have
-                     (let ((was-current
-                             (graph-db.spacetime:claim-current-p have))
-                           (kept (%refresh-kept have version
-                                                (getf args :extent))))
-                       (unless was-current (%note-change kept 1))
-                       kept)
-                     (let ((claim (apply ctor :graph graph
-                                         :relation
-                                         (compiled-rule-relation compiled)
-                                         :producer producer
-                                         :rule-version version
-                                         :standing :inferred
-                                         args)))
-                       (incf constructed)
-                       (%note-change claim 1)
-                       claim))))
+                     (have (%existing-claim existing key)))
+                 (%note-existing
+                  existing key
+                  (if have
+                      (let ((was-current
+                              (graph-db.spacetime:claim-current-p have))
+                            (kept (%refresh-kept have version
+                                                 (getf args :extent))))
+                        (unless was-current (%note-change kept 1))
+                        kept)
+                      (let ((claim (apply ctor :graph graph
+                                          :relation
+                                          (compiled-rule-relation compiled)
+                                          :producer producer
+                                          :rule-version version
+                                          :standing :inferred
+                                          args)))
+                        (incf constructed)
+                        (%note-change claim 1)
+                        claim)))))
              new-keys)
      constructed)))
 
@@ -896,28 +898,84 @@ write transaction's read set (docs/rules.md)."
 parent class MISSING-CLAIM-IDENTITY-COMPONENT is tagged with, the same
 tag RUN-RULE uses; DESIRED/ORDER/ORDER-TAIL accumulate across rounds as
 %MERGE-DESIRED folds each round's solutions in, ORDER-TAIL its last
-cons cell for an O(1) append (M1); EXISTING is the producer's already-
-standing claims, keyed by %EXISTING-KEY and seeded once before round
-0; NEW-KEYS is the identities %MERGE-DESIRED reports as first seen
-THIS round, reset before each round's evaluation and consumed by
-%ROUND-DELTA, so a round never rescans the whole cumulative ORDER."
+cons cell for an O(1) append (M1); EXISTING is a %EXISTING over the
+producer's standing claims, seeded before round 0 on the full path and
+lazy on a delta run (#457); NEW-KEYS is the identities %MERGE-DESIRED
+reports as first seen THIS round, reset before each round's evaluation
+and consumed by %ROUND-DELTA, so a round never rescans the whole
+cumulative ORDER."
   compiled report family
   (desired (make-hash-table :test 'equal)) (order '()) order-tail
   existing new-keys)
 
+(defstruct (%existing (:constructor %make-existing))
+  "A rule's standing claims by dedupe key, as %ROUND-DELTA and the
+delta paths' reconcile resolve them (#457 spec §2): TABLE maps a key to
+its claim, or to NIL for a cached miss; under LAZY-P a key TABLE lacks
+is resolved through %CLAIM-BY-DEDUPE-KEY on GRAPH for COMPILED and
+remembered.  The full path seeds TABLE with the whole derivation
+(%SEEDED-EXISTING); the forward path starts empty (%LAZY-EXISTING)."
+  (table (make-hash-table :test 'equal))
+  lazy-p graph compiled)
+
+(defun %claim-by-dedupe-key (graph compiled key)
+  "The claim of COMPILED's producer whose %EXISTING-KEY is KEY, through
+the subject-relation index -- the claims of one subject under one
+relation, bounded by the subject, never by the derivation -- a current
+one over a retracted one (D4); NIL when none stands (#457 spec §2)."
+  (let* ((family (compiled-rule-family compiled))
+         (producer (rule-producer (compiled-rule-spec compiled)))
+         (found (loop for c in (graph-db:index-lookup
+                                graph
+                                (graph-db.spacetime:claim-family-parent
+                                 family)
+                                graph-db::+claim-subject-relation-index-slots+
+                                (subseq key 0 3))
+                      when (and (string= producer
+                                         (graph-db.spacetime:claim-producer
+                                          c))
+                                (equal key (%existing-key c family)))
+                        collect c)))
+    (or (find-if #'graph-db.spacetime:claim-current-p found)
+        (first found))))
+
+(defun %existing-claim (existing key)
+  "The claim EXISTING has under KEY, resolved and cached when it is
+lazy; NIL when none stands."
+  (multiple-value-bind (claim seen) (gethash key (%existing-table existing))
+    (cond (seen claim)
+          ((%existing-lazy-p existing)
+           (setf (gethash key (%existing-table existing))
+                 (%claim-by-dedupe-key (%existing-graph existing)
+                                       (%existing-compiled existing)
+                                       key)))
+          (t nil))))
+
+(defun %note-existing (existing key claim)
+  "CLAIM now stands under KEY: what a round kept or constructed, so the
+reconcile at the fixpoint finds it without a lookup."
+  (setf (gethash key (%existing-table existing)) claim))
+
 (defun %seeded-existing (graph compiled)
   "COMPILED's producer's existing claims, keyed by %EXISTING-KEY to the
 claim itself: what a round may hand straight to its delta instead of
-constructing, and what %RECONCILE-CLAIMS later sweeps or keeps
-(GH #333)."
-  (let ((existing (make-hash-table :test 'equal))
+constructing, and what %RECONCILE-CLAIMS later sweeps or keeps (GH
+#333).  The full path's %EXISTING: one CLAIMS-BY-PRODUCER read of the
+whole derivation, the job's own size."
+  (let ((existing (%make-existing :graph graph :compiled compiled))
         (family (compiled-rule-family compiled))
         (spec (compiled-rule-spec compiled)))
     (dolist (c (graph-db.spacetime:claims-by-producer
                 graph (graph-db.spacetime:claim-family-parent family)
                 (rule-producer spec)))
-      (setf (gethash (%existing-key c family) existing) c))
+      (setf (gethash (%existing-key c family) (%existing-table existing))
+            c))
     existing))
+
+(defun %lazy-existing (graph compiled)
+  "The delta paths' %EXISTING: empty, each key resolved when first asked
+(#457 spec §2)."
+  (%make-existing :lazy-p t :graph graph :compiled compiled))
 
 (defun %refuse-stratum (runs tag text foreign)
   "Every RUN's report refused with TAG/TEXT: a refusal anywhere in a
@@ -1055,7 +1113,10 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              ;; genuinely from scratch.  COMPILED/REPORT/FAMILY, set
              ;; once when RUNS was built, are untouched.
              (setf (%stratum-run-existing run)
-                   (%seeded-existing graph (%stratum-run-compiled run))
+                   ;; #457 spec §2: a delta run resolves per key.
+                   (if forward-delta
+                       (%lazy-existing graph (%stratum-run-compiled run))
+                       (%seeded-existing graph (%stratum-run-compiled run)))
                    (%stratum-run-desired run) (make-hash-table :test 'equal)
                    (%stratum-run-order run) '()
                    (%stratum-run-order-tail run) nil
