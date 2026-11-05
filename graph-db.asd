@@ -235,7 +235,8 @@ docs/rules.md; GH #304."
   :pathname "rules/"
   :serial t
   :components ((:file "package") (:file "facts") (:file "schema")
-               (:file "compile") (:file "run"))
+               (:file "compile") (:file "run") (:file "delta")
+               (:file "forward"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test

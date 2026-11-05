@@ -97,6 +97,18 @@ storage formats (#60).
 
 ### Added
 
+- **Forward evaluation of rules** (#456, design
+  `docs/superpowers/specs/2026-11-04-forward-rules-design.md`). A
+  store that calls `enable-forward-rules` derives at commit: each
+  committed transaction's claim writes become a weighted delta, the
+  strata that read what changed run from it through the fixpoint
+  machinery, and nothing calls `run-rules`. `claim-absent/7` answers
+  the determined absences (standing `:searched-empty` or
+  `:determined-empty`) as the second negation beside `not/1`.
+  `graph-db:*after-commit-hooks*` is the core seam: functions of the
+  committed transaction, called after `with-transaction`'s retry loop
+  outside every lock.
+
 - **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
   subject and object keys, tested with `>/2`'s own predicate as a filter
   on every route and as a skip on the namespace route; a `nil` or

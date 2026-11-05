@@ -21,6 +21,10 @@ in.  FAMILY is the parent class's name, lowercase; SOURCE is :STORED or
 rather than in a store (spec §5).  Image-wide, so RUN-RULES filters it
 by the store's families (ruling P8).")
 
+(defvar *def-rules-stamp* 0
+  "Bumped by every DEF-RULE and UNDEF-RULE; a forward state's compiled
+rules are current while their stamp matches (rules/forward.lisp).")
+
 (defun %family-string (family)
   "FAMILY -- a symbol or a string -- as the lowercase name a RULE stores."
   (string-downcase (string family)))
@@ -32,6 +36,7 @@ by the store's families (ruling P8).")
   (check-type version string)
   (check-type head string)
   (check-type body string)
+  (incf *def-rules-stamp*)
   (setf (gethash name *def-rules*)
         (%make-rule-spec :name name :version version
                          :family (%family-string family)
@@ -53,6 +58,7 @@ store's other rules.  Returns NAME."
 
 (defun undef-rule (name)
   "Forget the DEF-RULE NAME; T when there was one."
+  (incf *def-rules-stamp*)
   (and (remhash name *def-rules*) t))
 
 (defun find-def-rule (name)

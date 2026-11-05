@@ -1050,3 +1050,72 @@ cycle that runs through another store's rules is not detected.
   not compile**, where `run-rules` reports that member and runs the
   rest. The fixpoint needs every rule of the stratum: one missing is
   an incomplete answer, not a smaller one.
+
+## Forward evaluation
+
+Design: `docs/superpowers/specs/2026-11-04-forward-rules-design.md`
+(decisions D1–D5 in its §1 are binding). Tracking: #456.
+
+`run-rules` is pull: somebody calls it. Forward evaluation is push:
+once a store opts in, every commit's claim writes are turned into a
+**delta** and the rules that read what changed run from it, in the
+committing thread, after the commit returns (D1: the derivation is a
+follow-on transaction, not part of the committing one). Nothing calls
+`run-rules`.
+
+```lisp
+(graph-db.rules:enable-forward-rules graph)    ; runs run-rules once
+(graph-db.rules:forward-rules-enabled-p graph) ; => T
+(graph-db.rules:disable-forward-rules graph)   ; drops the queue
+```
+
+`enable-forward-rules` registers the store and runs `run-rules` once,
+so a store with premises committed before the opt-in starts at its
+fixpoint. The opt-in is per open graph object and lives in the image:
+reopen the store, opt in again.
+
+**The delta.** `claim-delta` renders a committed transaction's writes
+(every node of a registered claim family) as a table, relation →
+list of `(claim . weight)`:
+
+| write | weight |
+|---|---|
+| create | +1 |
+| delete | −1 (the old version) |
+| update that closes the transaction period (`retract-claim`) | −1 |
+| update that re-opens it | +1 |
+| any other update | −1 old version, +1 new version |
+
+A claim created and deleted in one transaction nets to nothing. A
+transaction that writes no claim queues nothing; one that writes a
+`rule` record invalidates the compiled-rule cache.
+
+**A step.** Strata run in dependency order, as `run-rules` runs them.
+A stratum the delta does not touch -- none of its rules reads a
+relation the delta names, positively or under a `not` -- is skipped.
+A stratum touched only by +1 entries on positive reads runs the
+**forward path**: every rule runs the variants of its body in which
+one `claim/7` or `claim-absent/7` goal answers from the delta instead
+of the store (the fixpoint machinery's `rule-delta/2`, now generated
+for every claim goal, not only the recursive ones), no producer is
+excluded, and the reconcile sweeps nothing and only adds provenance:
+the step derived from a delta, not from the whole store, so a claim it
+did not meet is not thereby lost. A stratum touched by a −1, by a
+write to a relation it reads under `not`, or whose rule reads an
+unbound relation runs the **full path**, `run-rule` or the fixpoint
+with the full sweep. What a stratum constructed, re-opened or
+retracted joins the delta the later strata see. Each stratum commits
+its own transaction, as `run-rules` does, and those commits do not
+queue themselves again.
+
+**Repair.** `run-rules` is the forward mode's repair: it computes the
+same fixpoint from scratch and reconciles fully, so after any step it
+reports nothing derived and nothing swept. If it does not, that is a
+defect in the step.
+
+**Cost.** A step reads the touched rules' producers' claims once per
+stratum (`claims-by-producer`, the same read `run-rules` makes), so a
+step on a store with many derived claims costs a read of them even
+when the delta is one claim; a per-key lookup is the optimisation
+left for a later unit. The derivation itself is proportional to the
+delta's solutions.

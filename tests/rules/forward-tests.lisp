@@ -75,3 +75,73 @@ hook still runs after that lock is released (spec §6)."
                            *seen*)))))
       (seed-one g)
       (is (equal '(t) *seen*)))))
+
+;;; Deltas and the positive path (spec §3, §4.1, plan Task 4)
+
+(defun committed-tx (thunk)
+  "The TX a commit THUNK makes, captured through *AFTER-COMMIT-HOOKS*."
+  (let* ((seen nil)
+         (graph-db::*after-commit-hooks*
+           (cons (lambda (tx) (setf seen tx))
+                 graph-db::*after-commit-hooks*)))
+    (funcall thunk)
+    seen))
+
+(test a-delta-nets-a-claim-created-and-deleted-in-one-transaction
+  (with-rules-graph (g)
+    (let ((tx (committed-tx
+               (lambda ()
+                 (with-transaction ((graph-db::transaction-manager g))
+                   (mark-deleted
+                    (make-rt-claim-unary :graph g :subject-namespace :host
+                                         :subject-key "h9"
+                                         :relation "reachable"
+                                         :producer "scan-z"
+                                         :standing :observed)))))))
+      (is (zerop (hash-table-count
+                  (graph-db.rules:claim-delta (graph-db::writes tx) g)))))
+    ;; Control: a plain create is one +1 under its relation.
+    (let* ((tx (committed-tx (lambda () (seed-one g))))
+           (delta (graph-db.rules:claim-delta (graph-db::writes tx) g)))
+      (is (= 1 (hash-table-count delta)))
+      (is (equal '(1) (mapcar #'cdr (gethash "reachable" delta)))))))
+
+(test a-forward-rule-derives-after-the-commit-of-its-last-premise
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (seed g)
+    (is (= 2 (length (derived g 'rt-claim "web-hosts"))))
+    ;; Nothing left for run-rules to do.
+    (is (every (lambda (r) (zerop (graph-db.rules:rule-report-derived r)))
+               (graph-db.rules:run-rules g)))))
+
+(defparameter *hosts-web-head*
+  "(claim ?c rt-claim \"host\" ?h \"hosts-web\" nil nil)")
+(defparameter *hosts-web-body*
+  "(claim ?a rt-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)")
+
+(test a-forward-rule-derives-through-two-strata-in-one-step
+  "HOSTS-WEB reads WEB-HOSTS' head; one commit of the base premises
+derives both, the second rule written after the opt-in so the compiled
+cache is refreshed by its commit."
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (write-rule g :name "hosts-web" :version "1" :family "rt-claim"
+                  :head *hosts-web-head* :body *hosts-web-body*)
+    (seed g)
+    (is (= 2 (length (derived g 'rt-claim "web-hosts"))))
+    (is (equal '("h1" "h2")
+               (sort (mapcar #'claim-subject-key
+                             (derived g 'rt-claim "hosts-web"))
+                     #'string<)))))
+
+(test an-opted-out-graph-derives-nothing-at-commit
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (is-false (graph-db.rules:forward-rules-enabled-p g))
+    (seed g)
+    (is (null (derived g 'rt-claim "web-hosts")))
+    (is (= 2 (graph-db.rules:rule-report-derived
+              (graph-db.rules:run-rule g "web-hosts"))))))

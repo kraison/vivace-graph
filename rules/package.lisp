@@ -40,4 +40,9 @@
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
    ;; provenance (spec §9)
-   #:premises-of #:dependents-of))
+   #:premises-of #:dependents-of
+   ;; forward evaluation (forward-rules design, #456)
+   #:claim-delta #:delta-touches-p
+   #:enable-forward-rules #:disable-forward-rules
+   #:forward-rules-enabled-p #:forward-step #:forward-rules-status
+   #:run-forward-strata))
