@@ -1129,6 +1129,37 @@ or `:full`. Each stratum commits
 its own transaction, as `run-rules` does, and those commits do not
 queue themselves again.
 
+**The queue (D5).** Each enabled graph has one queue of pending
+deltas. The committing thread's hook queues its delta and then
+drains the queue, unless a step is already running on another thread,
+in which case it returns at once and the running step takes the new
+delta before it finishes. So a commit never waits on another commit's
+derivation, derivations are serialised per graph, and one step may
+run on a thread other than the one that committed the premise. The
+caveat that follows: **do not expect a derivation the moment your
+`with-transaction` returns** when other threads commit concurrently;
+poll `forward-rules-status` for an empty queue, or read the derived
+claims on the next commit's step. A commit made inside another
+transaction (a nested `with-transaction`) queues only; the outermost
+commit's hook drains, so a body that opened a transaction never has
+a step run inside it.
+
+**Failure (spec §4.4).** A rule that refuses in a step -- the rails,
+a constraint, a bad instant, a functor's own refusal -- is reported
+on the status and the step goes on with the next stratum and the
+next delta; the commit that queued the delta was durable before the
+step began and stays so. A condition that escapes the step is logged
+and recorded the same way under the name `:step`.
+
+```lisp
+(graph-db.rules:forward-rules-status graph)
+;; => (:enabled t :queue-depth 0 :running-p nil
+;;     :failures (("web-hosts" . "rule: ...")) :timers 0)
+```
+
+The last hundred failures are kept, newest first. `run-rules` after a
+failure reports the same refusal and repairs the rest.
+
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it
 reports nothing derived and nothing swept. If it does not, that is a

@@ -335,3 +335,106 @@ bound, not by a full re-run of the rule."
                            (first reports))))
         (is (= 300 (graph-db.rules:rule-report-swept (first reports))))))
     (is-true (run-rules-is-quiet g))))
+
+;;; Queue, nesting, failure, status (D5, spec §6, plan Task 6)
+
+(defvar *slow-seconds* 0
+  "How long SLOW-TRUE/1 sleeps per solution; set, not bound, since the
+step may run in another thread.")
+
+(graph-db::def-global-prolog-functor slow-true/1 (?x cont)
+  "Test-only: true, after *SLOW-SECONDS*."
+  (declare (ignore ?x))
+  (when (plusp *slow-seconds*) (sleep *slow-seconds*))
+  (funcall cont))
+
+(graph-db::def-global-prolog-functor refuse-loudly/1 (?x cont)
+  "Test-only: a refusal from inside a body."
+  (declare (ignore ?x cont))
+  (error 'graph-db.rules::rule-run-refusal :tag :rule
+         :text "refuse-loudly said no"))
+
+(defun commit-runs-web (g host)
+  "HOST runs web, in its own transaction.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rt-claim-binary :graph g :subject-namespace :host
+                          :subject-key host :relation "runs"
+                          :object-namespace :app :object-key "web"
+                          :producer "scan-t" :standing :observed)))
+
+(defparameter *slow-web-hosts-body*
+  (concatenate 'string *web-hosts-body* " (slow-true ?p)"))
+
+(test two-committing-threads-both-get-their-derivations-and-neither-blocks
+  "D5: a commit that arrives while another thread's step runs queues
+its delta and returns; the running step drains it."
+  (with-rules-graph (g)
+    (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                  :head *web-hosts-head* :body *slow-web-hosts-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (setf *slow-seconds* 0.6)
+    (unwind-protect
+         (let ((a (bt:make-thread
+                   (lambda ()
+                     (let ((graph-db:*graph* g))
+                       (commit-runs-web g "h1")))
+                   :name "committer a"))
+               (depth nil)
+               (elapsed nil))
+           (sleep 0.15)                 ; A is inside its step by now
+           (let ((start (get-internal-real-time)))
+             (commit-runs-web g "h2")
+             (setf elapsed (/ (- (get-internal-real-time) start)
+                              internal-time-units-per-second)))
+           (setf depth (getf (graph-db.rules:forward-rules-status g)
+                             :queue-depth))
+           (bt:join-thread a)
+           (is (< elapsed 0.4) "the second commit waited ~,2F s" elapsed)
+           (is (eql 1 depth))
+           (is (equal '("h1" "h2")
+                      (sort (mapcar #'claim-object-key
+                                    (derived g 'rt-claim "web-hosts"))
+                            #'string<))))
+      (setf *slow-seconds* 0))))
+
+(test a-nested-commit-defers-its-step-to-the-outermost
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (let ((inside nil))
+      (with-transaction ((graph-db::transaction-manager g))
+        (commit-runs-web g "h2")        ; nested: its own transaction
+        (setf inside (length (derived g 'rt-claim "web-hosts")))
+        (make-rt-claim-binary :graph g :subject-namespace :host
+                              :subject-key "h1" :relation "runs"
+                              :object-namespace :app :object-key "web"
+                              :producer "scan-t" :standing :observed))
+      (is (= 0 inside))
+      (is (equal '("h1" "h2")
+                 (sort (mapcar #'claim-object-key
+                               (derived g 'rt-claim "web-hosts"))
+                       #'string<))))))
+
+(defparameter *refusing-web-hosts-body*
+  (concatenate 'string *web-hosts-body* " (refuse-loudly ?p)"))
+
+(test a-failing-rule-body-leaves-the-commit-durable-and-is-reported
+  (with-rules-graph (g)
+    (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                  :head *web-hosts-head* :body *refusing-web-hosts-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (finishes (seed g))
+    (is (= 2 (length (claims-touching g 'rt-claim :app "web"
+                                      :role :object :relation "runs"))))
+    (is (null (derived g 'rt-claim "web-hosts")))
+    (let* ((status (graph-db.rules:forward-rules-status g))
+           (failure (find "web-hosts" (getf status :failures)
+                          :key #'car :test #'equal)))
+      (is-true (getf status :enabled))
+      (is (not (null failure)))
+      (when failure
+        (is (search "refuse-loudly" (cdr failure)))))
+    (let ((r (find "web-hosts" (graph-db.rules:run-rules g)
+                   :key #'graph-db.rules:rule-report-rule-name
+                   :test #'string=)))
+      (is (eq :refused (graph-db.rules:rule-report-outcome r))))))
