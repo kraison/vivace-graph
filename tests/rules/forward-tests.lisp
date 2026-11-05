@@ -1159,3 +1159,37 @@ wall seconds of the last drain."
                          :last-step-elapsed)))
       (is (realp elapsed))
       (is (and (realp elapsed) (>= elapsed 0))))))
+
+(test a-round-never-writes-the-seeded-resolver
+  "Review finding 1: %ROUND-DELTA notes what it kept or constructed in a
+lazy resolver only.  A seeded one is built once outside a cross-store
+round's retried transaction, so a note there would hand the retry the
+unwound attempt's unsaved claim as standing."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 1)
+      (declare (ignore r))
+      (let ((desired (make-hash-table :test 'equal))
+            (key '(:host "zz" "flagged" nil nil nil))
+            (seeded (graph-db.rules::%seeded-existing g compiled))
+            (lazy (graph-db.rules::%lazy-existing g compiled)))
+        (setf (gethash key desired)
+              (cons (list :subject-namespace :host :subject-key "zz"
+                          :extent nil)
+                    '()))
+        (with-transaction ((graph-db::transaction-manager g))
+          (multiple-value-bind (new count)
+              (graph-db.rules::%round-delta compiled g desired seeded
+                                            (list key))
+            (is (= 1 count))
+            (is (= 1 (length new)))
+            (is-false (nth-value 1 (gethash key (graph-db.rules::%existing-table
+                                                 seeded)))))
+          (multiple-value-bind (new count)
+              (graph-db.rules::%round-delta compiled g desired lazy
+                                            (list key))
+            (declare (ignore new))
+            ;; The lazy one resolves the claim the first call wrote
+            ;; (the overlay) and notes it; nothing is constructed twice.
+            (is (= 0 count))
+            (is-true (nth-value 1 (gethash key (graph-db.rules::%existing-table
+                                                lazy))))))))))

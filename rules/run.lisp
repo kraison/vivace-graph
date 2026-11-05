@@ -965,8 +965,11 @@ remembered.  The full path seeds TABLE with the whole derivation
 (defun %claim-by-dedupe-key (graph compiled key)
   "The claim of COMPILED's producer whose %EXISTING-KEY is KEY, through
 the subject-relation index -- the claims of one subject under one
-relation, bounded by the subject, never by the derivation -- a current
-one over a retracted one (D4); NIL when none stands (#457 spec §2)."
+relation, bounded by the subject, never by the derivation; NIL when
+none stands (#457 spec §2).  The identity constraint keeps a current
+and a retracted claim of one identity from coexisting, so the current-
+first choice below is %CLAIM-BY-IDENTITY-KEY's guard, not a tested
+preference."
   (let* ((family (compiled-rule-family compiled))
          (producer (rule-producer (compiled-rule-spec compiled)))
          (found (loop for c in (graph-db:index-lookup
@@ -996,9 +999,15 @@ lazy; NIL when none stands."
           (t nil))))
 
 (defun %note-existing (existing key claim)
-  "CLAIM now stands under KEY: what a round kept or constructed, so the
-reconcile at the fixpoint finds it without a lookup."
-  (setf (gethash key (%existing-table existing)) claim))
+  "CLAIM now stands under KEY: what a round kept or constructed, so a
+lazy EXISTING answers it at the fixpoint without a lookup.  A seeded
+table is never written: the full path's reconcile enumerates and never
+consults it, and a cross-store round's retried construction would
+otherwise resolve the unwound attempt's unsaved claim as standing
+(#457 review, finding 1).  => CLAIM, either way."
+  (when (%existing-lazy-p existing)
+    (setf (gethash key (%existing-table existing)) claim))
+  claim)
 
 (defun %seeded-existing (graph compiled)
   "COMPILED's producer's existing claims, keyed by %EXISTING-KEY to the
@@ -1316,7 +1325,8 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                          (and forward-sweep
                               (list :sweep-keys forward-sweep))))))
              ;; %RECONCILE-CLAIMS' own pass counts every desired key
-             ;; already standing (via CLAIMS-BY-PRODUCER, GH #324) as
+             ;; already standing (via CLAIMS-BY-PRODUCER, GH #324, or
+             ;; the lazy table on a delta run, #457) as
              ;; KEPT -- including a key %ROUND-DELTA constructed
              ;; earlier this run, since by now it stands too.  DERIVED
              ;; is never double-counted, so decrementing KEPT by it

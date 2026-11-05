@@ -78,9 +78,14 @@ answers from the table, and under `lazy-p` resolves a miss through
 `%claim-by-dedupe-key` and caches it. The full path seeds the table as
 `%seeded-existing` does today, `lazy-p` nil. The forward path builds an
 empty lazy one. `%round-delta` asks the resolver instead of `gethash`,
-and records what it kept or constructed under the key, so the
-reconcile at the fixpoint finds every desired key in the table without
-a second lookup.
+and records what it kept or constructed under the key **of a lazy
+table only**, so the reconcile at the fixpoint finds every desired key
+without a second lookup. The seeded table is read-only: the full
+path's reconcile enumerates and never consults it, and on the
+cross-store path a round's construction is its own retried
+transaction while the seed was built once outside it, so a note there
+would hand a retry the unwound attempt's unsaved claim (review
+finding 1).
 
 ## 3. The reconcile, keyed by the step
 
@@ -141,8 +146,14 @@ with N base claims and one rule deriving one claim per base claim;
 committed and the synchronous step timed. Run at N/10 and at N, the
 reported `forward-step-scale-ratio` is the N time over the N/10 time:
 near 1 when the step is bounded, near 10 when it is not. Reported, not
-gated, as #451's bench is; the N = 10^5 numbers go on #457.
-`*rules-max-solutions*` (100,000) is bound above N for the fixture.
+gated, as #451's bench is. The suite runs it at N = 20,000 (2,000 at
+`:small`) to keep `run-perf` short; the acceptance run is N = 10^5 by
+hand, its numbers on #457. The bench refuses to report unless the
+store reached a fixpoint of N derived claims and the timed step
+derived its claim, and it times the second commit after the opt-in,
+the first paying the compiled-rule cache.
+`*rules-max-solutions*` (100,000) and the query budgets are bound
+above N for the fixture.
 
 A FiveAM test is the mutation gate: with `claims-by-producer` swapped
 for a counting wrapper, a one-claim commit's forward step and a

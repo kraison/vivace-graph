@@ -306,13 +306,15 @@ git commit -m "rules: forward-rules-status reports the last step's elapsed time 
 
 Own graph name `:graph-db-perf-forward` with its own `def-source`,
 `def-claim-classes` and `def-rules-schema` (the generation rule). N =
-`(scale 100000)`; for each of N/10 and N: fresh graph, N base unary
-claims under relation "base" in batches of 500, one rule
-`derived(?k) :- base(?k)` written as the forward tests write one,
-`enable-forward-rules` under `*rules-max-solutions*` bound to 2N,
-then `timed-seconds` around one transaction committing one more base
-claim (the step runs on the committing thread before `with-transaction`
-returns). Record the ratio.
+`(scale 20000)`, overridable by `:n`; for each of N/10 and N: fresh
+graph, N base unary claims under relation "base" in batches of 500,
+one rule `derived(?k) :- base(?k)` written as the forward tests write
+one, `enable-forward-rules` under `*rules-max-solutions*` and the
+query budgets bound above N, a check that N claims stand under the
+rule, one untimed warm-up commit, then the wall time of one
+transaction committing one more base claim (the step runs on the
+committing thread before `with-transaction` returns), checked to have
+derived its claim. Record the ratio in milliseconds.
 
 - [ ] **Step 2: Run it at default scale**
 
@@ -323,8 +325,8 @@ Expected: three records; ratio near 1.
 
 - [ ] **Step 3: Run it at N = 10^5 and put the numbers on #457**
 
-Same call with `*perf-scale*` at normal; if it runs over ten minutes,
-under `systemd-run --user`. Comment on #457 with the three numbers.
+Same call with `:n 100000`; if it runs over ten minutes, under
+`systemd-run --user`. Comment on #457 with the three numbers.
 
 - [ ] **Step 4: Docs**
 

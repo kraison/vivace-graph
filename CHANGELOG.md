@@ -16,6 +16,13 @@ storage formats (#60).
 
 ### Changed
 
+- **A forward rules step reads what it touches, not the touched rule's
+  whole derivation** (#457). The forward and targeted paths resolve
+  each identity they derive through the subject-relation index and
+  read provenance per touched derived claim; `run-rules` and the full
+  path still read the producer. `forward-rules-status` gains
+  `:last-step-elapsed`, and `bench-forward-step-reads` in the perf
+  suite reports a one-claim step's time against two derived-set sizes.
 - **`run-rules` retracts a derivation it no longer derives instead of
   deleting it** (#456, D4 of the forward-rules design). The swept
   claim and its `derived-from` records stay on record with their
