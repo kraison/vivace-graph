@@ -1142,3 +1142,20 @@ retracted with it, as the enumerating pass retracted it."
         (is (null (derived g 'rt-claim "flagged")))
         (is (= 1 (length (foreign))))
         (is-false (claim-current-p (first (foreign))))))))
+
+;;; The step's cost on the status (#457 spec §4)
+
+(test the-status-reports-the-last-steps-elapsed-time
+  "Spec §4: :LAST-STEP-ELAPSED is NIL until a step has run, then the
+wall seconds of the last drain."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (is (null (getf (graph-db.rules:forward-rules-status g)
+                    :last-step-elapsed)))
+    (seed-keys g 2 :relation "up")
+    (let ((elapsed (getf (graph-db.rules:forward-rules-status g)
+                         :last-step-elapsed)))
+      (is (realp elapsed))
+      (is (and (realp elapsed) (>= elapsed 0))))))
