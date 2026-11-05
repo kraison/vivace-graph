@@ -7,8 +7,10 @@
   "One enabled graph's forward evaluation: QUEUE of pending deltas under
 LOCK, RUNNING-P while a step drains it (D5), FAILURES as (name .
 text) newest first, COMPILED the rule set cached while CACHE-STAMP
-matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS the threshold
-timers (thresholds.lisp), LAST-REPORTS the last delta's RULE-REPORTs."
+matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS the pending
+THRESHOLD-TIMERs by instant with TIMER-THREAD, TIMER-CV and TIMER-STOP
+driving them (thresholds.lisp), LAST-REPORTS the last delta's
+RULE-REPORTs."
   graph
   (queue '())
   (last-reports '())
@@ -17,7 +19,10 @@ timers (thresholds.lisp), LAST-REPORTS the last delta's RULE-REPORTs."
   (failures '())
   (compiled '())
   (cache-stamp nil)
-  (timers '()))
+  (timers '())
+  (timer-thread nil)
+  (timer-cv (bordeaux-threads:make-condition-variable))
+  (timer-stop nil))
 
 (defvar *forward-states* (make-hash-table :test 'eq)
   "Graph -> FORWARD-STATE for every graph forward evaluation is enabled
@@ -71,8 +76,9 @@ FAILURES and skipped."
 out of the step both land on FAILURES (spec §4.4) and the step goes
 on; the commit that queued the delta is durable either way."
   (handler-case
-      (let ((reports (run-forward-strata
-                      graph (%forward-compiled graph state) delta)))
+      (let* ((graph-db::*evaluation-instant* (graph-db.spacetime::%st-now))
+             (reports (run-forward-strata
+                       graph (%forward-compiled graph state) delta)))
         (setf (forward-state-last-reports state) reports)
         (dolist (r reports)
           (when (eq (rule-report-outcome r) :refused)
@@ -165,7 +171,19 @@ before the opt-in is not a delta.  Returns GRAPH's FORWARD-STATE."
     state))
 
 (defun disable-forward-rules (graph)
-  "Stop deriving at commit on GRAPH; pending deltas are dropped.  T when
-it was enabled."
-  (bordeaux-threads:with-lock-held (*forward-states-lock*)
-    (and (remhash graph *forward-states*) t)))
+  "Stop deriving at commit on GRAPH; pending deltas and timers are
+dropped, the timer thread stopped.  T when it was enabled."
+  (let ((state (bordeaux-threads:with-lock-held (*forward-states-lock*)
+                 (prog1 (gethash graph *forward-states*)
+                   (remhash graph *forward-states*)))))
+    (when state
+      (%stop-timers state)
+      t)))
+
+;; CLOSE-GRAPH implies the opt-out: nothing may touch a closed store
+;; (spec §5.3; Review Focus 3).  A method, not a core hook.
+(defmethod graph-db:close-graph :before ((graph graph-db::graph)
+                                         &key snapshot-p)
+  (declare (ignore snapshot-p))
+  (when (forward-rules-enabled-p graph)
+    (disable-forward-rules graph)))

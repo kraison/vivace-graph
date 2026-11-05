@@ -438,3 +438,125 @@ its delta and returns; the running step drains it."
                    :key #'graph-db.rules:rule-report-rule-name
                    :test #'string=)))
       (is (eq :refused (graph-db.rules:rule-report-outcome r))))))
+
+;;; now/1, instant-offset/3, thresholds and timers (D3, spec §5.2,
+;;; plan Task 7)
+
+(defun wait-until (thunk seconds)
+  "Poll THUNK every tenth of a second for up to SECONDS; its first
+true value, or NIL."
+  (loop repeat (ceiling (* seconds 10))
+        do (let ((v (funcall thunk)))
+             (when v (return v))
+             (sleep 0.1))))
+
+(defparameter *settled-head*
+  "(claim ?c rtt-claim \"host\" ?h \"settled\" nil nil)")
+(defparameter *settled-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-recorded-at ?p ?r) (instant-offset ?r \"PT1S\" ?d)
+   (now ?t) (instant>= ?t ?d)")
+
+(defun settled-hosts (g)
+  (mapcar #'claim-subject-key (derived g 'rtt-claim "settled")))
+
+(test a-gain-threshold-derives-at-its-flip-instant-with-validity-from-it
+  (with-rules-graph (g)
+    (write-rule g :name "settled" :version "1" :family "rtt-claim"
+                  :head *settled-head* :body *settled-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-runs-web g "h1")
+    (is (null (settled-hosts g)))
+    (is (eql 1 (getf (graph-db.rules:forward-rules-status g) :timers)))
+    (is (equal '("h1") (wait-until (lambda () (settled-hosts g)) 3)))
+    (let* ((premise (runs-web-premise g "h1"))
+           (flip (local-time:timestamp+ (claim-recorded-at premise) 1 :sec))
+           (c (first (derived g 'rtt-claim "settled"))))
+      (is (local-time:timestamp= flip
+                                 (bound-earliest
+                                  (extent-start (claim-extent c))))))
+    (is (eql 0 (getf (graph-db.rules:forward-rules-status g) :timers)))
+    (is-true (run-rules-is-quiet g))))
+
+(defparameter *fresh-head*
+  "(claim ?c rtt-claim \"host\" ?h \"fresh\" nil nil)")
+(defparameter *fresh-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-recorded-at ?p ?r) (instant-offset ?r \"PT1S\" ?d)
+   (now ?t) (instant< ?t ?d)")
+
+(defun fresh-hosts (g)
+  (mapcar #'claim-subject-key (derived g 'rtt-claim "fresh")))
+
+(test a-loss-threshold-retracts-at-its-flip-instant
+  (with-rules-graph (g)
+    (write-rule g :name "fresh" :version "1" :family "rtt-claim"
+                  :head *fresh-head* :body *fresh-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-runs-web g "h1")
+    (is (equal '("h1") (fresh-hosts g)))
+    (let* ((premise (runs-web-premise g "h1"))
+           (flip (local-time:timestamp+ (claim-recorded-at premise) 1 :sec))
+           (c (first (derived g 'rtt-claim "fresh"))))
+      (is (local-time:timestamp= flip
+                                 (bound-latest (extent-end (claim-extent c)))))
+      (is-true (wait-until (lambda () (null (fresh-hosts g))) 3))
+      (let ((again (first (derived g 'rtt-claim "fresh" :current nil))))
+        (is (equalp (graph-db:id c) (graph-db:id again)))
+        (is-false (claim-current-p again))))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-reopened-store-still-fires-a-pending-threshold
+  (with-rules-graph-dir (g dir)
+    (write-rule g :name "settled" :version "1" :family "rtt-claim"
+                  :head *settled-head* :body *settled-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-runs-web g "h1")
+    (close-graph g)
+    (is-false (graph-db.rules:forward-rules-enabled-p g))
+    (let ((g2 (open-graph *graph-name* (namestring dir))))
+      (unwind-protect
+           (progn
+             (graph-db.rules:enable-forward-rules g2)
+             (is (eql 1 (getf (graph-db.rules:forward-rules-status g2)
+                              :timers)))
+             (is (equal '("h1")
+                        (wait-until (lambda () (settled-hosts g2)) 3))))
+        (close-graph g2)))))
+
+(test closing-the-graph-stops-its-timers-and-drops-its-queue
+  "Review Focus 3: CLOSE-GRAPH implies DISABLE-FORWARD-RULES; nothing
+touches the closed store afterwards."
+  (with-rules-graph (g)
+    (write-rule g :name "settled" :version "1" :family "rtt-claim"
+                  :head *settled-head* :body *settled-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-runs-web g "h1")
+    (is (eql 1 (getf (graph-db.rules:forward-rules-status g) :timers)))
+    (close-graph g)
+    (is (equal '(:enabled nil) (graph-db.rules:forward-rules-status g)))
+    (is-true (wait-until
+              (lambda ()
+                (notany (lambda (th)
+                          (string= "forward timer" (bt:thread-name th)))
+                        (bt:all-threads)))
+              3))
+    (sleep 1.2)                         ; past the flip: no touch
+    (is (equal '(:enabled nil) (graph-db.rules:forward-rules-status g)))))
+
+(test instant-offset-refuses-months
+  (is (equal '("2026-01-08T00:00:00.000000000Z")
+             (select-flat (?y)
+               (instant-offset "2026-01-01T00:00:00Z" "P1W" ?y))))
+  (is (equal '("2026-01-02T01:01:01.000000000Z")
+             (select-flat (?y)
+               (instant-offset "2026-01-01T00:00:00Z" "P1DT1H1M1S" ?y))))
+  (signals graph-db:query-precondition-error
+    (select-flat (?y) (instant-offset "2026-01-01T00:00:00Z" "P1M" ?y)))
+  (signals graph-db:query-precondition-error
+    (select-flat (?y) (instant-offset "2026-01-01T00:00:00Z" "P1Y" ?y))))
+
+(test now-is-withheld-from-free-text
+  (with-rules-graph (g)
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:guard-query-text "(now ?t)" g))))

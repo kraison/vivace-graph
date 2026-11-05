@@ -28,6 +28,7 @@
    #:compiled-rule-relation #:compiled-rule-reads
    #:compiled-rule-negative-reads
    #:compiled-rule-stratum #:compiled-rule-stratum-relations
+   #:compiled-rule-thresholds
    #:rule-compile-error #:rule-compile-error-rule
    #:rule-compile-error-reason
    ;; running (spec §7)

@@ -652,6 +652,94 @@ records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
   "True when ?A and ?B name the same instant, whatever their spelling
 \(GH #388).")
 
+(defvar *evaluation-instant* nil
+  "The instant NOW/1 answers: bound once per RUN-RULES call and per
+forward step (forward-rules design §5.2), so every rule of a run sees
+one clock; %ST-NOW when nothing bound it.")
+
+(def-global-prolog-functor now/1 (?t cont)
+  "?T is the evaluation instant, as an instant string.  A rule body's
+functor only (*PROLOG-RULE-ONLY-PREDICATES*, query/guard.lisp): the
+compiler admits ?T in comparisons with a claim's instants alone, and
+records each as a threshold (compile.lisp %THRESHOLDS)."
+  (%yield (?t (%instant-string (or *evaluation-instant*
+                                  (graph-db.spacetime::%st-now))))
+    (funcall cont)))
+
+(defun %parse-iso-duration (text)
+  "TEXT, an ISO-8601 duration of weeks, days, hours, minutes and
+seconds (PnW, PnD, PTnH, PTnM, PTnS and their combinations, seconds
+may be decimal), as nanoseconds.  Months and years are refused: they
+are not fixed durations.  Anything else malformed is refused too; both
+as QUERY-PRECONDITION-ERROR."
+  (flet ((refuse (why)
+           (error 'query-precondition-error
+                  :reason (format nil "~S is not a duration this ~
+engine takes: ~A" text why))))
+    (unless (and (stringp text) (> (length text) 1)
+                 (char-equal (char text 0) #\P))
+      (refuse "write PnW, PnD, PTnH, PTnM or PTnS"))
+    (let ((i 1) (n (length text)) (time-part nil) (total 0) (any nil))
+      (loop while (< i n)
+            do (let ((ch (char text i)))
+                 (cond ((char-equal ch #\T)
+                        (when time-part (refuse "two T designators"))
+                        (setf time-part t)
+                        (incf i))
+                       (t
+                        (let ((start i))
+                          (loop while (and (< i n)
+                                           (or (digit-char-p (char text i))
+                                               (char= (char text i) #\.)))
+                                do (incf i))
+                          (when (or (= start i) (>= i n))
+                            (refuse "a number must precede each unit"))
+                          (let* ((num (let ((*read-default-float-format*
+                                              'double-float))
+                                        (read-from-string
+                                         (subseq text start i))))
+                                 (unit (char-upcase (char text i)))
+                                 (per-unit
+                                   (cond ((and (not time-part)
+                                               (char= unit #\W))
+                                          (* 7 86400))
+                                         ((and (not time-part)
+                                               (char= unit #\D))
+                                          86400)
+                                         ((and time-part (char= unit #\H))
+                                          3600)
+                                         ((and time-part (char= unit #\M))
+                                          60)
+                                         ((and time-part (char= unit #\S))
+                                          1)
+                                         ((member unit '(#\Y #\M))
+                                          (refuse "months and years are ~
+not fixed durations"))
+                                         (t (refuse (format nil
+                                                            "unknown unit ~A"
+                                                            unit))))))
+                            (unless (realp num)
+                              (refuse "a number must precede each unit"))
+                            (incf total (* num per-unit 1000000000))
+                            (setf any t)
+                            (incf i)))))))
+      (unless any (refuse "no component"))
+      (round total))))
+
+(def-global-prolog-functor instant-offset/3 (?x ?duration ?y cont)
+  "?Y is instant ?X plus ?DURATION, an ISO-8601 duration string of
+weeks, days, hours, minutes and seconds (%PARSE-ISO-DURATION; months
+and years are refused).  ?X unbound fails; a bound ?Y compares.  The
+instant a threshold flips at is computed this way (forward-rules
+design §5.2)."
+  (let ((x (%instant-arg ?x))
+        (d (%prolog-index-bound ?duration)))
+    (when x
+      (let ((nsec (%parse-iso-duration d)))
+        (%yield (?y (%instant-string
+                     (local-time:timestamp+ x nsec :nsec)))
+          (funcall cont))))))
+
 (def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601
 string or a timestamp); a claim with no extent makes no validity

@@ -107,7 +107,11 @@ storage formats (#60).
   `:determined-empty`) as the second negation beside `not/1`.
   `graph-db:*after-commit-hooks*` is the core seam: functions of the
   committed transaction, called after `with-transaction`'s retry loop
-  outside every lock.
+  outside every lock. `now/1` and `instant-offset/3` let a body state
+  a threshold against the evaluation instant; a forward-enabled store
+  schedules its own re-evaluation at the flip instant. The `graph-db`
+  package now shadows `now`, so the guard resolves the functor rather
+  than local-time's.
 
 - **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
   subject and object keys, tested with `>/2`'s own predicate as a filter

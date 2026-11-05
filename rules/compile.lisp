@@ -120,10 +120,15 @@ sorted names of the rules whose head relations are mutually reachable
 with this one's (its own name always), STRATUM-RELATIONS the sorted
 relations they derive; a rule is recursive when a body CLAIM/7 goal has
 an unbound ?c and a relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P,
-run.lisp, GH #333)."
+run.lisp, GH #333).  THRESHOLDS is one entry per comparison of NOW/1's
+instant: (GOAL DIRECTION CLAIM-VAR SOURCE OFFSET BOUND-VAR), DIRECTION
+:GAIN or :LOSS, SOURCE the claim-instant functor's name, OFFSET its
+ISO duration or NIL, BOUND-VAR the variable the comparison reads
+(forward-rules design §5.2; %THRESHOLDS)."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
-  vars premise-vars goals reads negative-reads stratum stratum-relations)
+  vars premise-vars goals reads negative-reads stratum stratum-relations
+  (thresholds '()))
 
 ;;; Reading the text
 
@@ -152,11 +157,13 @@ guard rebuilds a head into: NAME interned where S1 homed CLAIM/7
 
 (defun %guard (spec graph)
   "HEAD then BODY through the guard as one text, so a variable shared
-between them reads as one symbol: (VALUES VARS GOALS)."
+between them reads as one symbol: (VALUES VARS GOALS).  Rule text may
+say NOW (*GUARDING-RULE-TEXT*)."
   (handler-case
-      (graph-db.query:guard-query-text
-       (format nil "~A~%~A" (rule-spec-head spec) (rule-spec-body spec))
-       graph)
+      (let ((graph-db.query:*guarding-rule-text* t))
+        (graph-db.query:guard-query-text
+         (format nil "~A~%~A" (rule-spec-head spec) (rule-spec-body spec))
+         graph))
     (graph-db.query:prolog-guard-error (c)
       (%refuse spec "~A" (graph-db.query:prolog-guard-error-reason c)))))
 
@@ -337,6 +344,100 @@ unbound there (GH #333)."
           collect (second goal) into vars
         finally (return (remove-duplicates vars))))
 
+;;; Thresholds (forward-rules design §5.2)
+
+(defparameter *instant-source-functors*
+  '("CLAIM-VALID-FROM" "CLAIM-VALID-TO" "CLAIM-RECORDED-AT"
+    "CLAIM-TOUCHED-AT" "CLAIM-RETRACTED-AT")
+  "The functors whose second argument is an instant of a claim: what
+NOW/1's instant may be compared with, directly or through
+INSTANT-OFFSET/3.")
+
+(defun %mentions-p (var form)
+  (or (eq var form)
+      (and (consp form)
+           (or (%mentions-p var (car form)) (%mentions-p var (cdr form))))))
+
+(defun %instant-binder (var goals)
+  "The goal binding VAR to a claim instant: an INSTANT-OFFSET/3 whose
+third argument is VAR, or a source functor whose second is."
+  (find-if (lambda (g)
+             (or (and (%engine-goal-p g "INSTANT-OFFSET" 3)
+                      (eq (fourth g) var))
+                 (and (some (lambda (n) (%engine-goal-p g n 2))
+                            *instant-source-functors*)
+                      (eq (third g) var))))
+           goals))
+
+(defun %threshold-source (spec goal var goals premise-vars)
+  "(CLAIM-VAR SOURCE OFFSET) for VAR, the instant GOAL compares NOW
+with; refused when it is not a premise claim's instant."
+  (flet ((refuse ()
+           (%refuse spec "~A compares now with ~A, which is not a ~
+premise claim's instant: now may be compared only with ~
+claim-valid-from, claim-valid-to, claim-recorded-at, claim-touched-at ~
+or claim-retracted-at of a premise, or instant-offset over one of them"
+                    (%term-label goal) (%term-label var))))
+    (let ((b (%instant-binder var goals)))
+      (when (null b) (refuse))
+      (multiple-value-bind (source offset)
+          (if (%engine-goal-p b "INSTANT-OFFSET" 3)
+              (let ((src (%instant-binder (second b) goals)))
+                (when (or (null src)
+                          (%engine-goal-p src "INSTANT-OFFSET" 3)
+                          (not (stringp (third b))))
+                  (refuse))
+                (values src (third b)))
+              (values b nil))
+        (unless (member (second source) premise-vars)
+          (refuse))
+        (list (second source) (symbol-name (first source)) offset)))))
+
+(defun %thresholds (spec body premise-vars)
+  "BODY's threshold entries (COMPILED-RULE-THRESHOLDS), or NIL when it
+never says NOW.  Every other use of NOW's variable is refused."
+  (let ((nows (remove-if-not (lambda (g) (%engine-goal-p g "NOW" 1))
+                             body)))
+    (when (null nows)
+      (return-from %thresholds '()))
+    (when (rest nows)
+      (%refuse spec "a body says now once"))
+    (let ((?t (second (first nows)))
+          (entries '()))
+      (unless (%variable-p ?t)
+        (%refuse spec "now takes a variable"))
+      (dolist (goal body (nreverse entries))
+        (unless (eq goal (first nows))
+          (when (%mentions-p ?t goal)
+            (let* ((op (and (consp goal) (symbolp (first goal))
+                            (= 3 (length goal))
+                            (symbol-name (first goal))))
+                   (a (second goal)) (b (third goal))
+                   (direction
+                     (cond ((not (member op '("INSTANT<" "INSTANT<="
+                                             "INSTANT>" "INSTANT>=")
+                                         :test #'equal))
+                            nil)
+                           ((and (eq a ?t) (%variable-p b) (not (eq b ?t)))
+                            (if (member op '("INSTANT>" "INSTANT>=")
+                                        :test #'equal)
+                                :gain :loss))
+                           ((and (eq b ?t) (%variable-p a) (not (eq a ?t)))
+                            (if (member op '("INSTANT<" "INSTANT<=")
+                                        :test #'equal)
+                                :gain :loss))
+                           (t nil))))
+              (unless direction
+                (%refuse spec "~A: now's instant may only be ordered ~
+against a premise claim's instant with instant<, instant<=, instant> ~
+or instant>=" (%term-label goal)))
+              (let ((var (if (eq a ?t) b a)))
+                (push (append (list goal direction)
+                              (%threshold-source spec goal var body
+                                                 premise-vars)
+                              (list var))
+                      entries)))))))))
+
 ;;; The rule set a compile is checked against
 
 (defun %graph-declares-p (graph type-name)
@@ -483,6 +584,7 @@ claim/7 and the comparison, the compiler fuses them (#451)"))
         (when (null body)
           (%refuse spec "the body is empty"))
         (let* ((premise-vars (%premise-vars body))
+               (thresholds (%thresholds spec body premise-vars))
                (parsed (%parse-head spec head body-vars premise-vars))
                (reads (%body-reads body))
                (head-vars (remove-if-not #'%variable-p
@@ -515,8 +617,10 @@ unbound: bind the relation"))
               (apply #'%make-compiled-rule
                      :spec spec
                      :vars (remove-duplicates
-                            (append head-vars premise-vars))
+                            (append head-vars premise-vars
+                                    (mapcar #'sixth thresholds)))
                      :premise-vars premise-vars
+                     :thresholds thresholds
                      :goals body :reads reads
                      :negative-reads negative
                      :stratum (sort (cons name (copy-list stratum))

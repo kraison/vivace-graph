@@ -9,6 +9,10 @@
         #+ecl #:clos
         #+sbcl #:sb-mop
         #+sbcl #:sb-pcl)
+  ;; NOW is a rule-body functor (rules/facts.lisp NOW/1): the query
+  ;; guard interns a goal head by name here, and without the shadow it
+  ;; would find LOCAL-TIME:NOW instead (#456).
+  (:shadow #:now)
   #+sbcl (:shadowing-import-from "SB-EXT" "WORD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "STANDARD-METHOD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "FINALIZE-INHERITANCE")

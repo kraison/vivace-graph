@@ -69,6 +69,7 @@ pathname and its `graph-db.rules` package are unchanged.
 (claim-relation ?c ?r)      (claim-rule-version ?c ?v)
 (instant< ?a ?b) (instant> ?a ?b) (instant<= ?a ?b) (instant>= ?a ?b)
 (instant= ?a ?b)
+(instant-offset ?x duration ?y)   (now ?t)      ; rule bodies only
 ```
 
 | functor | answers |
@@ -88,6 +89,8 @@ pathname and its `graph-db.rules` package are unchanged.
 | `claim-relation/2` | the relation |
 | `claim-rule-version/2` | the rule version, or NIL |
 | `instant</2` and friends | order two instants by value (GH #388) |
+| `instant-offset/3` | `?y` is `?x` plus an ISO-8601 duration of weeks, days, hours, minutes and seconds (`P1W`, `P2DT3H`, `PT90S`); months and years are refused (#456) |
+| `now/1` | the evaluation instant, one per `run-rules` call and per forward step; a rule body's functor only, refused in free text (#456) |
 
 `family` is the **parent** class name a `def-claim-classes` registered,
 never an arity subclass. The registry is `eq`-keyed on the symbol as
@@ -1159,6 +1162,37 @@ and recorded the same way under the name `:step`.
 
 The last hundred failures are kept, newest first. `run-rules` after a
 failure reports the same refusal and repairs the rest.
+
+**Thresholds (D3).** A body may say `(now ?t)` and compare `?t` with
+an instant of a premise claim: one of `claim-valid-from/2`,
+`claim-valid-to/2`, `claim-recorded-at/2`, `claim-touched-at/2`,
+`claim-retracted-at/2`, or `instant-offset/3` over one of them, with
+`instant<`, `instant<=`, `instant>` or `instant>=`. Any other use of
+`?t` is refused at compile, naming the goal: the instant a match flips
+at must be a function of its premises, never of the clock. Each such
+comparison is a **threshold** with a direction, a **gain** (false
+before the instant, true from it: `(instant>= ?t ?d)`) or a **loss**
+(`(instant< ?t ?d)`), and `compiled-rule-thresholds` lists them.
+
+```lisp
+;; "settled": a host has run web for a second
+(claim ?p rt-claim "host" ?h "runs" "app" "web")
+(claim-recorded-at ?p ?r) (instant-offset ?r "PT1S" ?d)
+(now ?t) (instant>= ?t ?d)
+```
+
+Under the `:premises` extent policy on a temporal family, a gain sets
+the derived claim's validity start to the flip instant and a loss sets
+its end. When a step or a `run-rules` evaluates a threshold rule, it
+also evaluates the body without its thresholds for the matches the
+delta reaches and schedules a **timer** at every flip instant still
+ahead. When the timer fires the match's premise claims re-enter the
+step as a delta: +1 for a gain, so the rule derives; +1 and −1 for a
+loss, so the targeted path retracts what no longer holds. Timers are
+in memory, per enabled graph, on one thread named "forward timer";
+`disable-forward-rules` and `close-graph` stop it, and
+`enable-forward-rules` rebuilds the timers from the store when it runs
+`run-rules`. `forward-rules-status` counts them under `:timers`.
 
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it

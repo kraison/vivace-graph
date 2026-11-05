@@ -46,6 +46,17 @@ re-opened, -1 retracted -- pushed here, the next strata's delta
 post-commit hook does not queue that commit's writes again
 (rules/forward.lisp).")
 
+(defvar *threshold-scheduler* nil
+  "A function of (GRAPH COMPILED-RULES DELTA), set by thresholds.lisp:
+schedules the threshold timers the rules' current matches ask for,
+DELTA restricting the matches to a step's or NIL for every match.
+Called at the end of RUN-RULES and after each stratum a forward step
+ran.")
+
+(defun %schedule (graph compiled-rules delta)
+  (when *threshold-scheduler*
+    (funcall *threshold-scheduler* graph compiled-rules delta)))
+
 (defun %note-change (claim weight)
   "CLAIM changed by WEIGHT, recorded for RUN-FORWARD-STRATA when it is
 listening."
@@ -99,13 +110,16 @@ some store has run DEF-RULES-SCHEMA."
 ;;; Evaluating the body
 
 (defun %solutions (compiled graph report
-                   &optional (goals (compiled-rule-goals compiled)))
+                   &optional (goals (compiled-rule-goals compiled))
+                             (vars (compiled-rule-vars compiled)))
   "Every solution of GOALS -- COMPILED's body by default, or a fixpoint
 round's variant of it (%VARIANTS, GH #333) -- under RUN-QUERY-GOALS'
 rails (spec §7.2, ruling P4): a list of rows aligned with
 COMPILED-RULE-VARS.  SELECT's :SNAPSHOT inherits the open transaction
 on the single-store path and the composed read snapshots on the
-cross-store one (S3-P2).  Refuses past *RULES-MAX-SOLUTIONS*."
+cross-store one (S3-P2).  Refuses past *RULES-MAX-SOLUTIONS*.  VARS,
+the variables a row carries, is COMPILED's by default; the threshold
+scheduler asks for others."
   (let ((max-inferences (or *rules-max-inferences*
                             graph-db::*query-default-max-inferences*))
         (timeout (or *rules-timeout* graph-db::*query-default-timeout*))
@@ -119,7 +133,7 @@ ruling P4)."))
           (graph-db::*query-default-timeout* timeout)
           (graph-db::*query-default-limit* cap))
       (graph-db::run-query-goals
-       (compiled-rule-vars compiled) goals graph
+       vars goals graph
        :limit cap :format :raw
        :callback (lambda (row)
                    (setf (rule-report-inferences report)
@@ -174,6 +188,44 @@ DISJOINT-P when they never held at once."
                                  :standing :inferred))
                 (when (null acc)
                   (return (values nil t)))))))))
+
+(defun %threshold-bound (direction instant)
+  "The validity a threshold adds (spec §5.2): from INSTANT on for a
+gain, until it for a loss."
+  (ecase direction
+    (:gain (temporal-extent:make-interval
+            (temporal-extent:exact-bound instant)
+            (temporal-extent:unknown-bound)
+            :semantics :validity :standing :inferred))
+    (:loss (temporal-extent:make-interval
+            (temporal-extent:unknown-bound)
+            (temporal-extent:exact-bound instant)
+            :semantics :validity :standing :inferred))))
+
+(defun %solution-extent (compiled premises policy row vars)
+  "%PREMISE-EXTENT, then each threshold's bound intersected in for a
+temporal family under :PREMISES (spec §5.2): a gain's flip instant is
+the validity start, a loss's the end.  (VALUES EXTENT DISJOINT-P)."
+  (multiple-value-bind (extent disjoint-p) (%premise-extent premises policy)
+    (if (or disjoint-p
+            (eq policy :none)
+            (null (compiled-rule-thresholds compiled))
+            (not (graph-db.spacetime:claim-family-temporal-p
+                  (compiled-rule-family compiled))))
+        (values extent disjoint-p)
+        (dolist (th (compiled-rule-thresholds compiled) (values extent nil))
+          (let* ((at (graph-db::%instant-arg
+                      (%term-value (sixth th) row vars)))
+                 (bound (and at (%threshold-bound (second th) at))))
+            (when bound
+              (setf extent
+                    (if extent
+                        (temporal-extent:extent-intersection
+                         extent bound :semantics :validity
+                                      :standing :inferred)
+                        bound))
+              (when (null extent)
+                (return (values nil t)))))))))
 
 (defun %dedupe-key (family sns skey rel ons okey extent)
   "The derived claim's identity, as spec §7.3 collapses duplicates on:
@@ -392,7 +444,7 @@ since a cross-store run evaluates once and reconciles per attempt."
                                row vars)
                               "object"))))
         (multiple-value-bind (extent disjoint-p)
-            (%premise-extent premises policy)
+            (%solution-extent compiled premises policy row vars)
           (if disjoint-p
               (incf (rule-report-disjoint-premises report))
               ;; The refs after %PREMISE-EXTENT and inside the
@@ -623,7 +675,8 @@ share (M2), so the two can never disagree."
        (member (sixth goal) own :test #'string=)
        (%variable-p (second goal))))
 
-(defun %variants (compiled &key all-goals)
+(defun %variants (compiled &key all-goals
+                             (goals (compiled-rule-goals compiled)))
   "One goal list per recursive CLAIM/7 goal of COMPILED
 (%RECURSIVE-GOAL-P) -- or, with ALL-GOALS, per CLAIM/7 and
 CLAIM-ABSENT/7 goal with a plain variable ?c and a string relation,
@@ -640,7 +693,6 @@ unbound one would otherwise reach %UNBOUND-CLAIM-SCAN before the
 substitution ever runs (I1, GH #333).  NIL when COMPILED has no
 recursive goal."
   (let ((own (compiled-rule-stratum-relations compiled))
-        (goals (compiled-rule-goals compiled))
         (variants '()))
     (loop for goal in goals
           for i from 0
@@ -1203,7 +1255,10 @@ caller's transaction) signals."
          (report (%make-rule-report :rule-name (rule-spec-name spec)
                                     :version (rule-spec-version spec)))
          (start (get-internal-real-time))
-         (compiled nil))
+         (compiled nil)
+         (graph-db::*evaluation-instant*
+           (or graph-db::*evaluation-instant*
+               (graph-db.spacetime::%st-now))))
     (%check-no-foreign-read-in-transaction "RUN-RULE" foreign)
     (flet ((refuse (tag text)
              (setf (rule-report-outcome report) :refused
@@ -1436,7 +1491,9 @@ single-store, so a cycle through another store's rules is not
 detected (S3-P5)."
   (let ((scope (%normalize-scope graph scope))
         (reports '())
-        (compiled '()))
+        (compiled '())
+        (graph-db::*evaluation-instant*
+          (or graph-db::*evaluation-instant* (graph-db.spacetime::%st-now))))
     (dolist (spec (rules-in-scope graph))
       (when (%runnable-spec-p graph spec)
         (handler-case (push (compile-rule graph spec) compiled)
@@ -1448,7 +1505,8 @@ detected (S3-P5)."
                    :refusals (list (cons :rule
                                          (rule-compile-error-reason c))))
                   reports)))))
-    (dolist (stratum (%strata-order (nreverse compiled)))
+    (setf compiled (nreverse compiled))
+    (dolist (stratum (%strata-order compiled))
       ;; SOME, not just the first rule: a genuine cycle's every member
       ;; individually meets %COMPILED-RECURSIVE-P (each reads something
       ;; the cycle derives), but a stratum can also hold unrelated
@@ -1458,6 +1516,8 @@ detected (S3-P5)."
           (dolist (c stratum)
             (push (run-rule graph (compiled-rule-spec c) :scope scope)
                   reports))))
+    ;; Forward mode's timers follow every full run (spec §5.2).
+    (%schedule graph compiled nil)
     (nreverse reports)))
 
 ;;; Forward evaluation (forward-rules design §4; rules/forward.lisp)
@@ -1709,7 +1769,8 @@ post-commit hook.  => the RULE-REPORTs, in the order run."
             (unless (some (lambda (r)
                             (eq (rule-report-outcome r) :refused))
                           rs)
-              (setf pending (%merge-delta pending *forward-changes*)))))))))
+              (setf pending (%merge-delta pending *forward-changes*)))
+            (%schedule graph stratum (%positive-delta pending reads))))))))
 
 ;;; Provenance reads (spec §9)
 

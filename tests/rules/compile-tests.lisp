@@ -383,3 +383,25 @@ not a NOT -- and binds a premise (D2)."
       (is (equal '("?A")
                  (mapcar #'symbol-name
                          (graph-db.rules::compiled-rule-premise-vars c)))))))
+
+(defparameter *unbounded-now-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-relation ?p ?x) (now ?t) (instant< ?t ?x)")
+(defparameter *bounded-now-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-recorded-at ?p ?r) (instant-offset ?r \"PT1S\" ?d)
+   (now ?t) (instant>= ?t ?d)")
+
+(test an-unbounded-now-comparison-is-refused-at-compile
+  "Spec §5.2: ?t may only be compared with an instant derived from a
+premise claim, so the flip instant is a function of the premises."
+  (refuses "now" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *unbounded-now-body*)
+  (with-rules-graph (g)
+    (let ((c (graph-db.rules:compile-rule
+              g (spec :name "r" :version "1" :family "rt-claim"
+                      :head *web-hosts-head* :body *bounded-now-body*))))
+      (is (= 1 (length (graph-db.rules:compiled-rule-thresholds c))))
+      (is (eq :gain (second (first
+                             (graph-db.rules:compiled-rule-thresholds
+                              c))))))))
