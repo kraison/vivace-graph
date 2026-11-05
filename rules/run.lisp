@@ -608,7 +608,9 @@ SWEPT as %RECONCILE-CLAIMS has them: with SWEEP-KEYS, a record is a
 candidate for retraction only when its derived claim is in STANDING
 under a sweep key or among SWEPT; records of other claims are kept
 as they are and wanted ones still added -- DESIRED is then partial and
-a record it does not name may still be supported (§4.1)."
+a record it does not name may still be supported (§4.1).  With
+SWEEP-KEYS the records are read per claim of STANDING and SWEPT, never
+per producer (#457 spec §3)."
   (let* ((spec (compiled-rule-spec compiled))
          (producer (rule-producer spec))
          (version (rule-spec-version spec))
@@ -638,25 +640,45 @@ a record it does not name may still be supported (§4.1)."
     ;; One record per pair: a pair already kept is a duplicate and goes
     ;; with the records the derivation no longer asks for, as does a
     ;; record under this producer that is not a DERIVED-FROM at all.
-    (dolist (r (%current-first
-                (graph-db.spacetime:claims-by-producer graph 'derivation
-                                                       producer)))
-      (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
-                        (graph-db.spacetime:claim-object-key r))))
-        (multiple-value-bind (name wanted-p) (gethash pair wanted)
-          (cond ((and wanted-p
-                      (not (gethash pair kept))
-                      (string= "derived-from"
-                               (graph-db.spacetime:claim-relation r)))
-                 (setf (gethash pair kept) t)
-                 ;; No extent on a DERIVATION record, ever; NIL never
-                 ;; differs from the NIL it stores.
-                 (%refresh-kept r version nil name))
-                ((and (graph-db.spacetime:claim-current-p r)
-                      (or (not sweep-p)
-                          (gethash (graph-db.spacetime:claim-subject-key r)
-                                   touched)))
-                 (graph-db.spacetime:retract-claim r))))))
+    (flet ((reconcile-record (r)
+             (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
+                               (graph-db.spacetime:claim-object-key r))))
+               (multiple-value-bind (name wanted-p) (gethash pair wanted)
+                 (cond ((and wanted-p
+                             (not (gethash pair kept))
+                             (string= "derived-from"
+                                      (graph-db.spacetime:claim-relation
+                                       r)))
+                        (setf (gethash pair kept) t)
+                        ;; No extent on a DERIVATION record, ever; NIL
+                        ;; never differs from the NIL it stores.
+                        (%refresh-kept r version nil name))
+                       ((and (graph-db.spacetime:claim-current-p r)
+                             (or (not sweep-p)
+                                 (gethash
+                                  (graph-db.spacetime:claim-subject-key r)
+                                  touched)))
+                        (graph-db.spacetime:retract-claim r)))))))
+      (if sweep-p
+          ;; #457 spec §3: the records of the claims this step stands or
+          ;; swept, one subject-index read each, this producer's only --
+          ;; the set the enumerating pass would have met for them.
+          (let ((done (make-hash-table :test 'equal)))
+            (dolist (claim (append (mapcar #'cdr standing) swept))
+              (let ((dkey (graph-db.spacetime:claim-identity-key claim)))
+                (unless (gethash dkey done)
+                  (setf (gethash dkey done) t)
+                  (dolist (r (%current-first
+                              (graph-db.spacetime:claims-touching
+                               graph 'derivation :claim dkey
+                               :role :subject)))
+                    (when (string= producer
+                                   (graph-db.spacetime:claim-producer r))
+                      (reconcile-record r)))))))
+          (dolist (r (%current-first
+                      (graph-db.spacetime:claims-by-producer
+                       graph 'derivation producer)))
+            (reconcile-record r))))
     (maphash (lambda (pair name)
                (unless (gethash pair kept)
                  (make-derivation-binary

@@ -1083,3 +1083,62 @@ DERIVED and notes it in the resolver."
         (is (= 1 (graph-db.rules:rule-report-derived report)))
         (is (= 0 (graph-db.rules:rule-report-kept report)))
         (is (= 2 (length (derived g 'rt-claim "flagged"))))))))
+
+;;; Provenance per touched claim (#457 spec §3)
+
+(test a-forward-step-never-enumerates-the-producers-derivation-records
+  "Spec §3, the mutation gate for the provenance reads: neither the
+forward step nor the targeted step reads the producer's DERIVATION
+records through CLAIMS-BY-PRODUCER, and provenance is whole."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 5 :relation "up")
+    (let ((mode nil))
+      (with-counted-producer-reads (counts)
+        (setf mode (commit-strict-mode g))
+        (is (eql 0 (gethash 'graph-db.rules:derivation counts 0))))
+      (let ((c (first (derived g 'rt-claim "flagged"))))
+        (is (= 2 (length (graph-db.rules:premises-of g c))))
+        (is (find "mode" (graph-db.rules:premises-of g c)
+                  :key #'claim-relation :test #'string=)))
+      (with-counted-producer-reads (counts)
+        (retract-claim mode)
+        (is (eql 0 (gethash 'graph-db.rules:derivation counts 0))))
+      (is (null (derived g 'rt-claim "flagged")))
+      (let ((c (first (derived g 'rt-claim "flagged" :current nil))))
+        ;; D4: the records are retracted with the claim, not deleted.
+        (is (= 2 (length (graph-db.rules:premises-of g c))))
+        (is (every (lambda (r) (not (claim-current-p r)))
+                   (claims-touching g 'graph-db.rules:derivation :claim
+                                    (claim-identity-key c)
+                                    :role :subject)))))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-swept-claims-foreign-record-under-the-producer-is-retracted
+  "Review Focus 2: a DERIVATION record under the rule's producer that is
+not DERIVED-FROM, on a derived claim the targeted step sweeps, is
+retracted with it, as the enumerating pass retracted it."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 2 :relation "up")
+    (let* ((mode (commit-strict-mode g))
+           (c (first (derived g 'rt-claim "flagged")))
+           (key (claim-identity-key c)))
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules::make-derivation-binary
+         :graph g :subject-namespace :claim :subject-key key
+         :relation "annotates" :object-namespace :claim :object-key "x"
+         :producer "rule/flagged" :rule-version "1" :standing :inferred))
+      (flet ((foreign ()
+               (claims-touching g 'graph-db.rules:derivation :claim key
+                                :role :subject :relation "annotates")))
+        (is (= 1 (length (foreign))))
+        (is-true (claim-current-p (first (foreign))))
+        (retract-claim mode)
+        (is (null (derived g 'rt-claim "flagged")))
+        (is (= 1 (length (foreign))))
+        (is-false (claim-current-p (first (foreign))))))))
