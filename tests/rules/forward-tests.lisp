@@ -908,3 +908,288 @@ reads cannot pin the committing thread; the step stops after
           (is (find :rounds (getf status :failures) :key #'car))
           (is (eql 0 (getf status :queue-depth)))
           (is-false (getf status :running-p)))))))
+
+;;; The per-identity resolver (#457, spec
+;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)
+
+(defun flagged-rule-and-compiled (g n)
+  "The \"flagged\" rule written, N \"up\" premises and the strict mode
+committed, the rule run once.  => (VALUES RECORD COMPILED)."
+  (let ((r (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                       :head *flagged-head* :body *flagged-body*)))
+    (seed-keys g n :relation "up")
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rt-claim-binary :graph g :subject-namespace :sys
+                            :subject-key "s" :relation "mode"
+                            :object-namespace :val :object-key "strict"
+                            :producer "ops" :standing :asserted))
+    (graph-db.rules:run-rule g r)
+    (values r (graph-db.rules:compile-rule g r))))
+
+(test claim-by-dedupe-key-resolves-a-derived-claim-retracted-or-not
+  "Spec §2: a dedupe key resolves the producer's claim under it through
+the subject-relation index, retracted as well as current, and NIL for
+an identity nothing has."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 3)
+      (declare (ignore r))
+      (let* ((family (graph-db.rules::compiled-rule-family compiled))
+             (c (find "k00" (derived g 'rt-claim "flagged")
+                      :key #'claim-subject-key :test #'string=))
+             (key (graph-db.rules::%existing-key c family)))
+        (is (equal '(:host "k00" "flagged" nil nil nil) key))
+        (is (equalp (graph-db:id c)
+                    (graph-db:id (graph-db.rules::%claim-by-dedupe-key
+                                  g compiled key))))
+        (retract-claim c)
+        (let ((again (graph-db.rules::%claim-by-dedupe-key g compiled key)))
+          (is (equalp (graph-db:id c) (graph-db:id again)))
+          (is-false (claim-current-p again)))
+        (is (null (graph-db.rules::%claim-by-dedupe-key
+                   g compiled '(:host "nobody" "flagged" nil nil nil))))
+        ;; Another producer's claim under the same endpoints is not it.
+        (with-transaction ((graph-db::transaction-manager g))
+          (make-rt-claim-unary :graph g :subject-namespace :host
+                               :subject-key "k01" :relation "flagged"
+                               :producer "hand" :standing :asserted))
+        (let ((k01 (graph-db.rules::%claim-by-dedupe-key
+                    g compiled '(:host "k01" "flagged" nil nil nil))))
+          (is (string= "rule/flagged" (claim-producer k01))))))))
+
+(test claim-by-dedupe-key-matches-a-temporal-claim-by-its-extent-start
+  "Review Focus 1: a temporal family's dedupe key carries the extent
+start, so two derived claims of one endpoint pair resolve apart."
+  (with-rules-graph (g)
+    (seed g)
+    (seed-temporal g)
+    (let* ((r (write-host-version g))
+           (compiled (progn (graph-db.rules:run-rule g r)
+                            (graph-db.rules:compile-rule g r)))
+           (family (graph-db.rules::compiled-rule-family compiled))
+           (h1-v2 (remove-if-not
+                   (lambda (c) (and (string= "h1" (claim-subject-key c))
+                                    (string= "2" (claim-object-key c))))
+                   (derived g 'rtt-claim "host-version"))))
+      (is (= 2 (length h1-v2)))
+      (dolist (c h1-v2)
+        (let ((found (graph-db.rules::%claim-by-dedupe-key
+                      g compiled (graph-db.rules::%existing-key c family))))
+          (is (equalp (graph-db:id c) (graph-db:id found))))))))
+
+(test a-lazy-existing-resolves-on-demand-and-caches-the-miss
+  "Spec §2: the forward path's resolver starts empty, resolves a key
+when asked and remembers the answer, a miss included; the full path's
+is seeded and never resolves."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 2)
+      (declare (ignore r))
+      (let ((lazy (graph-db.rules::%lazy-existing g compiled))
+            (seeded (graph-db.rules::%seeded-existing g compiled))
+            (hit '(:host "k00" "flagged" nil nil nil))
+            (miss '(:host "nobody" "flagged" nil nil nil)))
+        (is-true (graph-db.rules::%existing-lazy-p lazy))
+        (is (zerop (hash-table-count (graph-db.rules::%existing-table lazy))))
+        (is (string= "k00" (claim-subject-key
+                            (graph-db.rules::%existing-claim lazy hit))))
+        (is (null (graph-db.rules::%existing-claim lazy miss)))
+        (is (= 2 (hash-table-count (graph-db.rules::%existing-table lazy))))
+        (is-true (nth-value 1 (gethash miss
+                                      (graph-db.rules::%existing-table
+                                       lazy))))
+        (is-false (graph-db.rules::%existing-lazy-p seeded))
+        (is (= 2 (hash-table-count
+                  (graph-db.rules::%existing-table seeded))))
+        (is (null (graph-db.rules::%existing-claim seeded miss)))
+        (is (= 2 (hash-table-count
+                  (graph-db.rules::%existing-table seeded))))))))
+
+;;; The reconcile walks the step's keys (#457 spec §3)
+
+(defmacro with-counted-producer-reads ((counts) &body body)
+  "BODY with CLAIMS-BY-PRODUCER counted into COUNTS, an EQUAL hash of
+claim-class symbol -> calls; the original restored on exit."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,counts (make-hash-table :test 'equal))
+           (,orig (fdefinition 'graph-db.spacetime:claims-by-producer)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db.spacetime:claims-by-producer)
+                    (lambda (graph claim-class producer &rest keys)
+                      (incf (gethash claim-class ,counts 0))
+                      (apply ,orig graph claim-class producer keys)))
+              ,@body)
+         (setf (fdefinition 'graph-db.spacetime:claims-by-producer)
+               ,orig)))))
+
+(defun commit-strict-mode (g)
+  "The strict mode claim, in its own transaction.  Returns it."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rt-claim-binary :graph g :subject-namespace :sys
+                          :subject-key "s" :relation "mode"
+                          :object-namespace :val :object-key "strict"
+                          :producer "ops" :standing :asserted)))
+
+(test a-forward-step-never-enumerates-the-producers-claims
+  "Spec §3, the mutation gate for the claim reads: a one-claim commit's
+forward step and a one-claim retraction's targeted step read the
+touched rule's producer through CLAIMS-BY-PRODUCER zero times, and
+derive and sweep exactly what they did before."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 50 :relation "up")
+    ;; DERIVED itself reads the producer, so it stays outside the
+    ;; counted windows.
+    (let ((mode nil))
+      (with-counted-producer-reads (counts)
+        (setf mode (commit-strict-mode g))
+        (is (eql 0 (gethash 'rt-claim counts 0))))
+      (is (= 50 (length (derived g 'rt-claim "flagged"))))
+      (with-counted-producer-reads (counts)
+        (retract-claim mode)
+        (is (eql 0 (gethash 'rt-claim counts 0))))
+      (is (null (derived g 'rt-claim "flagged")))
+      (is (= 50 (length (derived g 'rt-claim "flagged" :current nil)))))
+    (is-true (run-rules-is-quiet g))))
+
+(test the-per-key-reconcile-constructs-a-desired-key-that-stands-nowhere
+  "Spec §3 item 1: the targeted path has no round pass, so the per-key
+reconcile constructs a desired identity no claim has, counts it
+DERIVED and notes it in the resolver."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 1)
+      (declare (ignore r))
+      (let ((desired (make-hash-table :test 'equal))
+            (key '(:host "zz" "flagged" nil nil nil))
+            (report (graph-db.rules::%make-rule-report
+                     :rule-name "flagged" :version "1"))
+            (existing (graph-db.rules::%lazy-existing g compiled)))
+        (setf (gethash key desired)
+              (cons (list :subject-namespace :host :subject-key "zz"
+                          :extent nil)
+                    '()))
+        (with-transaction ((graph-db::transaction-manager g))
+          (multiple-value-bind (standing swept)
+              (graph-db.rules::%reconcile-claims
+               compiled g report desired (list key)
+               :sweep-keys (make-hash-table :test 'equal)
+               :existing existing)
+            (is (= 1 (length standing)))
+            (is (null swept))
+            (is (string= "zz" (claim-subject-key (cdr (first standing)))))
+            (is (eq (cdr (first standing))
+                    (graph-db.rules::%existing-claim existing key)))))
+        (is (= 1 (graph-db.rules:rule-report-derived report)))
+        (is (= 0 (graph-db.rules:rule-report-kept report)))
+        (is (= 2 (length (derived g 'rt-claim "flagged"))))))))
+
+;;; Provenance per touched claim (#457 spec §3)
+
+(test a-forward-step-never-enumerates-the-producers-derivation-records
+  "Spec §3, the mutation gate for the provenance reads: neither the
+forward step nor the targeted step reads the producer's DERIVATION
+records through CLAIMS-BY-PRODUCER, and provenance is whole."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 5 :relation "up")
+    (let ((mode nil))
+      (with-counted-producer-reads (counts)
+        (setf mode (commit-strict-mode g))
+        (is (eql 0 (gethash 'graph-db.rules:derivation counts 0))))
+      (let ((c (first (derived g 'rt-claim "flagged"))))
+        (is (= 2 (length (graph-db.rules:premises-of g c))))
+        (is (find "mode" (graph-db.rules:premises-of g c)
+                  :key #'claim-relation :test #'string=)))
+      (with-counted-producer-reads (counts)
+        (retract-claim mode)
+        (is (eql 0 (gethash 'graph-db.rules:derivation counts 0))))
+      (is (null (derived g 'rt-claim "flagged")))
+      (let ((c (first (derived g 'rt-claim "flagged" :current nil))))
+        ;; D4: the records are retracted with the claim, not deleted.
+        (is (= 2 (length (graph-db.rules:premises-of g c))))
+        (is (every (lambda (r) (not (claim-current-p r)))
+                   (claims-touching g 'graph-db.rules:derivation :claim
+                                    (claim-identity-key c)
+                                    :role :subject)))))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-swept-claims-foreign-record-under-the-producer-is-retracted
+  "Review Focus 2: a DERIVATION record under the rule's producer that is
+not DERIVED-FROM, on a derived claim the targeted step sweeps, is
+retracted with it, as the enumerating pass retracted it."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 2 :relation "up")
+    (let* ((mode (commit-strict-mode g))
+           (c (first (derived g 'rt-claim "flagged")))
+           (key (claim-identity-key c)))
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules::make-derivation-binary
+         :graph g :subject-namespace :claim :subject-key key
+         :relation "annotates" :object-namespace :claim :object-key "x"
+         :producer "rule/flagged" :rule-version "1" :standing :inferred))
+      (flet ((foreign ()
+               (claims-touching g 'graph-db.rules:derivation :claim key
+                                :role :subject :relation "annotates")))
+        (is (= 1 (length (foreign))))
+        (is-true (claim-current-p (first (foreign))))
+        (retract-claim mode)
+        (is (null (derived g 'rt-claim "flagged")))
+        (is (= 1 (length (foreign))))
+        (is-false (claim-current-p (first (foreign))))))))
+
+;;; The step's cost on the status (#457 spec §4)
+
+(test the-status-reports-the-last-steps-elapsed-time
+  "Spec §4: :LAST-STEP-ELAPSED is NIL until a step has run, then the
+wall seconds of the last drain."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (is (null (getf (graph-db.rules:forward-rules-status g)
+                    :last-step-elapsed)))
+    (seed-keys g 2 :relation "up")
+    (let ((elapsed (getf (graph-db.rules:forward-rules-status g)
+                         :last-step-elapsed)))
+      (is (realp elapsed))
+      (is (and (realp elapsed) (>= elapsed 0))))))
+
+(test a-round-never-writes-the-seeded-resolver
+  "Review finding 1: %ROUND-DELTA notes what it kept or constructed in a
+lazy resolver only.  A seeded one is built once outside a cross-store
+round's retried transaction, so a note there would hand the retry the
+unwound attempt's unsaved claim as standing."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 1)
+      (declare (ignore r))
+      (let ((desired (make-hash-table :test 'equal))
+            (key '(:host "zz" "flagged" nil nil nil))
+            (seeded (graph-db.rules::%seeded-existing g compiled))
+            (lazy (graph-db.rules::%lazy-existing g compiled)))
+        (setf (gethash key desired)
+              (cons (list :subject-namespace :host :subject-key "zz"
+                          :extent nil)
+                    '()))
+        (with-transaction ((graph-db::transaction-manager g))
+          (multiple-value-bind (new count)
+              (graph-db.rules::%round-delta compiled g desired seeded
+                                            (list key))
+            (is (= 1 count))
+            (is (= 1 (length new)))
+            (is-false (nth-value 1 (gethash key (graph-db.rules::%existing-table
+                                                 seeded)))))
+          (multiple-value-bind (new count)
+              (graph-db.rules::%round-delta compiled g desired lazy
+                                            (list key))
+            (declare (ignore new))
+            ;; The lazy one resolves the claim the first call wrote
+            ;; (the overlay) and notes it; nothing is constructed twice.
+            (is (= 0 count))
+            (is-true (nth-value 1 (gethash key (graph-db.rules::%existing-table
+                                                lazy))))))))))

@@ -1163,11 +1163,14 @@ and recorded the same way under the name `:step`.
 ```lisp
 (graph-db.rules:forward-rules-status graph)
 ;; => (:enabled t :queue-depth 0 :running-p nil
-;;     :failures (("web-hosts" . "rule: ...")) :timers 0)
+;;     :failures (("web-hosts" . "rule: ...")) :timers 0
+;;     :last-step-elapsed 0.004d0)
 ```
 
-The last hundred failures are kept, newest first. `run-rules` after a
-failure reports the same refusal and repairs the rest.
+The last hundred failures are kept, newest first; `:last-step-elapsed`
+is the wall seconds of the last `forward-step` drain, NIL before one.
+`run-rules` after a failure reports the same refusal and repairs the
+rest.
 
 **Thresholds (D3).** A body may say `(now ?t)` and compare `?t` with
 an instant of a premise claim: one of `claim-valid-from/2`,
@@ -1266,9 +1269,19 @@ same fixpoint from scratch and reconciles fully, so after any step it
 reports nothing derived and nothing swept. If it does not, that is a
 defect in the step.
 
-**Cost.** A step reads the touched rules' producers' claims once per
-stratum (`claims-by-producer`, the same read `run-rules` makes), so a
-step on a store with many derived claims costs a read of them even
-when the delta is one claim; the per-key lookup is #457, the next
-unit, and a consumer with a large derived set should wait for it. The
-derivation itself is proportional to the delta's solutions.
+**Cost.** A step reads in proportion to what it touches, not to the
+rule's standing derivation (#457): each identity the delta derives is
+resolved through the subject-relation index (the claims of one subject
+under one relation, from every producer), each swept or kept derived
+claim's provenance through the derivation family's subject index, and
+nothing enumerates the producer. The derivation itself is proportional
+to the delta's solutions. `forward-rules-status`'s `:last-step-elapsed`
+is the last step's wall time; `bench-forward-step-reads` in
+`tests/perf/rules-bench.lisp` runs a one-claim step against two
+derived-set sizes and reports the ratio (near 1). The full path --
+`run-rules`, `run-rule`, and a step's `:full` mode for a recursive
+stratum that lost a premise or a touched `not` -- still reads the whole
+producer, which is its job. One difference from that pass: two
+*current* claims of one identity under one producer (a hand-made
+duplicate) are both met by the full path, which sweeps the second,
+and only one by the per-key path, which leaves the other alone.

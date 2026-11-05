@@ -19,10 +19,12 @@ text) newest first, COMPILED the rule set cached while CACHE-STAMP
 matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS a TIMER-HEAP of
 pending THRESHOLD-TIMERs or NIL, with TIMER-THREAD, TIMER-CV and
 TIMER-STOP driving them (thresholds.lisp), LAST-REPORTS the last
-delta's RULE-REPORTs."
+delta's RULE-REPORTs, LAST-STEP-ELAPSED the wall seconds of the last
+FORWARD-STEP drain, NIL before one (#457)."
   graph
   (queue '())
   (last-reports '())
+  (last-step-elapsed nil)
   (lock (bordeaux-threads:make-lock "forward rules"))
   (running-p nil)
   (failures '())
@@ -108,7 +110,8 @@ RUNNING-P set and returns at once, its delta left for the running
 step.  So a commit never waits on another commit's derivation, and a
 reader must not expect a derivation the moment WITH-TRANSACTION
 returns (docs/rules.md).  Returns nothing."
-  (let ((state (%forward-state graph)))
+  (let ((state (%forward-state graph))
+        (start (get-internal-real-time)))
     (when state
       (bordeaux-threads:with-lock-held ((forward-state-lock state))
         (when (forward-state-running-p state)
@@ -139,7 +142,10 @@ returns (docs/rules.md).  Returns nothing."
                         (%run-delta graph state delta))))
         ;; Every exit, normal or not: the queue is empty or dropped.
         (bordeaux-threads:with-lock-held ((forward-state-lock state))
-          (setf (forward-state-running-p state) nil))))))
+          (setf (forward-state-last-step-elapsed state)
+                (/ (- (get-internal-real-time) start)
+                   (float internal-time-units-per-second 1.0d0))
+                (forward-state-running-p state) nil))))))
 
 (defun %drain-queues ()
   "Every enabled graph with a queued delta gets its step: what the
@@ -156,7 +162,9 @@ review, finding 1)."
 (defun forward-rules-status (graph)
   "What forward evaluation on GRAPH is doing: a plist (:ENABLED T
 :QUEUE-DEPTH n :RUNNING-P bool :FAILURES ((name . text) ...) :TIMERS
-n), newest failure first; (:ENABLED NIL) for a graph not opted in."
+n :LAST-STEP-ELAPSED seconds-or-NIL), newest failure first, the
+elapsed the last FORWARD-STEP drain's (#457); (:ENABLED NIL) for a
+graph not opted in."
   (let ((state (%forward-state graph)))
     (if (null state)
         (list :enabled nil)
@@ -165,7 +173,9 @@ n), newest failure first; (:ENABLED NIL) for a graph not opted in."
                 :queue-depth (length (forward-state-queue state))
                 :running-p (forward-state-running-p state)
                 :failures (copy-list (forward-state-failures state))
-                :timers (%timer-count (forward-state-timers state)))))))
+                :timers (%timer-count (forward-state-timers state))
+                :last-step-elapsed
+                (forward-state-last-step-elapsed state))))))
 
 (defun %forward-hook (tx)
   "The *AFTER-COMMIT-HOOKS* entry: a committed TX on an enabled graph
