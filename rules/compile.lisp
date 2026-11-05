@@ -264,6 +264,12 @@ not ~A" (%term-label rel)))
                               (%head-key spec okey body-vars "object"))
               :unary-p unary)))))
 
+(defun %claim-read-goal-p (goal)
+  "GOAL reads a relation: a CLAIM/7 or a CLAIM-ABSENT/7 call, the two
+share argument positions (D2)."
+  (or (%engine-goal-p goal "CLAIM" 7)
+      (%engine-goal-p goal "CLAIM-ABSENT" 7)))
+
 (defun %generator-goal-p (goal)
   "(claim-producer ?v \"p\"): a generator, to run first (ruling P5)."
   (and (%engine-goal-p goal "CLAIM-PRODUCER" 2)
@@ -275,11 +281,11 @@ not ~A" (%term-label rel)))
           (remove-if #'%generator-goal-p goals)))
 
 (defun %body-reads (goals)
-  "The relations the body's CLAIM/7 goals read, or :ANY when one of
-them leaves the relation unbound (ruling P6)."
+  "The relations the body's CLAIM/7 and CLAIM-ABSENT/7 goals read, or
+:ANY when one of them leaves the relation unbound (ruling P6)."
   (let ((reads '()))
     (dolist (goal goals (nreverse reads))
-      (when (%engine-goal-p goal "CLAIM" 7)
+      (when (%claim-read-goal-p goal)
         ;; The relation is CLAIM/7's fifth ARGUMENT, i.e. (sixth goal):
         ;; (claim ?c family sns skey rel ons okey).
         (let ((rel (sixth goal)))
@@ -307,7 +313,7 @@ unbound there (GH #333)."
   (let ((reads '()))
     (labels ((walk (goal negated)
                (cond ((%not-goal-p goal) (walk (second goal) t))
-                     ((and negated (%engine-goal-p goal "CLAIM" 7))
+                     ((and negated (%claim-read-goal-p goal))
                       (let ((rel (sixth goal)))
                         (if (stringp rel)
                             (pushnew rel reads :test #'string=)
@@ -320,7 +326,7 @@ unbound there (GH #333)."
 
 (defun %premise-vars (goals)
   (loop for goal in goals
-        when (and (%engine-goal-p goal "CLAIM" 7)
+        when (and (%claim-read-goal-p goal)
                   (%variable-p (second goal)))
           collect (second goal) into vars
         finally (return (remove-duplicates vars))))

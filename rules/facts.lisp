@@ -511,6 +511,24 @@ the present instant (GH #388)."
     (when (and c (graph-db.spacetime:claim-current-p c))
       (funcall cont))))
 
+(def-global-prolog-functor claim-absent/7
+    (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
+  "CLAIM/7's routes filtered to the DETERMINED absences: a claim still
+believed (CLAIM-CURRENT-P) whose standing is :SEARCHED-EMPTY or
+:DETERMINED-EMPTY.  The second negation beside NOT/1 (D2, forward-rules
+design §5.1): NOT says no claim is on record, this says somebody looked
+and found nothing.  A positive read for stratification, so a rule may
+say it of its own relation's inputs freely.  The weak absences
+(:UNCOVERED, :INDETERMINATE) are not answers."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil
+               (lambda ()
+                 (let ((c (%claim-arg ?c)))
+                   (when (and c
+                              (graph-db.spacetime:claim-current-p c)
+                              (member (graph-db.spacetime:claim-standing c)
+                                      '(:searched-empty :determined-empty)))
+                     (funcall cont))))))
+
 (defun %instant-arg (x)
   "X as a LOCAL-TIME timestamp: a timestamp passes, an RFC 3339 /
 ISO-8601 string is parsed, an unbound or NIL X is NIL and fails the

@@ -60,6 +60,7 @@ pathname and its `graph-db.rules` package are unchanged.
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-after ?c family ?sns ?skey ?rel ?ons ?okey skey-after okey-after)
+(claim-absent ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
 (claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
@@ -74,6 +75,7 @@ pathname and its `graph-db.rules` package are unchanged.
 |---|---|
 | `claim/7` | a claim of `family`, and its endpoints |
 | `claim-after/9` | `claim/7`'s rows with strict lower bounds on both keys, the namespace route started at the bound; "Solution order" (GH #451) |
+| `claim-absent/7` | `claim/7`'s rows restricted to current claims of standing `:searched-empty` or `:determined-empty`: the determined absences (D2) |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
 | `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
@@ -857,6 +859,27 @@ over the rule's own store, so A's rule reading a relation B's rule
 derives -- and B's reading one A's derives -- is neither refused at
 compile nor settled at run. Recursion within one store is handled;
 see "Recursive rules" below.
+
+## Two negations
+
+A body has two ways to say "not there", and they mean different
+things (D2 of the forward-rules design,
+`docs/superpowers/specs/2026-11-04-forward-rules-design.md` §5.1):
+
+- `(not (claim ?c family ...))` is **closed-world**: no claim of that
+  shape is on record. It is stratified negation: the relation under
+  it must belong to an earlier stratum, and a rule that says it of its
+  own stratum is refused at compile.
+- `(claim-absent ?c family sns skey rel ons okey)` is a **determined
+  absence**: somebody looked and found nothing. It answers the current
+  claims of standing `:searched-empty` or `:determined-empty` under
+  that relation, exactly `claim/7`'s routes with a filter, and it is a
+  positive read for stratification, so a rule may use it freely. The
+  weak absences, `:uncovered` and `:indeterminate`, and a retracted
+  absence are not answers.
+
+Say the second when the store records searches; say the first when
+silence is the only evidence there is.
 
 ## Recursive rules
 

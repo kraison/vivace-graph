@@ -364,3 +364,22 @@ validated at registration."
 (P6), the same refusal as a positive :ANY read."
   (refuses "bind the relation" :name "r" :version "1" :family "rt-claim"
            :head *head-x* :body *body-not-unbound*))
+
+(defparameter *unscanned-head*
+  "(claim ?c rt-claim \"host\" ?h \"unscanned\" nil nil)")
+(defparameter *unscanned-body*
+  "(claim-absent ?a rt-claim \"host\" ?h \"scanned\" ?o ?k)")
+
+(test claim-absent-is-a-positive-read-for-strata
+  "CLAIM-ABSENT/7 reads its relation like CLAIM/7 -- a positive read,
+not a NOT -- and binds a premise (D2)."
+  (with-rules-graph (g)
+    (let ((c (graph-db.rules:compile-rule
+              g (spec :name "unscanned" :version "1" :family "rt-claim"
+                      :head *unscanned-head* :body *unscanned-body*))))
+      (is (member "scanned" (graph-db.rules:compiled-rule-reads c)
+                  :test #'string=))
+      (is (null (graph-db.rules:compiled-rule-negative-reads c)))
+      (is (equal '("?A")
+                 (mapcar #'symbol-name
+                         (graph-db.rules::compiled-rule-premise-vars c)))))))
