@@ -222,3 +222,26 @@ SLG tabling for `select`/guarded queries and magic sets (#122, unit 2);
 the trampoline question (reopens with unit 2); incremental
 re-derivation on premise commit (kraison/blackboard#5); cross-store
 cycle detection (S3-P5).
+
+## 8. Forward evaluation (addendum, 2026-11-05)
+
+`docs/superpowers/specs/2026-11-04-forward-rules-design.md` runs the
+same machinery from a commit's delta (#456). Three rulings above read
+differently there, on purpose:
+
+- **R5** (the sweep is per fixpoint): on the forward path the
+  reconcile sweeps nothing and only adds provenance (`:sweep-keys` an
+  empty table), since the step derived from a delta, not from the
+  whole store; the targeted path sweeps exactly the dependents it
+  re-derived. The full sweep is `run-rules`' and the full path's.
+- **R7** (the stratum's producers are excluded from plain reads): off
+  on the forward path. The stratum's prior output is what a body
+  reads; a solution is one that names at least one delta claim, which
+  is what makes the step semi-naive.
+- **R10** (round 0's delta is the base facts): on the forward path
+  round 0's delta is the commit's +1 claims under the stratum's reads,
+  and every rule, recursive or not, runs its variants over every
+  claim goal (`%variants :all-goals t`).
+
+The sweep itself changed for both modes (D4): a lost derivation is
+retracted, never deleted, and re-opened when derived again.

@@ -710,3 +710,128 @@ processed."
                        (claim-subject-key f)))
             ;; Its provenance names the premise.
             (is (= 1 (length (graph-db.rules:premises-of g f))))))))))
+
+;;; Standing-query equivalence (spec §8, plan Task 9)
+
+(defvar *delivered* '()
+  "Agenda deliveries, newest first: (query event key).")
+
+(defun deliver (query)
+  (lambda (event match)
+    (push (list query event (getf match :key)) *delivered*)))
+
+(defun delivered-keys (query event)
+  (loop for (q e k) in *delivered*
+        when (and (string= q query) (eq e event)) collect k))
+
+(defparameter *q1-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-current ?p)")
+(defparameter *q2-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a) (claim-current ?p)
+   (claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)")
+(defparameter *q3-body*
+  "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)")
+
+(defun q1-keys (g)
+  (declare (ignore g))
+  (mapcar #'claim-identity-key
+          (select-flat (?p)
+            (claim ?p rt-claim "host" ?h "runs" "app" "web")
+            (claim-current ?p))))
+
+(defun q2-keys (g)
+  (declare (ignore g))
+  (mapcar (lambda (row) (graph-db::%joined-identity-keys row))
+          (select (:max-inferences 10000000) (?p ?u)
+            (claim ?p rt-claim "host" ?h "runs" "app" ?a) (claim-current ?p)
+            (claim ?u rt-claim "host" ?h "up" nil nil) (claim-current ?u))))
+
+(defun q3-keys (g)
+  (declare (ignore g))
+  (mapcar #'claim-identity-key
+          (select-flat (?u)
+            (claim ?u rt-claim "host" ?h "up" nil nil)
+            (claim-current ?u))))
+
+(defun host-claim (g host relation &optional object)
+  (find-if (lambda (c) (or (null object)
+                           (string= object (claim-object-key c))))
+           (claims-touching g 'rt-claim :host host :role :subject
+                            :relation relation)))
+
+(defun standing-query-step (g i)
+  "Commit number I of the script: a create, a second create, a
+retraction, a commit touching nothing read, a deletion."
+  (let ((host (format nil "k~2,'0d" i)))
+    (ecase (mod i 5)
+      (0 (commit-runs-web g host))
+      (1 (with-transaction ((graph-db::transaction-manager g))
+           (make-rt-claim-binary :graph g :subject-namespace :host
+                                 :subject-key host :relation "runs"
+                                 :object-namespace :app :object-key "db"
+                                 :producer "scan-t" :standing :observed)))
+      (2 (retract-claim (host-claim g (format nil "k~2,'0d" (- i 2))
+                                    "runs" "web")))
+      (3 (with-transaction ((graph-db::transaction-manager g))
+           (make-rt-claim-unary :graph g :subject-namespace :host
+                                :subject-key host :relation "noise"
+                                :producer "scan-t" :standing :observed)))
+      (4 (with-transaction ((graph-db::transaction-manager g))
+           (mark-deleted (host-claim g host "up")))))))
+
+(defun set-equal-p (a b)
+  (and (= (length a) (length (remove-duplicates a :test #'string=)))
+       (null (set-exclusive-or a b :test #'string=))))
+
+(test standing-queries-deliver-exactly-the-set-differences-of-full-reevaluation
+  "Spec §8: three queries as productions over forty commits; after
+each commit the deliveries since the last equal the set differences of
+re-evaluating the query from scratch, as sets, with no duplicate."
+  (with-rules-graph (g)
+    (let ((*delivered* '())
+          (mismatches '())
+          (total 0))
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-production "q1" :version "1"
+               :family rt-claim :body *q1-body* :action (deliver "q1"))
+             (graph-db.rules:def-production "q2" :version "1"
+               :family rt-claim :body *q2-body* :action (deliver "q2"))
+             (graph-db.rules:def-production "q3" :version "1"
+               :family rt-claim :body *q3-body* :action (deliver "q3"))
+             (seed-keys g 600 :relation "up")       ; q3 exceeds 500 rows
+             (graph-db.rules:enable-forward-rules g)
+             (is (= 600 (length (firings g "q3"))))
+             (setf *delivered* '())
+             (let ((prev (list (q1-keys g) (q2-keys g) (q3-keys g))))
+               (dotimes (i 40)
+                 (setf *delivered* '())
+                 (standing-query-step g i)
+                 (incf total (length *delivered*))
+                 (let ((now (list (q1-keys g) (q2-keys g) (q3-keys g))))
+                   (loop for q in '("q1" "q2" "q3")
+                         for before in prev
+                         for after in now
+                         do (let ((added (set-difference after before
+                                                         :test #'string=))
+                                  (removed (set-difference before after
+                                                           :test #'string=)))
+                              (unless (and (set-equal-p
+                                            (delivered-keys q :added) added)
+                                           (set-equal-p
+                                            (delivered-keys q :lost) removed))
+                                (push (list i q :added added
+                                            (delivered-keys q :added)
+                                            :removed removed
+                                            (delivered-keys q :lost))
+                                      mismatches))))
+                   (when (= 3 (mod i 5))
+                     (is (null *delivered*)))
+                   (setf prev now)))))
+        (graph-db.rules:undef-production "q1")
+        (graph-db.rules:undef-production "q2")
+        (graph-db.rules:undef-production "q3"))
+      (is (null mismatches) "mismatches: ~S" mismatches)
+      (is (plusp total))
+      (is-true (run-rules-is-quiet g)))))

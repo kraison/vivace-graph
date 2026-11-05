@@ -1,8 +1,11 @@
 # Forward evaluation of rules: derive and fire at commit
 
-**Status:** design, awaiting Kevin's approval (2026-11-04). Builder
-check done; its findings are folded in, and the two questions it left
-for Kevin are decided (D4, D5 in §1).
+**Status:** approved 2026-11-04; implemented on branch
+`forward-rules` 2026-11-05 (#456; plan
+`docs/superpowers/plans/2026-11-04-forward-rules.md`, whose ledger
+records the rulings taken while building). Builder check done; its
+findings are folded in, and the two questions it left for Kevin are
+decided (D4, D5 in §1).
 **Prior specs:** `2026-09-04-rules-as-producers-design.md` (the rule
 record, `run-rule`, the derivation family),
 `2026-09-06-recursive-rules-fixpoint-design.md` (strata, semi-naive
