@@ -341,10 +341,22 @@ family, whose window cover is capped at +SPATIAL-QUERY-MAX-CELLS+) are
 NOT in this category: their cost tracks the operator's own data, and
 the un-flagged structured builder already reaches all of it.")
 
+(defparameter *prolog-rule-only-predicates* '("NOW")
+  "Predicate names a RULE body may use and free text may not: NOW/1
+binds the evaluation instant RUN-RULES and a forward step set, which a
+one-off query has no business reading as a fact (graph-db/rules,
+forward-rules design §5.2).")
+
+(defvar *guarding-rule-text* nil
+  "Bound T by graph-db/rules' compiler around GUARD-QUERY-TEXT, which
+admits *PROLOG-RULE-ONLY-PREDICATES* then and only then.")
+
 (defun %excluded-predicate-p (name)
-  "NAME is withheld from free text, for either reason."
+  "NAME is withheld from free text, for any of the three reasons."
   (or (member name *prolog-excluded-predicates* :test #'string=)
-      (member name *prolog-cost-unbounded-predicates* :test #'string=)))
+      (member name *prolog-cost-unbounded-predicates* :test #'string=)
+      (and (not *guarding-rule-text*)
+           (member name *prolog-rule-only-predicates* :test #'string=))))
 
 (defun %functor-whitelist ()
   "(name-string . arity) -> home package, ENUMERATED from the two live

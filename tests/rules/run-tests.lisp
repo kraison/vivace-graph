@@ -5,11 +5,28 @@
 
 (in-suite rules-suite)
 
-(defun derived (g family name)
-  "The live claims rule NAME derived into FAMILY, current only."
-  (remove-if-not #'claim-current-p
-                 (claims-by-producer g family
-                                     (graph-db.rules::rule-producer name))))
+(defun derived (g family name &key (current t))
+  "The live claims rule NAME derived into FAMILY; current only unless
+CURRENT is NIL, which includes the retracted ones a sweep left (D4)."
+  (let ((all (claims-by-producer g family
+                                 (graph-db.rules::rule-producer name))))
+    (if current (remove-if-not #'claim-current-p all) all)))
+
+(defun derived-from-records (g claim)
+  "The DERIVED-FROM records naming CLAIM as the derived side, current
+or not."
+  (claims-touching g 'graph-db.rules:derivation
+                   :claim (claim-identity-key claim) :role :subject))
+
+(defparameter *web-hosts-current-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (claim-current ?p)")
+
+(defun write-web-hosts-current (g &rest args)
+  "WEB-HOSTS whose body tracks the premise's currency, so retracting a
+premise loses the derivation (docs/rules.md, currency is the body's
+business)."
+  (apply #'write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+         :head *web-hosts-head* :body *web-hosts-current-body* args))
 
 (defun refusal-tag (report)
   "The TAG of REPORT's first refusal."
@@ -79,10 +96,83 @@
         (is (equalp before
                     (graph-db:id
                      (first (derived g 'rt-claim "web-hosts")))))
-        ;; The old derivation records went with the old claims.
-        (is (= 1 (length (claims-by-producer
-                          g 'graph-db.rules:derivation
-                          "rule/web-hosts"))))))))
+        ;; D4: the swept claim is retracted, not deleted; it is still
+        ;; on record and no longer believed.
+        (let ((h2 (find "h2" (derived g 'rt-claim "web-hosts" :current nil)
+                        :key #'claim-object-key :test #'string=)))
+          (is (not (null h2)))
+          (when h2 (is-false (claim-current-p h2))))
+        ;; The old derivation record went with the old claim: retracted
+        ;; too, so one record is still believed.
+        (is (= 1 (count-if #'claim-current-p
+                           (claims-by-producer
+                            g 'graph-db.rules:derivation
+                            "rule/web-hosts"))))))))
+
+(test a-swept-derivation-is-retracted-with-its-provenance
+  "D4 (forward-rules design §4.2): a derivation the rule no longer
+derives is RETRACT-CLAIMed with its DERIVED-FROM records, never deleted."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts-current g)))
+      (graph-db.rules:run-rule g r)
+      (retract-claim (first (claims-touching g 'rt-claim :host "h2"
+                                             :role :subject
+                                             :relation "runs")))
+      (let ((report2 (graph-db.rules:run-rule g r)))
+        (is (= 1 (graph-db.rules:rule-report-swept report2)))
+        (is (= 1 (graph-db.rules:rule-report-kept report2)))
+        (let ((c (find "h2" (derived g 'rt-claim "web-hosts" :current nil)
+                       :key #'claim-object-key :test #'string=)))
+          (is (not (null c)))
+          (when c
+            (is-false (claim-current-p c))
+            (let ((recs (derived-from-records g c)))
+              (is (= 1 (length recs)))
+              (is (every (lambda (rec) (not (claim-current-p rec)))
+                         recs)))))))))
+
+(test a-re-derived-identity-re-opens-the-retracted-claim
+  "D4: an identity derived again whose claim is retracted is re-opened
+in place -- the same node, believed again -- as REGISTER-NODE re-opens
+a retracted registration; counted as kept."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts-current g))
+          (premise (first (claims-touching g 'rt-claim :host "h2"
+                                           :role :subject
+                                           :relation "runs"))))
+      (graph-db.rules:run-rule g r)
+      (retract-claim premise)
+      (graph-db.rules:run-rule g r)
+      (let ((c-before (find "h2" (derived g 'rt-claim "web-hosts"
+                                          :current nil)
+                            :key #'claim-object-key :test #'string=)))
+        (is-false (claim-current-p c-before))
+        ;; The premise comes back: RETRACT-CLAIM's twin is a fresh
+        ;; assertion of the same identity, which re-opens it.
+        (with-transaction ((graph-db::transaction-manager g))
+          (let ((p (copy (graph-db:lookup-vertex (graph-db:id premise)))))
+            (setf (claim-transaction-extent-sexp p)
+                  (extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent
+                    (graph-db.spacetime::%st-now))))
+            (save p)))
+        (let ((report3 (graph-db.rules:run-rule g r)))
+          (is (= 2 (graph-db.rules:rule-report-kept report3)))
+          (is (= 0 (graph-db.rules:rule-report-derived report3)))
+          (is (= 0 (graph-db.rules:rule-report-swept report3))))
+        (let ((c-after (find "h2" (derived g 'rt-claim "web-hosts")
+                             :key #'claim-object-key :test #'string=)))
+          (is (not (null c-after)))
+          (when c-after
+            (is (equalp (graph-db:id c-before) (graph-db:id c-after)))
+            (is-true (claim-current-p c-after))
+            (is (every #'claim-current-p
+                       (derived-from-records g c-after)))))
+        ;; Still one claim of that identity, not a second.
+        (is (= 2 (length (derived g 'rt-claim "web-hosts"
+                                  :current nil))))))))
 
 (test a-new-version-leaves-no-old-version-claim
   (with-rules-graph (g)
@@ -549,9 +639,10 @@ graph here."
       (is (typep (graph-db.rules:rule-report-elapsed report) 'real))
       (is (>= (graph-db.rules:rule-report-elapsed report) 0)))))
 
-(test a-retracted-derived-claim-stays-retracted-on-rerun
-  "Ruling P10's stated cost: keeping is not re-assertion.  The claim is
-kept -- same node -- and its closed transaction period stands."
+(test a-hand-retracted-derived-claim-is-re-opened-on-rerun
+  "D4 reverses ruling P10's stated cost: a derivation the rule still
+supports is believed, so a rerun re-opens a hand-retracted derived
+claim -- same node -- and counts it kept (forward-rules design §4.2)."
   (with-rules-graph (g)
     (seed g)
     (let ((r (write-web-hosts g)))
@@ -560,6 +651,9 @@ kept -- same node -- and its closed transaction period stands."
                        :key #'claim-object-key :test #'string=))
              (before (graph-db:id h1)))
         (retract-claim h1)
+        (is (equal '("h2")
+                   (mapcar #'claim-object-key
+                           (derived g 'rt-claim "web-hosts"))))
         (let ((report (graph-db.rules:run-rule g r)))
           (is (= 2 (graph-db.rules:rule-report-kept report)))
           (is (= 0 (graph-db.rules:rule-report-derived report)))
@@ -570,27 +664,11 @@ kept -- same node -- and its closed transaction period stands."
           (is-true again)
           (when again
             (is (equalp before (graph-db:id again)))
-            (is-false (claim-current-p again))))
-        ;; Control: h2 was never retracted and is still believed.
-        (is (equal '("h2")
-                   (mapcar #'claim-object-key
-                           (derived g 'rt-claim "web-hosts"))))
-        ;; And through the COPY/SAVE %REFRESH-VERSION does when the
-        ;; rule's version moves -- the other path that touches a kept
-        ;; claim -- the closed period still stands.
-        (with-transaction ((graph-db::transaction-manager g))
-          (let ((c (copy r)))
-            (setf (graph-db.rules:rule-version c) "2")
-            (save c)))
-        (is (= 2 (graph-db.rules:rule-report-kept
-                  (graph-db.rules:run-rule g "web-hosts"))))
-        (let ((again (find "h1" (claims-by-producer g 'rt-claim
-                                                    "rule/web-hosts")
-                           :key #'claim-object-key :test #'string=)))
-          (is-true again)
-          (when again
-            (is (string= "2" (claim-rule-version again)))
-            (is-false (claim-current-p again))))))))
+            (is-true (claim-current-p again))))
+        (is (equal '("h1" "h2")
+                   (sort (mapcar #'claim-object-key
+                                 (derived g 'rt-claim "web-hosts"))
+                         #'string<)))))))
 
 (test a-temporal-rerun-keeps-its-claims
   "Ruling P10 on a temporal family, where the extent start joins the
@@ -684,12 +762,20 @@ which is also why the keep is restricted to \"derived-from\"."
       (is (= 3 (length (claims-by-producer g 'graph-db.rules:derivation
                                            "rule/web-hosts"))))
       (graph-db.rules:run-rule g r)
-      (let ((after (claims-by-producer g 'graph-db.rules:derivation
-                                       "rule/web-hosts")))
+      ;; D4: the intruder is retracted, not deleted; the two believed
+      ;; records are the derived-from pair.
+      (let ((after (remove-if-not #'claim-current-p
+                                  (claims-by-producer
+                                   g 'graph-db.rules:derivation
+                                   "rule/web-hosts"))))
         (is (= 2 (length after)))
         (is (every (lambda (rec)
                      (string= "derived-from" (claim-relation rec)))
-                   after))))))
+                   after))
+        (is (= 1 (count-if-not #'claim-current-p
+                               (claims-by-producer
+                                g 'graph-db.rules:derivation
+                                "rule/web-hosts"))))))))
 
 ;;; The whole-branch review's findings (#331)
 

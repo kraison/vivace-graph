@@ -16,6 +16,13 @@ storage formats (#60).
 
 ### Changed
 
+- **`run-rules` retracts a derivation it no longer derives instead of
+  deleting it** (#456, D4 of the forward-rules design). The swept
+  claim and its `derived-from` records stay on record with their
+  transaction period closed, so provenance stays readable; an identity
+  derived again whose claim is retracted -- by a sweep or by hand --
+  is re-opened in place rather than left retracted. `rule-report-swept`
+  counts the retractions.
 - **A `.txn` file's header carries its transaction-id** (#422). The id
   is written after the commit lock, so nothing new runs inside it and
   the rename stays the commit point. Recovery cross-checks a nonzero
@@ -89,6 +96,27 @@ storage formats (#60).
   warning: there is no inert slot any more.
 
 ### Added
+
+- **Forward evaluation of rules** (#456, design
+  `docs/superpowers/specs/2026-11-04-forward-rules-design.md`). A
+  store that calls `enable-forward-rules` derives at commit: each
+  committed transaction's claim writes become a weighted delta, the
+  strata that read what changed run from it through the fixpoint
+  machinery, and nothing calls `run-rules`. `claim-absent/7` answers
+  the determined absences (standing `:searched-empty` or
+  `:determined-empty`) as the second negation beside `not/1`.
+  `graph-db:*after-commit-hooks*` is the core seam: functions of the
+  committed transaction, called after `with-transaction`'s retry loop
+  outside every lock. `now/1` and `instant-offset/3` let a body state
+  a threshold against the evaluation instant; a forward-enabled store
+  schedules its own re-evaluation at the flip instant. The `graph-db`
+  package now shadows `now`, so the guard resolves the functor rather
+  than local-time's. `def-production` and the stored `production`
+  record add OPS5-style productions on the same machinery: a matching
+  body derives a durable `firing` claim keyed by the premises'
+  identities and the action runs from a salience-ordered agenda.
+  `def-rules-schema` now also declares the `production` record and
+  the `firing` family.
 
 - **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
   subject and object keys, tested with `>/2`'s own predicate as a filter

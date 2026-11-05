@@ -235,7 +235,9 @@ docs/rules.md; GH #304."
   :pathname "rules/"
   :serial t
   :components ((:file "package") (:file "facts") (:file "schema")
-               (:file "compile") (:file "run"))
+               (:file "compile") (:file "run") (:file "delta")
+               (:file "forward") (:file "thresholds")
+               (:file "productions"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test
@@ -247,7 +249,7 @@ docs/rules.md; GH #304."
   :components ((:file "package") (:file "suite") (:file "facts-tests")
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
-               (:file "scope-tests"))
+               (:file "scope-tests") (:file "forward-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)

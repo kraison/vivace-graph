@@ -28,6 +28,7 @@
    #:compiled-rule-relation #:compiled-rule-reads
    #:compiled-rule-negative-reads
    #:compiled-rule-stratum #:compiled-rule-stratum-relations
+   #:compiled-rule-thresholds
    #:rule-compile-error #:rule-compile-error-rule
    #:rule-compile-error-reason
    ;; running (spec §7)
@@ -39,5 +40,20 @@
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
+   #:rule-report-path
    ;; provenance (spec §9)
-   #:premises-of #:dependents-of))
+   #:premises-of #:dependents-of
+   ;; productions (forward-rules design §7, #456)
+   #:def-production #:undef-production #:find-def-production
+   #:production #:make-production #:production-p #:production-name
+   #:production-version #:production-family #:production-body
+   #:production-salience #:production-writes #:production-action
+   #:production-spec #:production-spec-p #:production-spec-salience
+   #:production-spec-writes #:production-spec-action
+   #:compile-production #:compiled-production-p #:run-agenda
+   #:firing #:*production-actions*
+   ;; forward evaluation (forward-rules design, #456)
+   #:claim-delta #:delta-touches-p
+   #:enable-forward-rules #:disable-forward-rules
+   #:forward-rules-enabled-p #:forward-step #:forward-rules-status
+   #:run-forward-strata))

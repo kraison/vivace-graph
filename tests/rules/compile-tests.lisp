@@ -364,3 +364,60 @@ validated at registration."
 (P6), the same refusal as a positive :ANY read."
   (refuses "bind the relation" :name "r" :version "1" :family "rt-claim"
            :head *head-x* :body *body-not-unbound*))
+
+(defparameter *unscanned-head*
+  "(claim ?c rt-claim \"host\" ?h \"unscanned\" nil nil)")
+(defparameter *unscanned-body*
+  "(claim-absent ?a rt-claim \"host\" ?h \"scanned\" ?o ?k)")
+
+(test claim-absent-is-a-positive-read-for-strata
+  "CLAIM-ABSENT/7 reads its relation like CLAIM/7 -- a positive read,
+not a NOT -- and binds a premise (D2)."
+  (with-rules-graph (g)
+    (let ((c (graph-db.rules:compile-rule
+              g (spec :name "unscanned" :version "1" :family "rt-claim"
+                      :head *unscanned-head* :body *unscanned-body*))))
+      (is (member "scanned" (graph-db.rules:compiled-rule-reads c)
+                  :test #'string=))
+      (is (null (graph-db.rules:compiled-rule-negative-reads c)))
+      (is (equal '("?A")
+                 (mapcar #'symbol-name
+                         (graph-db.rules::compiled-rule-premise-vars c)))))))
+
+(defparameter *unbounded-now-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-relation ?p ?x) (now ?t) (instant< ?t ?x)")
+(defparameter *bounded-now-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-recorded-at ?p ?r) (instant-offset ?r \"PT1S\" ?d)
+   (now ?t) (instant>= ?t ?d)")
+
+(test an-unbounded-now-comparison-is-refused-at-compile
+  "Spec §5.2: ?t may only be compared with an instant derived from a
+premise claim, so the flip instant is a function of the premises."
+  (refuses "now" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *unbounded-now-body*)
+  (with-rules-graph (g)
+    (let ((c (graph-db.rules:compile-rule
+              g (spec :name "r" :version "1" :family "rt-claim"
+                      :head *web-hosts-head* :body *bounded-now-body*))))
+      (is (= 1 (length (graph-db.rules:compiled-rule-thresholds c))))
+      (is (eq :gain (second (first
+                             (graph-db.rules:compiled-rule-thresholds
+                              c))))))))
+
+(defparameter *self-feeding-body*
+  "(claim ?a rt-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)")
+
+(test a-production-reading-what-it-writes-is-refused
+  "One stratification graph (spec §7): a production's writes are edges
+to its reads, so reading what it writes is a cycle."
+  (with-rules-graph (g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-production "loop" :version "1"
+             :family rt-claim :body *self-feeding-body*
+             :writes '("hosted-on") :action (lambda (e m) (list e m)))
+           (signals graph-db.rules:rule-compile-error
+             (graph-db.rules:compile-production g "loop")))
+      (graph-db.rules:undef-production "loop"))))

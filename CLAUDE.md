@@ -48,7 +48,8 @@ Three traps when running tests here:
 - **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
   test system's `:perform`, which binds `graph-db::*system-directory*` and
   `graph-db::*type-registry*`; without it every test fails at `make-graph`
-  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`.
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`;
+  on one test of the rules suite, `tests/rules/run-test.sh TEST-NAME`.
 - **The node cache hides identity bugs.** While it is on, two lookups of
   one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
   or CLOS-valued slots passes by accident. A test that depends on two
@@ -135,9 +136,13 @@ Scratch locations differ between the two generations of tests:
     `defvar`ed in `globals.lisp` or earlier in `graph-db.asd`'s chain; a
     later `defvar` leaves those bindings lexical and silently inert
     (`*record-reads*`, GH #92);
-  - FiveAM test names are symbols, and the main suite's files share the
-    `graph-db/test` package, so a reused name silently replaces the first
-    test: grep `tests/` before naming one (90de8e8);
+  - FiveAM test names are symbols, and a suite's files share one package
+    (`graph-db/test`, `graph-db/rules-test`), so a reused name silently
+    replaces the first test, and a reused helper `defun` or
+    `defparameter` replaces the first definition the same way: grep the
+    suite's directory before naming either (90de8e8; a `reaches` helper
+    in `tests/rules/forward-tests.lisp` broke 13 fixpoint tests,
+    2026-11-05);
   - a test that swaps an engine function with `(setf fdefinition)` needs it
     declaimed `notinline`, or ECL compiles same-file calls directly and the
     swap never fires (`mmap.lisp`, 2277ee8);

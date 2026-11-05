@@ -511,6 +511,24 @@ the present instant (GH #388)."
     (when (and c (graph-db.spacetime:claim-current-p c))
       (funcall cont))))
 
+(def-global-prolog-functor claim-absent/7
+    (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
+  "CLAIM/7's routes filtered to the DETERMINED absences: a claim still
+believed (CLAIM-CURRENT-P) whose standing is :SEARCHED-EMPTY or
+:DETERMINED-EMPTY.  The second negation beside NOT/1 (D2, forward-rules
+design §5.1): NOT says no claim is on record, this says somebody looked
+and found nothing.  A positive read for stratification, so a rule may
+say it of its own relation's inputs freely.  The weak absences
+(:UNCOVERED, :INDETERMINATE) are not answers."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil
+               (lambda ()
+                 (let ((c (%claim-arg ?c)))
+                   (when (and c
+                              (graph-db.spacetime:claim-current-p c)
+                              (member (graph-db.spacetime:claim-standing c)
+                                      '(:searched-empty :determined-empty)))
+                     (funcall cont))))))
+
 (defun %instant-arg (x)
   "X as a LOCAL-TIME timestamp: a timestamp passes, an RFC 3339 /
 ISO-8601 string is parsed, an unbound or NIL X is NIL and fails the
@@ -633,6 +651,134 @@ records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
 (%def-instant-compare instant=/2 local-time:timestamp=
   "True when ?A and ?B name the same instant, whatever their spelling
 \(GH #388).")
+
+(defvar *evaluation-instant* nil
+  "The instant NOW/1 answers: bound once per RUN-RULES call and per
+forward step (forward-rules design §5.2), so every rule of a run sees
+one clock; %ST-NOW when nothing bound it.")
+
+(def-global-prolog-functor now/1 (?t cont)
+  "?T is the evaluation instant, as an instant string.  A rule body's
+functor only (*PROLOG-RULE-ONLY-PREDICATES*, query/guard.lisp): the
+compiler admits ?T in comparisons with a claim's instants alone, and
+records each as a threshold (compile.lisp %THRESHOLDS)."
+  (%yield (?t (%instant-string (or *evaluation-instant*
+                                  (graph-db.spacetime::%st-now))))
+    (funcall cont)))
+
+(defun %parse-iso-duration (text)
+  "TEXT, an ISO-8601 duration of weeks, days, hours, minutes and
+seconds (PnW, PnD, PTnH, PTnM, PTnS and their combinations, seconds
+may be decimal), as nanoseconds.  Months and years are refused: they
+are not fixed durations.  Anything else malformed is refused too; both
+as QUERY-PRECONDITION-ERROR."
+  (flet ((refuse (why)
+           (error 'query-precondition-error
+                  :reason (format nil "~S is not a duration this ~
+engine takes: ~A" text why))))
+    (unless (and (stringp text) (> (length text) 1)
+                 (char-equal (char text 0) #\P))
+      (refuse "write PnW, PnD, PTnH, PTnM or PTnS"))
+    (let ((i 1) (n (length text)) (time-part nil) (total 0) (any nil))
+      (loop while (< i n)
+            do (let ((ch (char text i)))
+                 (cond ((char-equal ch #\T)
+                        (when time-part (refuse "two T designators"))
+                        (setf time-part t)
+                        (incf i))
+                       (t
+                        (let ((start i))
+                          (loop while (and (< i n)
+                                           (or (digit-char-p (char text i))
+                                               (char= (char text i) #\.)))
+                                do (incf i))
+                          (when (or (= start i) (>= i n))
+                            (refuse "a number must precede each unit"))
+                          (let* ((num (let ((*read-default-float-format*
+                                              'double-float))
+                                        (read-from-string
+                                         (subseq text start i))))
+                                 (unit (char-upcase (char text i)))
+                                 (per-unit
+                                   (cond ((and (not time-part)
+                                               (char= unit #\W))
+                                          (* 7 86400))
+                                         ((and (not time-part)
+                                               (char= unit #\D))
+                                          86400)
+                                         ((and time-part (char= unit #\H))
+                                          3600)
+                                         ((and time-part (char= unit #\M))
+                                          60)
+                                         ((and time-part (char= unit #\S))
+                                          1)
+                                         ((member unit '(#\Y #\M))
+                                          (refuse "months and years are ~
+not fixed durations"))
+                                         (t (refuse (format nil
+                                                            "unknown unit ~A"
+                                                            unit))))))
+                            (unless (realp num)
+                              (refuse "a number must precede each unit"))
+                            (incf total (* num per-unit 1000000000))
+                            (setf any t)
+                            (incf i)))))))
+      (unless any (refuse "no component"))
+      (round total))))
+
+(def-global-prolog-functor instant-offset/3 (?x ?duration ?y cont)
+  "?Y is instant ?X plus ?DURATION, an ISO-8601 duration string of
+weeks, days, hours, minutes and seconds (%PARSE-ISO-DURATION; months
+and years are refused).  ?X unbound fails; a bound ?Y compares.  The
+instant a threshold flips at is computed this way (forward-rules
+design §5.2)."
+  (let ((x (%instant-arg ?x))
+        (d (%prolog-index-bound ?duration)))
+    (when x
+      (let ((nsec (%parse-iso-duration d)))
+        (%yield (?y (%instant-string
+                     (local-time:timestamp+ x nsec :nsec)))
+          (funcall cont))))))
+
+(defun %fnv-1a-64 (string)
+  "STRING's FNV-1a 64-bit hash over its character codes, as sixteen
+lowercase hex digits: stable across images, no dependency (forward-rules
+design §7, the firing subject key)."
+  (let ((h #xcbf29ce484222325))
+    (loop for ch across string
+          do (setf h (logand #xffffffffffffffff
+                             (* (logxor h (char-code ch))
+                                #x100000001b3))))
+    (format nil "~(~16,'0x~)" h)))
+
+(defun %joined-identity-keys (claims)
+  "CLAIMS' identity keys sorted and joined with |: a production
+instantiation's name in the clear."
+  (format nil "~{~A~^|~}"
+          (sort (mapcar #'graph-db.spacetime:claim-identity-key claims)
+                #'string<)))
+
+(defmacro %def-instantiation-key (n)
+  "INSTANTIATION-KEY/(N+1): ?KEY is the FNV-1a-64 hex of the N premise
+claims' joined identity keys.  The compiler appends this goal to a
+production's body (rules/compile.lisp); one arity per premise count."
+  (let* ((args (loop for i from 1 to n
+                     collect (intern (format nil "?P~D" i))))
+         (name (intern (format nil "INSTANTIATION-KEY/~D" (1+ n)))))
+    `(def-global-prolog-functor ,name (?key ,@args cont)
+       (let ((claims (list ,@(mapcar (lambda (a) `(%claim-arg ,a)) args))))
+         (when (every #'identity claims)
+           (%yield (?key (%fnv-1a-64 (%joined-identity-keys claims)))
+             (funcall cont)))))))
+
+(%def-instantiation-key 1)
+(%def-instantiation-key 2)
+(%def-instantiation-key 3)
+(%def-instantiation-key 4)
+(%def-instantiation-key 5)
+(%def-instantiation-key 6)
+(%def-instantiation-key 7)
+(%def-instantiation-key 8)
 
 (def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601

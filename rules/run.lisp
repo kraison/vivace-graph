@@ -35,6 +35,62 @@ delta variants: the test reference for the semi-naive answer.")
   (:documentation "RUN-RULE's own refusal, caught by RUN-RULE itself and
 turned into a report entry; never escapes."))
 
+(defvar *forward-changes* :off
+  "A list while RUN-FORWARD-STRATA runs a stratum: every (claim .
+weight) the rounds and the reconcile changed -- +1 constructed or
+re-opened, -1 retracted -- pushed here, the next strata's delta
+(forward-rules design §4.3).  :OFF outside forward evaluation.")
+
+(defvar *forward-hook-suppressed* nil
+  "Bound T around a commit forward evaluation itself makes, so the
+post-commit hook does not queue that commit's writes again
+(rules/forward.lisp).")
+
+(defvar *threshold-scheduler* nil
+  "A function of (GRAPH COMPILED-RULES DELTA), set by thresholds.lisp:
+schedules the threshold timers the rules' current matches ask for,
+DELTA restricting the matches to a step's or NIL for every match.
+Called at the end of RUN-RULES and after each stratum a forward step
+ran.")
+
+(defvar *agenda-runner* nil
+  "A function of (GRAPH COMPILED-RULES CHANGES), set by
+productions.lisp: fires the actions for the FIRING claims a step
+changed, CHANGES in arrival order (forward-rules design §7).")
+
+(defvar *agenda-production* nil
+  "The COMPILED-RULE of the production whose action is running, so the
+post-commit hook can check its writes against the declared ones.")
+
+(defun %schedule (graph compiled-rules delta)
+  (when *threshold-scheduler*
+    (funcall *threshold-scheduler* graph compiled-rules delta)))
+
+(defun %note-change (claim weight)
+  "CLAIM changed by WEIGHT, recorded for RUN-FORWARD-STRATA when it is
+listening."
+  (when (listp *forward-changes*)
+    (push (cons claim weight) *forward-changes*)))
+
+(defun %reset-changes ()
+  "Forget the changes noted so far: called at the top of every
+transaction thunk CALL-WITH-TRANSACTION may re-run on a
+VALIDATION-CONFLICT, so an aborted attempt's uncommitted claims never
+reach a later stratum or the agenda (final review, finding 2)."
+  (when (listp *forward-changes*)
+    (setf *forward-changes* '())))
+
+(defun %call-collecting-changes (fn)
+  "FN under a fresh change list: (VALUES FN's-value CHANGES), CHANGES
+in arrival order.  One retried unit of work per call, so %RESET-CHANGES
+inside FN cannot discard a neighbour's changes."
+  (let ((*forward-changes* '()))
+    (let ((value (funcall fn)))
+      (values value (reverse *forward-changes*)))))
+
+(defun %note-changes (changes)
+  (dolist (ch changes) (%note-change (car ch) (cdr ch))))
+
 (defstruct (rule-report (:constructor %make-rule-report))
   "What one RUN-RULE did (spec §7).  OUTCOME is :DERIVED or :REFUSED.
 DERIVED counts claims constructed this run, KEPT the previous
@@ -51,14 +107,20 @@ refusal, else :RULE (compile, effects, ill-typed head), :BUDGET (the
 rails) or :SOLUTIONS (the cap).  INFERENCES is the count at the last
 solution; ELAPSED is seconds.  ROUNDS is the fixpoint rounds a
 recursive stratum ran (1 otherwise), STRATUM the names it ran with
-(GH #333)."
+(GH #333).  PATH is NIL from RUN-RULE and RUN-RULES, and from a forward
+step :FORWARD, :TARGETED or :FULL (forward-rules design §4.2)."
   rule-name version (outcome :derived) (derived 0) (kept 0) (swept 0)
   (disjoint-premises 0) (refusals '()) (inferences 0) (elapsed 0)
-  (rounds 1) (stratum '()))
+  (rounds 1) (stratum '()) (path nil))
 
-(defun rule-producer (name)
-  "The producer string rule NAME writes as: rule/NAME."
-  (format nil "rule/~A" name))
+(defun rule-producer (rule)
+  "The producer string RULE writes as: rule/NAME for a rule, given as
+its spec or its name; production/NAME for a PRODUCTION-SPEC (forward-
+rules design §7)."
+  (cond ((production-spec-p rule)
+         (format nil "production/~A" (rule-spec-name rule)))
+        ((rule-spec-p rule) (format nil "rule/~A" (rule-spec-name rule)))
+        (t (format nil "rule/~A" rule))))
 
 (defun %resolve-rule (graph rule)
   "RULE as a RULE-SPEC: a record or spec passes through; a name finds the
@@ -67,6 +129,9 @@ the common path never names the RULE type, which is no type at all until
 some store has run DEF-RULES-SCHEMA."
   (cond
     ((rule-spec-p rule) rule)
+    ((let ((class (find-class 'production nil)))
+       (and class (typep rule class)))
+     (%production-rule-spec graph (%production-spec-of-record rule)))
     ((stringp rule)
      (let ((stored (and (%graph-declares-p graph 'rule)
                         (first (graph-db:index-lookup
@@ -74,6 +139,9 @@ some store has run DEF-RULES-SCHEMA."
        (cond ((and stored (not (graph-db:deleted-p stored)))
               (rule-spec-of stored))
              ((find-def-rule rule))
+             ((let ((p (or (%stored-production graph rule)
+                           (find-def-production rule))))
+                (and p (%production-rule-spec graph p))))
              (t (error "No rule named ~S in ~(~S~) or the image."
                        rule (graph-db:graph-name graph))))))
     (t (rule-spec-of rule))))
@@ -81,13 +149,16 @@ some store has run DEF-RULES-SCHEMA."
 ;;; Evaluating the body
 
 (defun %solutions (compiled graph report
-                   &optional (goals (compiled-rule-goals compiled)))
+                   &optional (goals (compiled-rule-goals compiled))
+                             (vars (compiled-rule-vars compiled)))
   "Every solution of GOALS -- COMPILED's body by default, or a fixpoint
 round's variant of it (%VARIANTS, GH #333) -- under RUN-QUERY-GOALS'
 rails (spec §7.2, ruling P4): a list of rows aligned with
 COMPILED-RULE-VARS.  SELECT's :SNAPSHOT inherits the open transaction
 on the single-store path and the composed read snapshots on the
-cross-store one (S3-P2).  Refuses past *RULES-MAX-SOLUTIONS*."
+cross-store one (S3-P2).  Refuses past *RULES-MAX-SOLUTIONS*.  VARS,
+the variables a row carries, is COMPILED's by default; the threshold
+scheduler asks for others."
   (let ((max-inferences (or *rules-max-inferences*
                             graph-db::*query-default-max-inferences*))
         (timeout (or *rules-timeout* graph-db::*query-default-timeout*))
@@ -101,7 +172,7 @@ ruling P4)."))
           (graph-db::*query-default-timeout* timeout)
           (graph-db::*query-default-limit* cap))
       (graph-db::run-query-goals
-       (compiled-rule-vars compiled) goals graph
+       vars goals graph
        :limit cap :format :raw
        :callback (lambda (row)
                    (setf (rule-report-inferences report)
@@ -157,6 +228,44 @@ DISJOINT-P when they never held at once."
                 (when (null acc)
                   (return (values nil t)))))))))
 
+(defun %threshold-bound (direction instant)
+  "The validity a threshold adds (spec §5.2): from INSTANT on for a
+gain, until it for a loss."
+  (ecase direction
+    (:gain (temporal-extent:make-interval
+            (temporal-extent:exact-bound instant)
+            (temporal-extent:unknown-bound)
+            :semantics :validity :standing :inferred))
+    (:loss (temporal-extent:make-interval
+            (temporal-extent:unknown-bound)
+            (temporal-extent:exact-bound instant)
+            :semantics :validity :standing :inferred))))
+
+(defun %solution-extent (compiled premises policy row vars)
+  "%PREMISE-EXTENT, then each threshold's bound intersected in for a
+temporal family under :PREMISES (spec §5.2): a gain's flip instant is
+the validity start, a loss's the end.  (VALUES EXTENT DISJOINT-P)."
+  (multiple-value-bind (extent disjoint-p) (%premise-extent premises policy)
+    (if (or disjoint-p
+            (eq policy :none)
+            (null (compiled-rule-thresholds compiled))
+            (not (graph-db.spacetime:claim-family-temporal-p
+                  (compiled-rule-family compiled))))
+        (values extent disjoint-p)
+        (dolist (th (compiled-rule-thresholds compiled) (values extent nil))
+          (let* ((at (graph-db::%instant-arg
+                      (%term-value (sixth th) row vars)))
+                 (bound (and at (%threshold-bound (second th) at))))
+            (when bound
+              (setf extent
+                    (if extent
+                        (temporal-extent:extent-intersection
+                         extent bound :semantics :validity
+                                      :standing :inferred)
+                        bound))
+              (when (null extent)
+                (return (values nil t)))))))))
+
 (defun %dedupe-key (family sns skey rel ons okey extent)
   "The derived claim's identity, as spec §7.3 collapses duplicates on:
 the endpoints and relation, plus the extent START for a temporal family
@@ -209,16 +318,17 @@ spacetime/claim.lisp)."
 
 (defun %refresh-kept (claim version extent &optional (method nil methodp))
   "CLAIM brought to the current derivation's VERSION, EXTENT and -- when
-METHOD is supplied -- METHOD, by ONE copy and save when any differs; the
-saved copy, else CLAIM.  EXTENT is what this run would derive, NIL under
-:EXTENT-POLICY :NONE and for a DERIVED-FROM record.  A kept temporal
-claim's extent START cannot move -- the dedupe key carries it -- but its
-END can, and a refreshed extent can then overlap a sibling run, which
-%VALIDATE-EXTENT-DISJOINTNESS refuses at commit like any other (#331,
-docs/rules.md).  METHOD is refreshed rather than the record swept and
-rewritten: MARK-DELETED releases a unique key only post-durability while
-VALIDATE-UNIQUE-CONSTRAINTS runs pre-durability, so a sweep and a
-re-insert of one identity in a transaction always collide (ruling P10)."
+METHOD is supplied -- METHOD, and RE-OPENED if it was retracted, by ONE
+copy and save when any differs; the saved copy, else CLAIM.  EXTENT is
+what this run would derive, NIL under :EXTENT-POLICY :NONE and for a
+DERIVED-FROM record.  A kept temporal claim's extent START cannot move
+-- the dedupe key carries it -- but its END can, and a refreshed extent
+can then overlap a sibling run, which %VALIDATE-EXTENT-DISJOINTNESS
+refuses at commit like any other (#331, docs/rules.md).  The re-open is
+D4 of the forward-rules design (§4.2): a derivation the rule supports
+is believed, whoever retracted it; REGISTER-NODE re-opens the same way.
+METHOD is refreshed rather than the record swept and rewritten, since a
+sweep keeps the identity occupied (ruling P10, D4)."
   (let* ((sexp (and extent (graph-db.spacetime:extent->sexp extent)))
          (extent-moved
            (not (equal (%extent-sexp-key sexp)
@@ -230,8 +340,9 @@ re-insert of one identity in a transaction always collide (ruling P10)."
          (method-moved
            (and methodp
                 (not (equal method
-                            (graph-db.spacetime:claim-method claim))))))
-    (if (not (or extent-moved version-moved method-moved))
+                            (graph-db.spacetime:claim-method claim)))))
+         (retracted (not (graph-db.spacetime:claim-current-p claim))))
+    (if (not (or extent-moved version-moved method-moved retracted))
         claim
         (let ((c (graph-db:copy claim)))
           (when version-moved
@@ -240,8 +351,21 @@ re-insert of one identity in a transaction always collide (ruling P10)."
             (setf (graph-db.spacetime:claim-extent c) extent))
           (when method-moved
             (setf (graph-db.spacetime:claim-method c) method))
+          (when retracted
+            (setf (graph-db.spacetime:claim-transaction-extent-sexp c)
+                  (graph-db.spacetime:extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent
+                    (graph-db.spacetime::%st-now)))))
           (graph-db:save c)
           c))))
+
+(defun %current-first (claims)
+  "CLAIMS with the current ones ahead of the retracted, order otherwise
+kept: a reconcile that meets a current claim and a retracted twin of one
+identity keeps the current one and leaves the other alone (D4)."
+  (stable-sort (copy-list claims)
+               (lambda (a b) (and a (not b)))
+               :key #'graph-db.spacetime:claim-current-p))
 
 (defun %store-name (graph)
   "GRAPH's name as a DERIVED-FROM record's METHOD carries it: the
@@ -359,7 +483,7 @@ since a cross-store run evaluates once and reconciles per attempt."
                                row vars)
                               "object"))))
         (multiple-value-bind (extent disjoint-p)
-            (%premise-extent premises policy)
+            (%solution-extent compiled premises policy row vars)
           (if disjoint-p
               (incf (rule-report-disjoint-premises report))
               ;; The refs after %PREMISE-EXTENT and inside the
@@ -385,26 +509,37 @@ since a cross-store run evaluates once and reconciles per attempt."
                       (push key order))))))))
     (values claims (nreverse order))))
 
-(defun %reconcile-claims (compiled graph report desired order)
-  "Ruling P10, inside the transaction: the producer's existing claims
-kept when re-derived -- with the version AND the extent this run
-derives, since neither is part of every identity -- deleted when not;
-new identities constructed.  => an alist of (dedupe key . claim) for
-every claim of the derivation that now stands."
+(defun %reconcile-claims (compiled graph report desired order
+                          &key (sweep-keys nil sweep-p))
+  "Ruling P10 under D4, inside the transaction: the producer's existing
+claims kept when re-derived -- with the version AND the extent this run
+derives, since neither is part of every identity, and re-opened if
+retracted -- RETRACTED when not (never deleted: the record stays and
+DEPENDENTS-OF still answers), a retracted claim no longer derived left
+as it is and counted nowhere; new identities constructed.  With
+SWEEP-KEYS, an EQUAL hash of dedupe keys, only a claim under one of
+them is a candidate for retraction: forward evaluation derived
+DESIRED from a delta, not from the whole store, so a claim it did not
+meet is not thereby lost (forward-rules design §4.1; an empty table
+sweeps nothing).  => (VALUES STANDING SWEPT): an alist of (dedupe key
+. claim) for every claim of the derivation that now stands, and the
+claims retracted here."
   ;; CLAIMS-BY-PRODUCER overlays the open transaction's writes (GH
   ;; #324), so the producer's claims must be read BEFORE this function
   ;; writes any: the reconcile compares against the committed set.
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
-         (producer (rule-producer (rule-spec-name spec)))
+         (producer (rule-producer spec))
          (version (rule-spec-version spec))
          (parent (graph-db.spacetime:claim-family-parent family))
          ;; SEEN, not an ASSOC over STANDING: *RULES-MAX-SOLUTIONS* is
          ;; 100000, and the alist scan would be quadratic in it.
          (seen (make-hash-table :test 'equal))
-         (standing '()))
-    (dolist (c (graph-db.spacetime:claims-by-producer graph parent
-                                                      producer))
+         (standing '())
+         (swept '()))
+    (dolist (c (%current-first
+                (graph-db.spacetime:claims-by-producer graph parent
+                                                       producer)))
       (let ((key (%existing-key c family)))
         (cond ((and (nth-value 1 (gethash key desired))
                     (not (gethash key seen)))
@@ -413,13 +548,17 @@ every claim of the derivation that now stands."
                ;; The extent %DESIRED holds for this key, i.e. the FIRST
                ;; solution's where several collapsed (ruling T4-R3) --
                ;; what a fresh construction would have used.
-               (push (cons key (%refresh-kept
-                                c version
-                                (getf (car (gethash key desired))
-                                      :extent)))
-                     standing))
-              (t
-               (graph-db:mark-deleted c)
+               (let ((was-current (graph-db.spacetime:claim-current-p c))
+                     (kept (%refresh-kept
+                            c version
+                            (getf (car (gethash key desired)) :extent))))
+                 (unless was-current (%note-change kept 1))
+                 (push (cons key kept) standing)))
+              ((and (graph-db.spacetime:claim-current-p c)
+                    (or (not sweep-p) (gethash key sweep-keys)))
+               (let ((r (graph-db.spacetime:retract-claim c)))
+                 (%note-change r -1)
+                 (push r swept))
                (incf (rule-report-swept report))))))
     (let ((ctor (%constructor family (compiled-rule-unary-p compiled))))
       (dolist (key order)
@@ -431,22 +570,39 @@ every claim of the derivation that now stands."
                               (car (gethash key desired)))))
             (incf (rule-report-derived report))
             (setf (gethash key seen) t)
+            (%note-change claim 1)
             (push (cons key claim) standing)))))
-    standing))
+    (values standing swept)))
 
-(defun %reconcile-provenance (compiled graph desired standing)
-  "Spec §9 under ruling P10: one DERIVED-FROM record per (derived claim,
-premise) the derivation now asks for, its METHOD the premise's store
-name and NIL for the rule's own store (spec §10); records the producer
-wrote that it no longer asks for are deleted, the rest kept with their
-RULE-VERSION and METHOD refreshed -- a premise that moved store renames
-its record rather than being swept and rewritten, which would collide
-on the family's unique key (%REFRESH-KEPT)."
+(defun %reconcile-provenance (compiled graph desired standing
+                              &key (sweep-keys nil sweep-p) swept)
+  "Spec §9 under ruling P10 and D4: one DERIVED-FROM record per (derived
+claim, premise) the derivation now asks for, its METHOD the premise's
+store name and NIL for the rule's own store (spec §10); records the
+producer wrote that it no longer asks for are RETRACTED with their
+claim, the rest kept -- re-opened if retracted -- with their
+RULE-VERSION and METHOD refreshed (%REFRESH-KEPT).  SWEEP-KEYS and
+SWEPT as %RECONCILE-CLAIMS has them: with SWEEP-KEYS, a record is a
+candidate for retraction only when its derived claim is in STANDING
+under a sweep key or among SWEPT; records of other claims are kept
+as they are and wanted ones still added -- DESIRED is then partial and
+a record it does not name may still be supported (§4.1)."
   (let* ((spec (compiled-rule-spec compiled))
-         (producer (rule-producer (rule-spec-name spec)))
+         (producer (rule-producer spec))
          (version (rule-spec-version spec))
          (wanted (make-hash-table :test 'equal))
-         (kept (make-hash-table :test 'equal)))
+         (kept (make-hash-table :test 'equal))
+         (touched (make-hash-table :test 'equal)))
+    (when sweep-p
+      (loop for (key . claim) in standing
+            when (gethash key sweep-keys)
+              do (setf (gethash (graph-db.spacetime:claim-identity-key
+                                 claim)
+                                touched)
+                       t))
+      (dolist (c swept)
+        (setf (gethash (graph-db.spacetime:claim-identity-key c) touched)
+              t)))
     (loop for (key . claim) in standing
           for derived-key = (graph-db.spacetime:claim-identity-key claim)
           do (dolist (p (cdr (gethash key desired)))
@@ -460,20 +616,25 @@ on the family's unique key (%REFRESH-KEPT)."
     ;; One record per pair: a pair already kept is a duplicate and goes
     ;; with the records the derivation no longer asks for, as does a
     ;; record under this producer that is not a DERIVED-FROM at all.
-    (dolist (r (graph-db.spacetime:claims-by-producer graph 'derivation
-                                                      producer))
+    (dolist (r (%current-first
+                (graph-db.spacetime:claims-by-producer graph 'derivation
+                                                       producer)))
       (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
                         (graph-db.spacetime:claim-object-key r))))
         (multiple-value-bind (name wanted-p) (gethash pair wanted)
-          (if (and wanted-p
-                   (not (gethash pair kept))
-                   (string= "derived-from"
-                            (graph-db.spacetime:claim-relation r)))
-              (progn (setf (gethash pair kept) t)
-                     ;; No extent on a DERIVATION record, ever; NIL never
-                     ;; differs from the NIL it stores.
-                     (%refresh-kept r version nil name))
-              (graph-db:mark-deleted r)))))
+          (cond ((and wanted-p
+                      (not (gethash pair kept))
+                      (string= "derived-from"
+                               (graph-db.spacetime:claim-relation r)))
+                 (setf (gethash pair kept) t)
+                 ;; No extent on a DERIVATION record, ever; NIL never
+                 ;; differs from the NIL it stores.
+                 (%refresh-kept r version nil name))
+                ((and (graph-db.spacetime:claim-current-p r)
+                      (or (not sweep-p)
+                          (gethash (graph-db.spacetime:claim-subject-key r)
+                                   touched)))
+                 (graph-db.spacetime:retract-claim r))))))
     (maphash (lambda (pair name)
                (unless (gethash pair kept)
                  (make-derivation-binary
@@ -497,9 +658,10 @@ is %DESIRED's for the same reason."
   (setf (rule-report-derived report) 0
         (rule-report-kept report) 0
         (rule-report-swept report) 0)
-  (let ((standing (%reconcile-claims compiled graph report desired
-                                     order)))
-    (%reconcile-provenance compiled graph desired standing)
+  (%reset-changes)
+  (multiple-value-bind (standing swept)
+      (%reconcile-claims compiled graph report desired order)
+    (%reconcile-provenance compiled graph desired standing :swept swept)
     report))
 
 ;;; Refusals
@@ -553,9 +715,14 @@ share (M2), so the two can never disagree."
        (member (sixth goal) own :test #'string=)
        (%variable-p (second goal))))
 
-(defun %variants (compiled)
+(defun %variants (compiled &key all-goals
+                             (goals (compiled-rule-goals compiled)))
   "One goal list per recursive CLAIM/7 goal of COMPILED
-(%RECURSIVE-GOAL-P): a RULE-DELTA/2 generator for that goal's ?c, then
+(%RECURSIVE-GOAL-P) -- or, with ALL-GOALS, per CLAIM/7 and
+CLAIM-ABSENT/7 goal with a plain variable ?c and a string relation,
+whatever stratum it reads, which is how forward evaluation answers a
+body from a commit's delta (forward-rules design §4.1): a RULE-DELTA/2
+generator for that goal's ?c, then
 the goal itself, then every OTHER goal in its original relative order.
 The substituted goal runs FIRST, not merely before its own original
 position: with ?c bound by the generator it is a node-bound filter
@@ -566,11 +733,14 @@ unbound one would otherwise reach %UNBOUND-CLAIM-SCAN before the
 substitution ever runs (I1, GH #333).  NIL when COMPILED has no
 recursive goal."
   (let ((own (compiled-rule-stratum-relations compiled))
-        (goals (compiled-rule-goals compiled))
         (variants '()))
     (loop for goal in goals
           for i from 0
-          when (%recursive-goal-p goal own)
+          when (if all-goals
+                   (and (%claim-read-goal-p goal)
+                        (stringp (sixth goal))
+                        (%variable-p (second goal)))
+                   (%recursive-goal-p goal own))
             do (push (list* (list 'graph-db::rule-delta
                                   (second goal) (sixth goal))
                            goal
@@ -628,8 +798,7 @@ derives from it, and the extent it was first derived with may no
 longer be the one its own premises give (I1)."
   (let ((ctor (%constructor (compiled-rule-family compiled)
                             (compiled-rule-unary-p compiled)))
-        (producer (rule-producer (rule-spec-name
-                                  (compiled-rule-spec compiled))))
+        (producer (rule-producer (compiled-rule-spec compiled)))
         (version (rule-spec-version (compiled-rule-spec compiled)))
         (constructed 0))
     (values
@@ -637,7 +806,12 @@ longer be the one its own premises give (I1)."
                (let ((args (car (gethash key desired)))
                      (have (gethash key existing)))
                  (if have
-                     (%refresh-kept have version (getf args :extent))
+                     (let ((was-current
+                             (graph-db.spacetime:claim-current-p have))
+                           (kept (%refresh-kept have version
+                                                (getf args :extent))))
+                       (unless was-current (%note-change kept 1))
+                       kept)
                      (let ((claim (apply ctor :graph graph
                                          :relation
                                          (compiled-rule-relation compiled)
@@ -646,6 +820,7 @@ longer be the one its own premises give (I1)."
                                          :standing :inferred
                                          args)))
                        (incf constructed)
+                       (%note-change claim 1)
                        claim))))
              new-keys)
      constructed)))
@@ -740,7 +915,7 @@ constructing, and what %RECONCILE-CLAIMS later sweeps or keeps
         (spec (compiled-rule-spec compiled)))
     (dolist (c (graph-db.spacetime:claims-by-producer
                 graph (graph-db.spacetime:claim-family-parent family)
-                (rule-producer (rule-spec-name spec))))
+                (rule-producer spec)))
       (setf (gethash (%existing-key c family) existing) c))
     existing))
 
@@ -763,7 +938,7 @@ GH #333)."
         (setf (rule-report-derived r) 0))
       (setf (rule-report-refusals r) (list (cons tag text))))))
 
-(defun %run-stratum (graph stratum scope)
+(defun %run-stratum (graph stratum scope &key forward-delta)
   "STRATUM (compiled rules sharing a recursive stratum) to its fixpoint
 (spec §3): a recomputation reads base facts plus the delta, never the
 stratum's own prior output, since that output is exactly what this
@@ -814,15 +989,25 @@ claims standing and DERIVED counting them, but KEPT and SWEPT report 0
 -- FINISH-RUN's reconcile, the only place either is set, is itself
 inside the transaction that just unwound (I3); the report's ROUNDS
 names how many rounds ran.  => one RULE-REPORT per rule of STRATUM, in
-its input order."
+its input order.
+
+FORWARD-DELTA (forward-rules design §4.1) is a relation -> claims
+table, a commit's +1 claims: round 0's delta is it instead of the base
+facts, every rule runs its ALL-GOALS variants in every round (so a
+solution is one that names at least one delta claim), no producer is
+excluded (the stratum's prior output is what a body reads), and the
+reconcile sweeps nothing (:SWEEP-KEYS an empty table) -- what the
+delta did not reach is not thereby lost.  Non-recursive strata take
+this path too; a non-recursive rule's rounds end when the delta of its
+own relations is empty."
   (let* ((foreign (rest scope))
+         (forward-sweep (and forward-delta
+                             (make-hash-table :test 'equal)))
          ;; (PRODUCER . RELATION) pairs: the exclusion is scoped to the
          ;; relation each producer derives, so a body reading a stratum
          ;; producer's DERIVATION records still sees them (M3).
          (producers (mapcar (lambda (c)
-                              (cons (rule-producer
-                                     (rule-spec-name
-                                      (compiled-rule-spec c)))
+                              (cons (rule-producer (compiled-rule-spec c))
                                     (compiled-rule-relation c)))
                             stratum))
          ;; Built once, before the retried thunk: a signal while
@@ -887,7 +1072,8 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
            (goal-lists (run)
              (let* ((c (%stratum-run-compiled run))
                     (variants (%variants c)))
-               (cond (*rules-naive-rounds*
+               (cond (forward-delta (%variants c :all-goals t))
+                     (*rules-naive-rounds*
                       (list (compiled-rule-goals c)))
                      (variants variants)
                      ((zerop round) (list (compiled-rule-goals c)))
@@ -896,9 +1082,11 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              (let ((graph-db::*claim-scope* scope)
                    (graph-db:*rule-delta* delta)
                    (graph-db::*claim-exclude-producers*
-                     (unless *rules-naive-rounds* producers))
+                     (unless (or forward-delta *rules-naive-rounds*)
+                       producers))
                    (graph-db::*claim-derived-this-run*
-                     (unless *rules-naive-rounds* derived-table)))
+                     (unless (or forward-delta *rules-naive-rounds*)
+                       derived-table)))
                (%desired (%stratum-run-compiled run) graph
                          (%stratum-run-report run) goals)))
            (per-rule (run thunk)
@@ -976,9 +1164,11 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              ;; still sees the facts its closure starts from (C1).
              ;; Inside EVALUATE-ROUND, hence under the cross-store
              ;; path's snapshots, like the evaluation that reads it.
-             (when (and (zerop round) (not *rules-naive-rounds*))
-               (setf delta (%stratum-base-facts scope stratum
-                                                producers)))
+             (when (zerop round)
+               (cond (forward-delta (setf delta forward-delta))
+                     ((not *rules-naive-rounds*)
+                      (setf delta (%stratum-base-facts scope stratum
+                                                       producers)))))
              (evaluate-phase))
            (one-round ()
              (let* ((base-derived
@@ -1004,15 +1194,20 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
               (lambda ()
                 ;; I4: provenance in the SAME per-rule step as
                 ;; reconcile, so a refusal in either is tagged.
-                (let ((standing
-                        (%reconcile-claims
+                (multiple-value-bind (standing swept)
+                    (apply #'%reconcile-claims
+                           (%stratum-run-compiled run) graph
+                           (%stratum-run-report run)
+                           (%stratum-run-desired run)
+                           (%stratum-run-order run)
+                           (and forward-sweep
+                                (list :sweep-keys forward-sweep)))
+                  (apply #'%reconcile-provenance
                          (%stratum-run-compiled run) graph
-                         (%stratum-run-report run)
-                         (%stratum-run-desired run)
-                         (%stratum-run-order run))))
-                  (%reconcile-provenance
-                   (%stratum-run-compiled run) graph
-                   (%stratum-run-desired run) standing))))
+                         (%stratum-run-desired run) standing
+                         :swept swept
+                         (and forward-sweep
+                              (list :sweep-keys forward-sweep))))))
              ;; %RECONCILE-CLAIMS' own pass counts every desired key
              ;; already standing (via CLAIMS-BY-PRODUCER, GH #324) as
              ;; KEPT -- including a key %ROUND-DELTA constructed
@@ -1028,6 +1223,7 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              ;; cross-store per-round reset), so a VALIDATION-CONFLICT
              ;; retry starts genuinely from scratch.
              (mapc #'reset-run runs)
+             (%reset-changes)
              (setf derived-table (make-hash-table :test 'equal)
                    round 0
                    delta nil)
@@ -1097,7 +1293,10 @@ caller's transaction) signals."
          (report (%make-rule-report :rule-name (rule-spec-name spec)
                                     :version (rule-spec-version spec)))
          (start (get-internal-real-time))
-         (compiled nil))
+         (compiled nil)
+         (graph-db::*evaluation-instant*
+           (or graph-db::*evaluation-instant*
+               (graph-db.spacetime::%st-now))))
     (%check-no-foreign-read-in-transaction "RUN-RULE" foreign)
     (flet ((refuse (tag text)
              (setf (rule-report-outcome report) :refused
@@ -1251,7 +1450,10 @@ where the store carries its family (ruling P8).  A def-rule the store
 cannot run is skipped silently rather than reported -- it is not this
 store's rule, and its text names types this schema does not have."
   (or (eq (rule-spec-source spec) :stored)
-      (%graph-declares-p graph (rule-spec-family spec))))
+      (and (%graph-declares-p graph (rule-spec-family spec))
+           (or (not (production-spec-p spec))
+               (%graph-declares-p graph
+                                  (production-spec-source-family spec))))))
 
 (defun %strata-of (compiled-rules)
   "COMPILED-RULES grouped by stratum, input order kept inside and
@@ -1330,7 +1532,9 @@ single-store, so a cycle through another store's rules is not
 detected (S3-P5)."
   (let ((scope (%normalize-scope graph scope))
         (reports '())
-        (compiled '()))
+        (compiled '())
+        (graph-db::*evaluation-instant*
+          (or graph-db::*evaluation-instant* (graph-db.spacetime::%st-now))))
     (dolist (spec (rules-in-scope graph))
       (when (%runnable-spec-p graph spec)
         (handler-case (push (compile-rule graph spec) compiled)
@@ -1342,7 +1546,8 @@ detected (S3-P5)."
                    :refusals (list (cons :rule
                                          (rule-compile-error-reason c))))
                   reports)))))
-    (dolist (stratum (%strata-order (nreverse compiled)))
+    (setf compiled (nreverse compiled))
+    (dolist (stratum (%strata-order compiled))
       ;; SOME, not just the first rule: a genuine cycle's every member
       ;; individually meets %COMPILED-RECURSIVE-P (each reads something
       ;; the cycle derives), but a stratum can also hold unrelated
@@ -1352,7 +1557,285 @@ detected (S3-P5)."
           (dolist (c stratum)
             (push (run-rule graph (compiled-rule-spec c) :scope scope)
                   reports))))
+    ;; Forward mode's timers follow every full run (spec §5.2).
+    (%schedule graph compiled nil)
     (nreverse reports)))
+
+;;; Forward evaluation (forward-rules design §4; rules/forward.lisp)
+
+(defun %delta-touch (stratum delta)
+  "How a commit's DELTA (relation -> list of (claim . weight)) touches
+STRATUM: :FORWARD when every touch is on a bound positive read (a +1
+runs the delta variants, a -1 the targeted re-derivation, §4.2), :FULL
+when any touch is on a NOT or on a rule reading :ANY relation, NIL
+when it reads nothing the delta names.  A recursive stratum touched by
+a -1 is promoted to :FULL by the caller."
+  (let ((mode nil)
+        (producers (%stratum-producers stratum)))
+    (dolist (c stratum mode)
+      (let ((reads (compiled-rule-reads c))
+            (negative (compiled-rule-negative-reads c)))
+        (loop for rel being the hash-keys of delta
+                using (hash-value entries)
+              do (let ((positive (or (eq reads :any)
+                                     (member rel reads :test #'string=)))
+                       (negated (or (eq negative :any)
+                                    (member rel negative
+                                            :test #'string=))))
+                   (cond ((or negated (and positive (eq reads :any)))
+                          (return-from %delta-touch :full))
+                         ;; A lost claim this stratum itself derived
+                         ;; (a hand retraction) is re-checked (§4.2).
+                         ((or positive
+                              (some (lambda (e)
+                                      (and (minusp (cdr e))
+                                           (member
+                                            (graph-db.spacetime:claim-producer
+                                             (car e))
+                                            producers :test #'string=)))
+                                    entries))
+                          (setf mode :forward)))))))))
+
+(defun %stratum-producers (stratum)
+  (mapcar (lambda (c) (rule-producer (compiled-rule-spec c)))
+          stratum))
+
+(defun %stratum-positive-reads (stratum)
+  "The relations STRATUM's rules read positively; none is :ANY on the
+forward path."
+  (remove-duplicates (loop for c in stratum
+                           for reads = (compiled-rule-reads c)
+                           when (listp reads) append reads)
+                     :test #'string=))
+
+(defun %positive-delta (delta relations)
+  "DELTA's +1 claims under RELATIONS as the relation -> claims table
+RULE-DELTA/2 reads."
+  (let ((table (make-hash-table :test 'equal)))
+    (maphash (lambda (rel entries)
+               (when (member rel relations :test #'string=)
+                 (let ((claims (loop for (claim . w) in entries
+                                     when (plusp w) collect claim)))
+                   (when claims (setf (gethash rel table) claims)))))
+             delta)
+    table))
+
+(defun %negative-claims (delta relations producers)
+  "DELTA's -1 claims under RELATIONS, plus those one of PRODUCERS
+derived whatever their relation."
+  (loop for rel being the hash-keys of delta using (hash-value entries)
+        append (loop for (claim . w) in entries
+                     when (and (minusp w)
+                               (or (member rel relations :test #'string=)
+                                   (member (graph-db.spacetime:claim-producer
+                                            claim)
+                                           producers :test #'string=)))
+                       collect claim)))
+
+(defun %head-binding-goals (compiled claim)
+  "Goals binding COMPILED's head variables to CLAIM's endpoints, so the
+body re-derives that one identity: =/2 on each variable term, a
+literal term left to the head's own check."
+  (let ((goals '()))
+    (flet ((bind (term value)
+             (when (and term (%variable-p term))
+               (push (list '= term value) goals))))
+      (bind (compiled-rule-head-sns compiled)
+            (graph-db.spacetime:claim-subject-namespace claim))
+      (bind (compiled-rule-head-skey compiled)
+            (graph-db.spacetime:claim-subject-key claim))
+      (unless (compiled-rule-unary-p compiled)
+        (bind (compiled-rule-head-ons compiled)
+              (graph-db.spacetime:claim-object-namespace claim))
+        (bind (compiled-rule-head-okey compiled)
+              (graph-db.spacetime:claim-object-key claim))))
+    goals))
+
+(defun %rederive-dependents (graph compiled claims)
+  "Spec §4.2 case (a), the targeted path: each of CLAIMS -- derived
+claims of COMPILED's producer that cite a retracted premise, or are
+themselves retracted -- re-derived with its head bound, then kept
+(re-opened when retracted), or retracted when nothing supports it
+now; provenance reconciled for these claims alone (:SWEEP-KEYS).  One
+transaction; a refusal is reported as RUN-RULE reports one.  =>
+RULE-REPORT with PATH :TARGETED."
+  (let* ((spec (compiled-rule-spec compiled))
+         (family (compiled-rule-family compiled))
+         (report (%make-rule-report :rule-name (rule-spec-name spec)
+                                    :version (rule-spec-version spec)
+                                    :stratum (compiled-rule-stratum
+                                              compiled)
+                                    :path :targeted))
+         (start (get-internal-real-time)))
+    (flet ((refuse (tag text)
+             (setf (rule-report-outcome report) :refused
+                   (rule-report-derived report) 0
+                   (rule-report-kept report) 0
+                   (rule-report-swept report) 0
+                   (rule-report-refusals report) (list (cons tag text)))))
+      (handler-case
+          (graph-db:with-transaction (:graph graph)
+            (setf (rule-report-derived report) 0
+                  (rule-report-kept report) 0
+                  (rule-report-swept report) 0)
+            (%reset-changes)
+            (let ((desired (make-hash-table :test 'equal))
+                  (order '())
+                  (tail nil)
+                  (sweep (make-hash-table :test 'equal))
+                  (inferences 0)
+                  (graph-db::*claim-scope* (list graph)))
+              (dolist (c claims)
+                (setf (gethash (%existing-key c family) sweep) t)
+                (multiple-value-bind (table keys)
+                    (%desired compiled graph report
+                              (append (%head-binding-goals compiled c)
+                                      (compiled-rule-goals compiled)))
+                  (incf inferences (rule-report-inferences report))
+                  (multiple-value-bind (head new-tail)
+                      (%merge-desired desired order tail table keys)
+                    (setf order head
+                          tail new-tail))))
+              (setf (rule-report-inferences report) inferences)
+              (multiple-value-bind (standing swept)
+                  (%reconcile-claims compiled graph report desired order
+                                     :sweep-keys sweep)
+                (%reconcile-provenance compiled graph desired standing
+                                       :sweep-keys sweep :swept swept))))
+        (rule-run-refusal (c)
+          (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c)))
+        (graph-db:prolog-permission-error (c)
+          (refuse :rule (princ-to-string c)))
+        (graph-db:prolog-error (c)
+          (refuse :budget (princ-to-string c)))
+        (graph-db.spacetime:missing-claim-identity-component (c)
+          (refuse (graph-db.spacetime:claim-family-parent family)
+                  (princ-to-string c)))
+        (graph-db:constraint-violation (c)
+          (refuse (%violation-family c) (princ-to-string c)))
+        (graph-db:query-precondition-error (c)
+          (refuse :rule (princ-to-string c)))))
+    (setf (rule-report-elapsed report)
+          (/ (- (get-internal-real-time) start)
+             (float internal-time-units-per-second 1.0d0)))
+    report))
+
+(defun %targeted-reports (graph stratum lost)
+  "The targeted path over LOST, the -1 claims touching STRATUM's
+positive reads: for each rule, the claims it derived that cite one of
+them (DEPENDENTS-OF, filtered to the rule's producer) plus any of LOST
+the rule itself produced -- a hand-retracted derived claim, re-checked
+and re-opened when still supported (Review Focus 2).  => one report
+per rule with something to re-derive."
+  (let ((reports '()))
+    (dolist (c stratum (nreverse reports))
+      (let* ((producer (rule-producer (compiled-rule-spec c)))
+             (seen (make-hash-table :test 'equalp))
+             (claims '()))
+        (flet ((take (d)
+                 (when (and (string= producer
+                                     (graph-db.spacetime:claim-producer d))
+                            (not (gethash (graph-db:id d) seen)))
+                   (setf (gethash (graph-db:id d) seen) t)
+                   (push d claims))))
+          (dolist (p lost)
+            (take p)
+            (mapc #'take (dependents-of graph p))))
+        (when claims
+          (multiple-value-bind (report changes)
+              (%call-collecting-changes
+               (lambda () (%rederive-dependents graph c (nreverse claims))))
+            (%note-changes changes)
+            (push report reports)))))))
+
+(defun %merge-delta (delta changes)
+  "DELTA plus CHANGES, a list of (claim . weight), each under its
+claim's relation; a fresh table."
+  (let ((table (make-hash-table :test 'equal)))
+    (maphash (lambda (rel entries) (setf (gethash rel table) entries))
+             delta)
+    (dolist (change changes table)
+      (push change (gethash (graph-db.spacetime:claim-relation
+                             (car change))
+                            table)))))
+
+(defun run-forward-strata (graph compiled-rules delta)
+  "One forward step over COMPILED-RULES for DELTA, a commit's claim
+writes as CLAIM-DELTA renders them (forward-rules design §4.3): strata
+in dependency order, each one DELTA touches run -- the -1 claims
+through the targeted path (%TARGETED-REPORTS, §4.2 case a), the +1
+claims through %RUN-STRATUM with them as the delta, when every touch is
+on a positive read; the full path (RUN-RULE, or %RUN-STRATUM for a
+recursive stratum) for a NOT, an unbound read or a recursive stratum
+that lost a premise (§4.2 cases b and c) -- and what a stratum derived,
+re-opened or retracted joins the delta the later strata see.  A
+refused stratum contributes nothing.  Each stratum commits its own
+transaction, as RUN-RULES does; those commits are hidden from the
+post-commit hook.  => the RULE-REPORTs, in the order run."
+  (let ((reports '())
+        (pending delta)
+        (all-changes '())
+        (scope (%normalize-scope graph nil))
+        (*forward-hook-suppressed* t))
+    (dolist (stratum (%strata-order compiled-rules)
+                     (progn
+                       ;; §7: the agenda, after the strata, outside the
+                       ;; suppression so an action's commit queues.
+                       (when (and *agenda-runner* all-changes)
+                         (let ((*forward-hook-suppressed* nil))
+                           (funcall *agenda-runner* graph compiled-rules
+                                    (nreverse all-changes))))
+                       (nreverse reports)))
+      (let* ((mode (%delta-touch stratum pending))
+             (reads (%stratum-positive-reads stratum))
+             (lost (and (eq mode :forward)
+                        (%negative-claims pending reads
+                                          (%stratum-producers stratum)))))
+        ;; §4.2 case (b): a recursive stratum that lost a premise
+        ;; re-runs in full; provenance cannot bound a closure's loss.
+        (when (and lost (some #'%compiled-recursive-p stratum))
+          (setf mode :full))
+        (when mode
+          (let* ((*forward-changes* '())
+                 (rs (flet ((unit (fn)
+                              ;; Each retried unit under its own list.
+                              (multiple-value-bind (v changes)
+                                  (%call-collecting-changes fn)
+                                (%note-changes changes)
+                                v)))
+                       (ecase mode
+                         (:forward
+                          (let ((positive (%positive-delta pending reads)))
+                            (append
+                             (%targeted-reports graph stratum lost)
+                             (when (plusp (hash-table-count positive))
+                               (mapc (lambda (r)
+                                       (setf (rule-report-path r) :forward))
+                                     (unit (lambda ()
+                                             (%run-stratum
+                                              graph stratum scope
+                                              :forward-delta positive))))))))
+                         (:full
+                          (mapc (lambda (r) (setf (rule-report-path r) :full))
+                                (if (some #'%compiled-recursive-p stratum)
+                                    (unit (lambda ()
+                                            (%run-stratum graph stratum
+                                                          scope)))
+                                    (mapcar (lambda (c)
+                                              (unit
+                                               (lambda ()
+                                                 (run-rule
+                                                  graph
+                                                  (compiled-rule-spec c)))))
+                                            stratum))))))))
+            (dolist (r rs) (push r reports))
+            (unless (some (lambda (r)
+                            (eq (rule-report-outcome r) :refused))
+                          rs)
+              (setf pending (%merge-delta pending *forward-changes*))
+              (setf all-changes
+                    (append (reverse *forward-changes*) all-changes)))
+            (%schedule graph stratum (%positive-delta pending reads))))))))
 
 ;;; Provenance reads (spec §9)
 

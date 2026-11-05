@@ -645,6 +645,8 @@ The transaction manager is the central orchestrator responsible for:
 
 Every operation that modifies the graph occurs within the context of the currently active transaction, which is bound to the special variable ~*transaction*~.
 
+Once ~with-transaction~ has committed, it calls each function on ~*after-commit-hooks*~ with the committed transaction, on the committing thread, after its retry loop has returned and outside every lock and the ~*transaction*~ binding, so a hook may open a transaction of its own; a body that unwound or a commit that was refused calls none. This is the seam the forward evaluation of rules plugs into (~docs/rules.md~, "Forward evaluation").
+
 *** The ~with-transaction~ Macro
 
 For application developers, the primary interface to the transaction system is the ~with-transaction~ macro. This macro provides the essential guarantee of **atomicity**: all the database operations within its body are treated as a single, indivisible unit. They will either all succeed and be permanently saved, or they will all be discarded as if they never happened.
@@ -6671,6 +6673,12 @@ There is no verify phase for a backend whose spatial index only
 bounds. Without GEOS, ~register-geometry~ refuses an extended geometry
 outright (above) rather than approximating and then trying to confirm
 the approximation; build that step only if a backend ever needs it.
+
+*** Rules, forward evaluation and productions (~graph-db/rules~)
+
+The optional ~graph-db/rules~ system reads claims as Prolog facts and lets a store hold *rules*: versioned producers whose body is a guarded Prolog query over claims and whose head is one claim pattern. ~run-rules~ derives every rule to its fixpoint, strata in dependency order, and reconciles each rule's previous derivation: a claim derived again is kept, one no longer derived is *retracted* (never deleted) and re-opened when derived again, and a ~derived-from~ record names each derived claim's premises. The full reference is ~docs/rules.md~.
+
+Since #456 a store can also opt in to *forward evaluation*: after ~(graph-db.rules:enable-forward-rules graph)~, every commit's claim writes become a weighted delta and the rules that read what changed run from it, in the committing thread, after the commit returns (the ~*after-commit-hooks*~ seam of Chapter 5). A positive delta derives through the fixpoint machinery seeded with the new claims; a retraction or deletion finds the derivations it supported through provenance and re-derives them with their heads bound; a recursive stratum that lost a premise re-runs in full. Concurrent commits queue their deltas on one per-graph queue that the running step drains, so a commit never waits on another's derivation. ~now/1~ and ~instant-offset/3~ let a body state a threshold against the evaluation instant, and an enabled store schedules its own re-evaluation at the flip instant. *Productions* (~def-production~, or a stored ~production~ record) add an action to a body: a match derives a durable ~firing~ claim keyed by the premises' identities and the action runs from a salience-ordered agenda with ~:added~ and ~:lost~ events. ~forward-rules-status~ reports the queue, the timers and any failure; ~run-rules~ remains the repair and must report nothing to do after any step.
 
 ** Chapter 19: Measuring Performance
 

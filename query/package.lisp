@@ -13,4 +13,4 @@
    ;; the runner (spec SS4, GH #322)
    #:run-guarded-prolog
    ;; the compile half, for a caller that keeps the goals (GH #331)
-   #:guard-query-text))
+   #:guard-query-text #:*guarding-rule-text*))

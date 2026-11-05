@@ -934,3 +934,43 @@ so the bound-key route runs and the bound only filters."
     (is (null (select (:flat t :max-inferences 1000) (?k)
                 (claim ?c rt-claim "host" ?k ?r ?ons ?o)
                 (> ?k ?b))))))
+
+;;; claim-absent/7 (D2, forward-rules design §5.1)
+
+(defun seed-absences (g)
+  "Five unary rt-claims on h1..h5 under relation \"scanned\", one per
+standing, plus a sixth on h7 that is determined-empty but retracted;
+h6 has no claim at all.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (loop for (key standing) in '(("h1" :searched-empty)
+                                  ("h2" :determined-empty)
+                                  ("h3" :uncovered)
+                                  ("h4" :indeterminate)
+                                  ("h5" :observed)
+                                  ("h7" :determined-empty))
+          do (make-rt-claim-unary :graph g :subject-namespace :host
+                                  :subject-key key :relation "scanned"
+                                  :producer "scan-c" :standing standing)))
+  (retract-claim (first (claims-touching g 'rt-claim :host "h7"
+                                         :role :subject
+                                         :relation "scanned"))))
+
+(test claim-absent-answers-determined-absences-only
+  "A determined absence is a current claim of standing :SEARCHED-EMPTY
+or :DETERMINED-EMPTY; the two weak absences, a presence, a retracted
+absence and a subject with no claim at all are not answers."
+  (with-rules-graph (g)
+    (seed-absences g)
+    (is (equal '("h1" "h2")
+               (sort (select-flat (?k)
+                       (claim-absent ?c rt-claim "host" ?k "scanned"
+                                     ?o ?ok))
+                     #'string<)))
+    ;; A bound subject takes the indexed route like CLAIM/7.
+    (is (equal '("determined-empty")
+               (select-flat (?s)
+                 (claim-absent ?c rt-claim "host" "h2" "scanned" ?o ?ok)
+                 (claim-standing ?c ?s))))
+    (is (null (select-flat (?s)
+                (claim-absent ?c rt-claim "host" "h5" "scanned" ?o ?ok)
+                (claim-standing ?c ?s))))))
