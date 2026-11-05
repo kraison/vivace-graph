@@ -510,7 +510,7 @@ since a cross-store run evaluates once and reconciles per attempt."
     (values claims (nreverse order))))
 
 (defun %reconcile-claims (compiled graph report desired order
-                          &key (sweep-keys nil sweep-p))
+                          &key (sweep-keys nil sweep-p) existing)
   "Ruling P10 under D4, inside the transaction: the producer's existing
 claims kept when re-derived -- with the version AND the extent this run
 derives, since neither is part of every identity, and re-opened if
@@ -521,12 +521,16 @@ SWEEP-KEYS, an EQUAL hash of dedupe keys, only a claim under one of
 them is a candidate for retraction: forward evaluation derived
 DESIRED from a delta, not from the whole store, so a claim it did not
 meet is not thereby lost (forward-rules design §4.1; an empty table
-sweeps nothing).  => (VALUES STANDING SWEPT): an alist of (dedupe key
-. claim) for every claim of the derivation that now stands, and the
-claims retracted here."
-  ;; CLAIMS-BY-PRODUCER overlays the open transaction's writes (GH
-  ;; #324), so the producer's claims must be read BEFORE this function
-  ;; writes any: the reconcile compares against the committed set.
+sweeps nothing).  That path never enumerates the producer: each key
+of ORDER and of SWEEP-KEYS is resolved through EXISTING, a %EXISTING
+(a lazy one when not given), inside this transaction (#457 spec §3).
+=> (VALUES STANDING SWEPT): an alist of (dedupe key . claim) for every
+claim of the derivation that now stands, and the claims retracted
+here."
+  ;; CLAIMS-BY-PRODUCER and INDEX-LOOKUP overlay the open transaction's
+  ;; writes (GH #324, #408), so the producer's claims are read BEFORE
+  ;; this function constructs any: the reconcile compares against the
+  ;; committed set, and a refreshed key is never a looked-up one.
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
          (producer (rule-producer spec))
@@ -537,29 +541,46 @@ claims retracted here."
          (seen (make-hash-table :test 'equal))
          (standing '())
          (swept '()))
-    (dolist (c (%current-first
-                (graph-db.spacetime:claims-by-producer graph parent
-                                                       producer)))
-      (let ((key (%existing-key c family)))
-        (cond ((and (nth-value 1 (gethash key desired))
-                    (not (gethash key seen)))
-               (incf (rule-report-kept report))
-               (setf (gethash key seen) t)
-               ;; The extent %DESIRED holds for this key, i.e. the FIRST
-               ;; solution's where several collapsed (ruling T4-R3) --
-               ;; what a fresh construction would have used.
-               (let ((was-current (graph-db.spacetime:claim-current-p c))
-                     (kept (%refresh-kept
-                            c version
-                            (getf (car (gethash key desired)) :extent))))
-                 (unless was-current (%note-change kept 1))
-                 (push (cons key kept) standing)))
-              ((and (graph-db.spacetime:claim-current-p c)
-                    (or (not sweep-p) (gethash key sweep-keys)))
-               (let ((r (graph-db.spacetime:retract-claim c)))
-                 (%note-change r -1)
-                 (push r swept))
-               (incf (rule-report-swept report))))))
+    (flet ((keep (c key)
+             (incf (rule-report-kept report))
+             (setf (gethash key seen) t)
+             ;; The extent %DESIRED holds for this key, i.e. the FIRST
+             ;; solution's where several collapsed (ruling T4-R3) --
+             ;; what a fresh construction would have used.
+             (let ((was-current (graph-db.spacetime:claim-current-p c))
+                   (kept (%refresh-kept
+                          c version
+                          (getf (car (gethash key desired)) :extent))))
+               (unless was-current (%note-change kept 1))
+               (when existing (%note-existing existing key kept))
+               (push (cons key kept) standing)))
+           (sweep (c)
+             (let ((r (graph-db.spacetime:retract-claim c)))
+               (%note-change r -1)
+               (push r swept))
+             (incf (rule-report-swept report))))
+      (cond (sweep-p
+             (unless existing
+               (setf existing (%lazy-existing graph compiled)))
+             (dolist (key order)
+               (let ((c (%existing-claim existing key)))
+                 (when c (keep c key))))
+             (loop for key being the hash-keys of sweep-keys
+                   unless (nth-value 1 (gethash key desired))
+                     do (let ((c (%existing-claim existing key)))
+                          (when (and c (graph-db.spacetime:claim-current-p
+                                        c))
+                            (sweep c)))))
+            (t
+             (dolist (c (%current-first
+                         (graph-db.spacetime:claims-by-producer
+                          graph parent producer)))
+               (let ((key (%existing-key c family)))
+                 (cond ((and (nth-value 1 (gethash key desired))
+                             (not (gethash key seen)))
+                        (keep c key))
+                       ((graph-db.spacetime:claim-current-p c)
+                        (sweep c))))))))
     (let ((ctor (%constructor family (compiled-rule-unary-p compiled))))
       (dolist (key order)
         (unless (gethash key seen)
@@ -571,6 +592,7 @@ claims retracted here."
             (incf (rule-report-derived report))
             (setf (gethash key seen) t)
             (%note-change claim 1)
+            (when existing (%note-existing existing key claim))
             (push (cons key claim) standing)))))
     (values standing swept)))
 
@@ -1262,7 +1284,9 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                            (%stratum-run-desired run)
                            (%stratum-run-order run)
                            (and forward-sweep
-                                (list :sweep-keys forward-sweep)))
+                                (list :sweep-keys forward-sweep
+                                      :existing
+                                      (%stratum-run-existing run))))
                   (apply #'%reconcile-provenance
                          (%stratum-run-compiled run) graph
                          (%stratum-run-desired run) standing
@@ -1760,7 +1784,12 @@ RULE-REPORT with PATH :TARGETED."
               (setf (rule-report-inferences report) inferences)
               (multiple-value-bind (standing swept)
                   (%reconcile-claims compiled graph report desired order
-                                     :sweep-keys sweep)
+                                     :sweep-keys sweep
+                                     ;; Fresh per attempt: a retry must
+                                     ;; not reuse what a failed one
+                                     ;; resolved (#457 spec §3).
+                                     :existing (%lazy-existing graph
+                                                               compiled))
                 (%reconcile-provenance compiled graph desired standing
                                        :sweep-keys sweep :swept swept))))
         (rule-run-refusal (c)

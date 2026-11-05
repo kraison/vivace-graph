@@ -1002,3 +1002,84 @@ is seeded and never resolves."
         (is (null (graph-db.rules::%existing-claim seeded miss)))
         (is (= 2 (hash-table-count
                   (graph-db.rules::%existing-table seeded))))))))
+
+;;; The reconcile walks the step's keys (#457 spec §3)
+
+(defmacro with-counted-producer-reads ((counts) &body body)
+  "BODY with CLAIMS-BY-PRODUCER counted into COUNTS, an EQUAL hash of
+claim-class symbol -> calls; the original restored on exit."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,counts (make-hash-table :test 'equal))
+           (,orig (fdefinition 'graph-db.spacetime:claims-by-producer)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db.spacetime:claims-by-producer)
+                    (lambda (graph claim-class producer &rest keys)
+                      (incf (gethash claim-class ,counts 0))
+                      (apply ,orig graph claim-class producer keys)))
+              ,@body)
+         (setf (fdefinition 'graph-db.spacetime:claims-by-producer)
+               ,orig)))))
+
+(defun commit-strict-mode (g)
+  "The strict mode claim, in its own transaction.  Returns it."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rt-claim-binary :graph g :subject-namespace :sys
+                          :subject-key "s" :relation "mode"
+                          :object-namespace :val :object-key "strict"
+                          :producer "ops" :standing :asserted)))
+
+(test a-forward-step-never-enumerates-the-producers-claims
+  "Spec §3, the mutation gate for the claim reads: a one-claim commit's
+forward step and a one-claim retraction's targeted step read the
+touched rule's producer through CLAIMS-BY-PRODUCER zero times, and
+derive and sweep exactly what they did before."
+  (with-rules-graph (g)
+    (write-rule g :name "flagged" :version "1" :family "rt-claim"
+                  :head *flagged-head* :body *flagged-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (seed-keys g 50 :relation "up")
+    ;; DERIVED itself reads the producer, so it stays outside the
+    ;; counted windows.
+    (let ((mode nil))
+      (with-counted-producer-reads (counts)
+        (setf mode (commit-strict-mode g))
+        (is (eql 0 (gethash 'rt-claim counts 0))))
+      (is (= 50 (length (derived g 'rt-claim "flagged"))))
+      (with-counted-producer-reads (counts)
+        (retract-claim mode)
+        (is (eql 0 (gethash 'rt-claim counts 0))))
+      (is (null (derived g 'rt-claim "flagged")))
+      (is (= 50 (length (derived g 'rt-claim "flagged" :current nil)))))
+    (is-true (run-rules-is-quiet g))))
+
+(test the-per-key-reconcile-constructs-a-desired-key-that-stands-nowhere
+  "Spec §3 item 1: the targeted path has no round pass, so the per-key
+reconcile constructs a desired identity no claim has, counts it
+DERIVED and notes it in the resolver."
+  (with-rules-graph (g)
+    (multiple-value-bind (r compiled) (flagged-rule-and-compiled g 1)
+      (declare (ignore r))
+      (let ((desired (make-hash-table :test 'equal))
+            (key '(:host "zz" "flagged" nil nil nil))
+            (report (graph-db.rules::%make-rule-report
+                     :rule-name "flagged" :version "1"))
+            (existing (graph-db.rules::%lazy-existing g compiled)))
+        (setf (gethash key desired)
+              (cons (list :subject-namespace :host :subject-key "zz"
+                          :extent nil)
+                    '()))
+        (with-transaction ((graph-db::transaction-manager g))
+          (multiple-value-bind (standing swept)
+              (graph-db.rules::%reconcile-claims
+               compiled g report desired (list key)
+               :sweep-keys (make-hash-table :test 'equal)
+               :existing existing)
+            (is (= 1 (length standing)))
+            (is (null swept))
+            (is (string= "zz" (claim-subject-key (cdr (first standing)))))
+            (is (eq (cdr (first standing))
+                    (graph-db.rules::%existing-claim existing key)))))
+        (is (= 1 (graph-db.rules:rule-report-derived report)))
+        (is (= 0 (graph-db.rules:rule-report-kept report)))
+        (is (= 2 (length (derived g 'rt-claim "flagged"))))))))
