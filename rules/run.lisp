@@ -209,16 +209,17 @@ spacetime/claim.lisp)."
 
 (defun %refresh-kept (claim version extent &optional (method nil methodp))
   "CLAIM brought to the current derivation's VERSION, EXTENT and -- when
-METHOD is supplied -- METHOD, by ONE copy and save when any differs; the
-saved copy, else CLAIM.  EXTENT is what this run would derive, NIL under
-:EXTENT-POLICY :NONE and for a DERIVED-FROM record.  A kept temporal
-claim's extent START cannot move -- the dedupe key carries it -- but its
-END can, and a refreshed extent can then overlap a sibling run, which
-%VALIDATE-EXTENT-DISJOINTNESS refuses at commit like any other (#331,
-docs/rules.md).  METHOD is refreshed rather than the record swept and
-rewritten: MARK-DELETED releases a unique key only post-durability while
-VALIDATE-UNIQUE-CONSTRAINTS runs pre-durability, so a sweep and a
-re-insert of one identity in a transaction always collide (ruling P10)."
+METHOD is supplied -- METHOD, and RE-OPENED if it was retracted, by ONE
+copy and save when any differs; the saved copy, else CLAIM.  EXTENT is
+what this run would derive, NIL under :EXTENT-POLICY :NONE and for a
+DERIVED-FROM record.  A kept temporal claim's extent START cannot move
+-- the dedupe key carries it -- but its END can, and a refreshed extent
+can then overlap a sibling run, which %VALIDATE-EXTENT-DISJOINTNESS
+refuses at commit like any other (#331, docs/rules.md).  The re-open is
+D4 of the forward-rules design (§4.2): a derivation the rule supports
+is believed, whoever retracted it; REGISTER-NODE re-opens the same way.
+METHOD is refreshed rather than the record swept and rewritten, since a
+sweep keeps the identity occupied (ruling P10, D4)."
   (let* ((sexp (and extent (graph-db.spacetime:extent->sexp extent)))
          (extent-moved
            (not (equal (%extent-sexp-key sexp)
@@ -230,8 +231,9 @@ re-insert of one identity in a transaction always collide (ruling P10)."
          (method-moved
            (and methodp
                 (not (equal method
-                            (graph-db.spacetime:claim-method claim))))))
-    (if (not (or extent-moved version-moved method-moved))
+                            (graph-db.spacetime:claim-method claim)))))
+         (retracted (not (graph-db.spacetime:claim-current-p claim))))
+    (if (not (or extent-moved version-moved method-moved retracted))
         claim
         (let ((c (graph-db:copy claim)))
           (when version-moved
@@ -240,8 +242,21 @@ re-insert of one identity in a transaction always collide (ruling P10)."
             (setf (graph-db.spacetime:claim-extent c) extent))
           (when method-moved
             (setf (graph-db.spacetime:claim-method c) method))
+          (when retracted
+            (setf (graph-db.spacetime:claim-transaction-extent-sexp c)
+                  (graph-db.spacetime:extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent
+                    (graph-db.spacetime::%st-now)))))
           (graph-db:save c)
           c))))
+
+(defun %current-first (claims)
+  "CLAIMS with the current ones ahead of the retracted, order otherwise
+kept: a reconcile that meets a current claim and a retracted twin of one
+identity keeps the current one and leaves the other alone (D4)."
+  (stable-sort (copy-list claims)
+               (lambda (a b) (and a (not b)))
+               :key #'graph-db.spacetime:claim-current-p))
 
 (defun %store-name (graph)
   "GRAPH's name as a DERIVED-FROM record's METHOD carries it: the
@@ -386,11 +401,14 @@ since a cross-store run evaluates once and reconciles per attempt."
     (values claims (nreverse order))))
 
 (defun %reconcile-claims (compiled graph report desired order)
-  "Ruling P10, inside the transaction: the producer's existing claims
-kept when re-derived -- with the version AND the extent this run
-derives, since neither is part of every identity -- deleted when not;
-new identities constructed.  => an alist of (dedupe key . claim) for
-every claim of the derivation that now stands."
+  "Ruling P10 under D4, inside the transaction: the producer's existing
+claims kept when re-derived -- with the version AND the extent this run
+derives, since neither is part of every identity, and re-opened if
+retracted -- RETRACTED when not (never deleted: the record stays and
+DEPENDENTS-OF still answers), a retracted claim no longer derived left
+as it is and counted nowhere; new identities constructed.  => an alist
+of (dedupe key . claim) for every claim of the derivation that now
+stands."
   ;; CLAIMS-BY-PRODUCER overlays the open transaction's writes (GH
   ;; #324), so the producer's claims must be read BEFORE this function
   ;; writes any: the reconcile compares against the committed set.
@@ -403,8 +421,9 @@ every claim of the derivation that now stands."
          ;; 100000, and the alist scan would be quadratic in it.
          (seen (make-hash-table :test 'equal))
          (standing '()))
-    (dolist (c (graph-db.spacetime:claims-by-producer graph parent
-                                                      producer))
+    (dolist (c (%current-first
+                (graph-db.spacetime:claims-by-producer graph parent
+                                                       producer)))
       (let ((key (%existing-key c family)))
         (cond ((and (nth-value 1 (gethash key desired))
                     (not (gethash key seen)))
@@ -418,8 +437,8 @@ every claim of the derivation that now stands."
                                 (getf (car (gethash key desired))
                                       :extent)))
                      standing))
-              (t
-               (graph-db:mark-deleted c)
+              ((graph-db.spacetime:claim-current-p c)
+               (graph-db.spacetime:retract-claim c)
                (incf (rule-report-swept report))))))
     (let ((ctor (%constructor family (compiled-rule-unary-p compiled))))
       (dolist (key order)
@@ -435,13 +454,12 @@ every claim of the derivation that now stands."
     standing))
 
 (defun %reconcile-provenance (compiled graph desired standing)
-  "Spec §9 under ruling P10: one DERIVED-FROM record per (derived claim,
-premise) the derivation now asks for, its METHOD the premise's store
-name and NIL for the rule's own store (spec §10); records the producer
-wrote that it no longer asks for are deleted, the rest kept with their
-RULE-VERSION and METHOD refreshed -- a premise that moved store renames
-its record rather than being swept and rewritten, which would collide
-on the family's unique key (%REFRESH-KEPT)."
+  "Spec §9 under ruling P10 and D4: one DERIVED-FROM record per (derived
+claim, premise) the derivation now asks for, its METHOD the premise's
+store name and NIL for the rule's own store (spec §10); records the
+producer wrote that it no longer asks for are RETRACTED with their
+claim, the rest kept -- re-opened if retracted -- with their
+RULE-VERSION and METHOD refreshed (%REFRESH-KEPT)."
   (let* ((spec (compiled-rule-spec compiled))
          (producer (rule-producer (rule-spec-name spec)))
          (version (rule-spec-version spec))
@@ -460,20 +478,22 @@ on the family's unique key (%REFRESH-KEPT)."
     ;; One record per pair: a pair already kept is a duplicate and goes
     ;; with the records the derivation no longer asks for, as does a
     ;; record under this producer that is not a DERIVED-FROM at all.
-    (dolist (r (graph-db.spacetime:claims-by-producer graph 'derivation
-                                                      producer))
+    (dolist (r (%current-first
+                (graph-db.spacetime:claims-by-producer graph 'derivation
+                                                       producer)))
       (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
                         (graph-db.spacetime:claim-object-key r))))
         (multiple-value-bind (name wanted-p) (gethash pair wanted)
-          (if (and wanted-p
-                   (not (gethash pair kept))
-                   (string= "derived-from"
-                            (graph-db.spacetime:claim-relation r)))
-              (progn (setf (gethash pair kept) t)
-                     ;; No extent on a DERIVATION record, ever; NIL never
-                     ;; differs from the NIL it stores.
-                     (%refresh-kept r version nil name))
-              (graph-db:mark-deleted r)))))
+          (cond ((and wanted-p
+                      (not (gethash pair kept))
+                      (string= "derived-from"
+                               (graph-db.spacetime:claim-relation r)))
+                 (setf (gethash pair kept) t)
+                 ;; No extent on a DERIVATION record, ever; NIL never
+                 ;; differs from the NIL it stores.
+                 (%refresh-kept r version nil name))
+                ((graph-db.spacetime:claim-current-p r)
+                 (graph-db.spacetime:retract-claim r))))))
     (maphash (lambda (pair name)
                (unless (gethash pair kept)
                  (make-derivation-binary

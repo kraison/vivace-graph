@@ -16,6 +16,13 @@ storage formats (#60).
 
 ### Changed
 
+- **`run-rules` retracts a derivation it no longer derives instead of
+  deleting it** (#456, D4 of the forward-rules design). The swept
+  claim and its `derived-from` records stay on record with their
+  transaction period closed, so provenance stays readable; an identity
+  derived again whose claim is retracted -- by a sweep or by hand --
+  is re-opened in place rather than left retracted. `rule-report-swept`
+  counts the retractions.
 - **A `.txn` file's header carries its transaction-id** (#422). The id
   is written after the commit lock, so nothing new runs inside it and
   the rename stays the commit point. Recovery cross-checks a nonzero

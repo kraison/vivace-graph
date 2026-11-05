@@ -561,10 +561,22 @@ in one transaction always collide under `def-unique` (recon note C1,
 what is unchanged has no such collision, and it is sound because a body
 reads the committed store either way (recon note A6).
 
-A **retracted** derived claim whose identity is derived again stays
-retracted: keeping is not re-assertion. `run-rule` writes no
-transaction extent, so `retract-claim`'s closed period stands until
-something re-asserts it.
+**A sweep retracts; it never deletes** (D4 of the forward-rules
+design, `docs/superpowers/specs/2026-11-04-forward-rules-design.md`
+§4.2). A derivation the rule no longer derives is `retract-claim`ed
+together with its `derived-from` records, so the claim stays on
+record, `dependents-of` still answers through it, and
+`claims-by-producer` still returns it; `claim-current-p` tells it from
+a believed one. `rule-report-swept` counts these retractions. A
+**retracted** derived claim whose identity is derived again -- whether
+a sweep retracted it or a caller did by hand -- is **re-opened** in
+place: same node, transaction period re-opened as of now, counted as
+kept. The derivation is supported, so it is believed. A retracted
+claim the rule still does not derive is left as it is and counted
+nowhere. Note for a family with a `def-unique` over a subset of the
+identity: a retracted claim still occupies its key, so a later
+derivation that differs only outside that subset collides at commit
+exactly as a same-run sweep-and-insert does.
 
 **Duplicates collapse.** Two solutions with the same head endpoints and
 relation are one claim; for a temporal family the extent *start* joins
