@@ -132,7 +132,9 @@ fixpoint-spec ruling that assumed a from-scratch run:
    rule's whole standing derivation on every commit. The step's
    reconcile is an upsert of `desired` plus a sweep restricted to the
    head identities §4.2 found unsupported. The step's `rule-report`
-   counts (`derived`, `kept`, `swept`) are per step.
+   counts (`derived`, `kept`, `swept`) are per step. The reads behind
+   that reconcile are per identity, not per producer, since #457
+   (`2026-11-05-forward-step-reads-design.md`).
 
 Body variants substitute `rule-delta/2` for one `claim/7` goal in turn.
 Today `%variants` substitutes only goals that read a stratum relation
