@@ -645,6 +645,8 @@ The transaction manager is the central orchestrator responsible for:
 
 Every operation that modifies the graph occurs within the context of the currently active transaction, which is bound to the special variable ~*transaction*~.
 
+Once ~with-transaction~ has committed, it calls each function on ~*after-commit-hooks*~ with the committed transaction, on the committing thread, after its retry loop has returned and outside every lock and the ~*transaction*~ binding, so a hook may open a transaction of its own; a body that unwound or a commit that was refused calls none. This is the seam the forward evaluation of rules plugs into (~docs/rules.md~, "Forward evaluation").
+
 *** The ~with-transaction~ Macro
 
 For application developers, the primary interface to the transaction system is the ~with-transaction~ macro. This macro provides the essential guarantee of **atomicity**: all the database operations within its body are treated as a single, indivisible unit. They will either all succeed and be permanently saved, or they will all be discarded as if they never happened.

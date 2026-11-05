@@ -464,6 +464,7 @@
            #:validation-report-violations #:validation-report-family-counts
            #:validation-report-checked-counts #:validation-report-spec-counts
            #:commit-view-graph #:*commit-validators*
+           #:*after-commit-hooks*                           ; #456
            ;; Disjointness over vertex types (GH #157, 4a)
            #:def-disjoint #:undef-disjoint #:disjointness-violation
            #:djv-classes #:djv-offender #:djv-name

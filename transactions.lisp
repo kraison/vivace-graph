@@ -20,6 +20,15 @@ disjointness registers here (GH #157 4b) -- mirroring
 *NODE-TYPE-DEFINITION-HOOKS* (schema.lisp).  A validator that signals
 aborts the commit before anything is journaled; it MUST be pure reads
 plus signalling, and should read tx state through MAKE-COMMIT-VIEW.")
+(defvar *after-commit-hooks* '()
+  "Functions of one argument, the committed TX, called by
+CALL-WITH-TRANSACTION once its retry loop has returned a committed
+transaction: after %COMMIT and CLEANUP-TRANSACTION, outside the
+*TRANSACTION* binding and outside every lock, on the committing thread.
+Not called when the body unwound or the commit was refused.  A hook may
+open a transaction of its own.  The seam forward rule evaluation plugs
+into (graph-db/rules, forward-rules design §6).  A signal from a hook
+propagates to WITH-TRANSACTION's caller after the commit is durable.")
 (defvar *quiesced-store-closing-p* nil
   "Bound T only in the detaching thread's dynamic extent, while
 DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
@@ -3259,6 +3268,7 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
 
 (defmethod call-with-transaction (fun transaction-manager)
   (let ((completed nil)
+        (committed-tx nil)
         (attempt-count 0))
     (flet ((call-transaction-fun ()
              (let ((*transaction* (create-transaction transaction-manager)))
@@ -3276,16 +3286,23 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
                  ;; life of the image (GH #150).
                  (unwind-protect
                       (when completed
-                        (funcall *end-of-transaction-action* *transaction*))
+                        (funcall *end-of-transaction-action* *transaction*)
+                        (setf committed-tx *transaction*))
                    (cleanup-transaction *transaction*))))))
-      (loop
-         (when (<= *maximum-transaction-attempts* attempt-count)
-           (with-transaction-manager-lock (transaction-manager)
-             (return (call-transaction-fun))))
-         (handler-case
-             (return (call-transaction-fun))
-           (validation-conflict ()
-             (incf attempt-count)))))))
+      (multiple-value-prog1
+          (loop
+            (when (<= *maximum-transaction-attempts* attempt-count)
+              (with-transaction-manager-lock (transaction-manager)
+                (return (call-transaction-fun))))
+            (handler-case
+                (return (call-transaction-fun))
+              (validation-conflict ()
+                (incf attempt-count))))
+        ;; *AFTER-COMMIT-HOOKS*: here, after the loop, so the
+        ;; retry-exhausted path's manager lock is released too.
+        (when committed-tx
+          (dolist (hook *after-commit-hooks*)
+            (funcall hook committed-tx)))))))
 
 (defgeneric add-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
