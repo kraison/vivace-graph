@@ -43,6 +43,15 @@
    #:rule-report-path
    ;; provenance (spec §9)
    #:premises-of #:dependents-of
+   ;; productions (forward-rules design §7, #456)
+   #:def-production #:undef-production #:find-def-production
+   #:production #:make-production #:production-p #:production-name
+   #:production-version #:production-family #:production-body
+   #:production-salience #:production-writes #:production-action
+   #:production-spec #:production-spec-p #:production-spec-salience
+   #:production-spec-writes #:production-spec-action
+   #:compile-production #:compiled-production-p #:run-agenda
+   #:firing #:*production-actions*
    ;; forward evaluation (forward-rules design, #456)
    #:claim-delta #:delta-touches-p
    #:enable-forward-rules #:disable-forward-rules

@@ -560,3 +560,153 @@ touches the closed store afterwards."
   (with-rules-graph (g)
     (signals graph-db.query:prolog-guard-error
       (graph-db.query:guard-query-text "(now ?t)" g))))
+
+;;; Productions (spec §7, plan Task 8)
+
+(defvar *fired* '()
+  "What the test actions saw, newest first: (name event key).")
+
+(defun note-firing (name)
+  "An action that records its calls on *FIRED*."
+  (lambda (event match)
+    (push (list name event (getf match :key)) *fired*)))
+
+(defun fired ()
+  (reverse *fired*))
+
+(defparameter *web-watch-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-current ?p)")
+
+(defmacro with-production ((name &rest keys) &body body)
+  "DEF-PRODUCTION NAME around BODY, forgotten afterwards."
+  `(unwind-protect
+        (progn (graph-db.rules:def-production ,name ,@keys) ,@body)
+     (graph-db.rules:undef-production ,name)))
+
+(defun firings (g name)
+  "The current FIRING claims of production NAME."
+  (remove-if-not #'claim-current-p
+                 (claims-by-producer g 'graph-db.rules:firing
+                                     (format nil "production/~A" name))))
+
+(test a-production-fires-added-once-per-instantiation-and-lost-once
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("web-watch" :version "1" :family rt-claim
+                                    :body *web-watch-body*
+                                    :action (note-firing "web-watch"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (is (equal '(:added) (mapcar #'second (fired))))
+        (commit-runs-web g "h2")
+        (is (equal '(:added :added) (mapcar #'second (fired))))
+        (is (= 2 (length (firings g "web-watch"))))
+        (retract-claim (runs-web-premise g "h1"))
+        (is (equal '(:added :added :lost) (mapcar #'second (fired))))
+        (is (equal (third (first (fired))) (third (third (fired)))))
+        (is (= 1 (length (firings g "web-watch"))))
+        ;; RUN-RULES maintains the firing claims and fires no action.
+        (is-true (run-rules-is-quiet g))
+        (is (= 3 (length (fired))))))))
+
+(test a-production-survives-a-premise-being-swept-and-re-derived
+  "The instantiation key is the premises' identity keys, so a premise
+deleted and written again is the same instantiation: the firing claim
+is re-opened, not duplicated."
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("web-watch" :version "1" :family rt-claim
+                                    :body *web-watch-body*
+                                    :action (note-firing "web-watch"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (let ((before (graph-db:id (first (firings g "web-watch")))))
+          (with-transaction ((graph-db::transaction-manager g))
+            (mark-deleted (runs-web-premise g "h1")))
+          (is (null (firings g "web-watch")))
+          (commit-runs-web g "h1")
+          (is (equal '(:added :lost :added) (mapcar #'second (fired))))
+          (is (= 1 (length (remove-duplicates (mapcar #'third (fired))
+                                              :test #'equal))))
+          (is (equalp before
+                      (graph-db:id (first (firings g "web-watch"))))))))))
+
+(test a-stored-production-naming-an-unregistered-action-is-refused-at-commit
+  (with-rules-graph (g)
+    (signals graph-db.rules:rule-compile-error
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules:make-production
+         :graph g :name "ghost" :version "1" :family "rt-claim"
+         :body *web-watch-body* :salience 0 :writes '()
+         :action "nobody")))
+    (is (null (graph-db:index-lookup g 'graph-db.rules:production
+                                     '(graph-db.rules::name) "ghost")))))
+
+(test a-production-that-writes-then-signals-keeps-both-and-is-reported
+  "Review Focus 4: the action's write stands, the firing claim stands,
+the failure is on the status, and the next commit's delta is still
+processed."
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production
+          ("web-mark" :version "1" :family rt-claim
+                      :body *web-watch-body* :writes '("marked")
+                      :action (lambda (event match)
+                                (declare (ignore match))
+                                (when (eq event :added)
+                                  (with-transaction
+                                      ((graph-db::transaction-manager g))
+                                    (make-rt-claim-unary
+                                     :graph g :subject-namespace :host
+                                     :subject-key "h1" :relation "marked"
+                                     :producer "web-mark"
+                                     :standing :inferred))
+                                  (error "boom"))))
+        (graph-db.rules:enable-forward-rules g)
+        (finishes (commit-runs-web g "h1"))
+        (is (= 1 (length (claims-touching g 'rt-claim :host "h1"
+                                          :role :subject
+                                          :relation "marked"))))
+        (is (= 1 (length (firings g "web-mark"))))
+        (let ((failure (find "web-mark"
+                             (getf (graph-db.rules:forward-rules-status g)
+                                   :failures)
+                             :key #'car :test #'equal)))
+          (is (not (null failure)))
+          (when failure (is (search "boom" (cdr failure)))))
+        (commit-runs-web g "h2")
+        (is (= 2 (length (firings g "web-mark"))))))))
+
+(test agenda-order-is-salience-then-epoch
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("low" :version "1" :family rt-claim
+                              :body *web-watch-body* :salience 0
+                              :action (note-firing "low"))
+        (with-production ("high" :version "1" :family rt-claim
+                                 :body *web-watch-body* :salience 10
+                                 :action (note-firing "high"))
+          (graph-db.rules:enable-forward-rules g)
+          (commit-runs-web g "h1")
+          (is (equal '("high" "low") (mapcar #'first (fired)))))))))
+
+(test firing-claims-are-readable-and-carry-the-production-version
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("web-watch" :version "3" :family rt-claim
+                                    :body *web-watch-body*
+                                    :action (note-firing "web-watch"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (let ((f (first (firings g "web-watch"))))
+          (is (not (null f)))
+          (when f
+            (is (string= "web-watch" (claim-relation f)))
+            (is (string= "3" (claim-rule-version f)))
+            (is (eq :production (claim-subject-namespace f)))
+            (is (= 16 (length (claim-subject-key f))))
+            (is (every (lambda (ch) (digit-char-p ch 16))
+                       (claim-subject-key f)))
+            ;; Its provenance names the premise.
+            (is (= 1 (length (graph-db.rules:premises-of g f))))))))))

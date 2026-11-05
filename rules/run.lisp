@@ -53,6 +53,15 @@ DELTA restricting the matches to a step's or NIL for every match.
 Called at the end of RUN-RULES and after each stratum a forward step
 ran.")
 
+(defvar *agenda-runner* nil
+  "A function of (GRAPH COMPILED-RULES CHANGES), set by
+productions.lisp: fires the actions for the FIRING claims a step
+changed, CHANGES in arrival order (forward-rules design §7).")
+
+(defvar *agenda-production* nil
+  "The COMPILED-RULE of the production whose action is running, so the
+post-commit hook can check its writes against the declared ones.")
+
 (defun %schedule (graph compiled-rules delta)
   (when *threshold-scheduler*
     (funcall *threshold-scheduler* graph compiled-rules delta)))
@@ -85,9 +94,14 @@ step :FORWARD, :TARGETED or :FULL (forward-rules design §4.2)."
   (disjoint-premises 0) (refusals '()) (inferences 0) (elapsed 0)
   (rounds 1) (stratum '()) (path nil))
 
-(defun rule-producer (name)
-  "The producer string rule NAME writes as: rule/NAME."
-  (format nil "rule/~A" name))
+(defun rule-producer (rule)
+  "The producer string RULE writes as: rule/NAME for a rule, given as
+its spec or its name; production/NAME for a PRODUCTION-SPEC (forward-
+rules design §7)."
+  (cond ((production-spec-p rule)
+         (format nil "production/~A" (rule-spec-name rule)))
+        ((rule-spec-p rule) (format nil "rule/~A" (rule-spec-name rule)))
+        (t (format nil "rule/~A" rule))))
 
 (defun %resolve-rule (graph rule)
   "RULE as a RULE-SPEC: a record or spec passes through; a name finds the
@@ -96,6 +110,9 @@ the common path never names the RULE type, which is no type at all until
 some store has run DEF-RULES-SCHEMA."
   (cond
     ((rule-spec-p rule) rule)
+    ((let ((class (find-class 'production nil)))
+       (and class (typep rule class)))
+     (%production-rule-spec graph (%production-spec-of-record rule)))
     ((stringp rule)
      (let ((stored (and (%graph-declares-p graph 'rule)
                         (first (graph-db:index-lookup
@@ -103,6 +120,9 @@ some store has run DEF-RULES-SCHEMA."
        (cond ((and stored (not (graph-db:deleted-p stored)))
               (rule-spec-of stored))
              ((find-def-rule rule))
+             ((let ((p (or (%stored-production graph rule)
+                           (find-def-production rule))))
+                (and p (%production-rule-spec graph p))))
              (t (error "No rule named ~S in ~(~S~) or the image."
                        rule (graph-db:graph-name graph))))))
     (t (rule-spec-of rule))))
@@ -490,7 +510,7 @@ claims retracted here."
   ;; writes any: the reconcile compares against the committed set.
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
-         (producer (rule-producer (rule-spec-name spec)))
+         (producer (rule-producer spec))
          (version (rule-spec-version spec))
          (parent (graph-db.spacetime:claim-family-parent family))
          ;; SEEN, not an ASSOC over STANDING: *RULES-MAX-SOLUTIONS* is
@@ -549,7 +569,7 @@ under a sweep key or among SWEPT; records of other claims are kept
 as they are and wanted ones still added -- DESIRED is then partial and
 a record it does not name may still be supported (§4.1)."
   (let* ((spec (compiled-rule-spec compiled))
-         (producer (rule-producer (rule-spec-name spec)))
+         (producer (rule-producer spec))
          (version (rule-spec-version spec))
          (wanted (make-hash-table :test 'equal))
          (kept (make-hash-table :test 'equal))
@@ -758,8 +778,7 @@ derives from it, and the extent it was first derived with may no
 longer be the one its own premises give (I1)."
   (let ((ctor (%constructor (compiled-rule-family compiled)
                             (compiled-rule-unary-p compiled)))
-        (producer (rule-producer (rule-spec-name
-                                  (compiled-rule-spec compiled))))
+        (producer (rule-producer (compiled-rule-spec compiled)))
         (version (rule-spec-version (compiled-rule-spec compiled)))
         (constructed 0))
     (values
@@ -876,7 +895,7 @@ constructing, and what %RECONCILE-CLAIMS later sweeps or keeps
         (spec (compiled-rule-spec compiled)))
     (dolist (c (graph-db.spacetime:claims-by-producer
                 graph (graph-db.spacetime:claim-family-parent family)
-                (rule-producer (rule-spec-name spec))))
+                (rule-producer spec)))
       (setf (gethash (%existing-key c family) existing) c))
     existing))
 
@@ -968,9 +987,7 @@ own relations is empty."
          ;; relation each producer derives, so a body reading a stratum
          ;; producer's DERIVATION records still sees them (M3).
          (producers (mapcar (lambda (c)
-                              (cons (rule-producer
-                                     (rule-spec-name
-                                      (compiled-rule-spec c)))
+                              (cons (rule-producer (compiled-rule-spec c))
                                     (compiled-rule-relation c)))
                             stratum))
          ;; Built once, before the retried thunk: a signal while
@@ -1412,7 +1429,10 @@ where the store carries its family (ruling P8).  A def-rule the store
 cannot run is skipped silently rather than reported -- it is not this
 store's rule, and its text names types this schema does not have."
   (or (eq (rule-spec-source spec) :stored)
-      (%graph-declares-p graph (rule-spec-family spec))))
+      (and (%graph-declares-p graph (rule-spec-family spec))
+           (or (not (production-spec-p spec))
+               (%graph-declares-p graph
+                                  (production-spec-source-family spec))))))
 
 (defun %strata-of (compiled-rules)
   "COMPILED-RULES grouped by stratum, input order kept inside and
@@ -1556,8 +1576,7 @@ a -1 is promoted to :FULL by the caller."
                           (setf mode :forward)))))))))
 
 (defun %stratum-producers (stratum)
-  (mapcar (lambda (c) (rule-producer (rule-spec-name
-                                      (compiled-rule-spec c))))
+  (mapcar (lambda (c) (rule-producer (compiled-rule-spec c)))
           stratum))
 
 (defun %stratum-positive-reads (stratum)
@@ -1688,8 +1707,7 @@ and re-opened when still supported (Review Focus 2).  => one report
 per rule with something to re-derive."
   (let ((reports '()))
     (dolist (c stratum (nreverse reports))
-      (let* ((producer (rule-producer (rule-spec-name
-                                       (compiled-rule-spec c))))
+      (let* ((producer (rule-producer (compiled-rule-spec c)))
              (seen (make-hash-table :test 'equalp))
              (claims '()))
         (flet ((take (d)
@@ -1731,9 +1749,18 @@ transaction, as RUN-RULES does; those commits are hidden from the
 post-commit hook.  => the RULE-REPORTs, in the order run."
   (let ((reports '())
         (pending delta)
+        (all-changes '())
         (scope (%normalize-scope graph nil))
         (*forward-hook-suppressed* t))
-    (dolist (stratum (%strata-order compiled-rules) (nreverse reports))
+    (dolist (stratum (%strata-order compiled-rules)
+                     (progn
+                       ;; §7: the agenda, after the strata, outside the
+                       ;; suppression so an action's commit queues.
+                       (when (and *agenda-runner* all-changes)
+                         (let ((*forward-hook-suppressed* nil))
+                           (funcall *agenda-runner* graph compiled-rules
+                                    (nreverse all-changes))))
+                       (nreverse reports)))
       (let* ((mode (%delta-touch stratum pending))
              (reads (%stratum-positive-reads stratum))
              (lost (and (eq mode :forward)
@@ -1769,7 +1796,9 @@ post-commit hook.  => the RULE-REPORTs, in the order run."
             (unless (some (lambda (r)
                             (eq (rule-report-outcome r) :refused))
                           rs)
-              (setf pending (%merge-delta pending *forward-changes*)))
+              (setf pending (%merge-delta pending *forward-changes*))
+              (setf all-changes
+                    (append (reverse *forward-changes*) all-changes)))
             (%schedule graph stratum (%positive-delta pending reads))))))))
 
 ;;; Provenance reads (spec §9)

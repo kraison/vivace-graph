@@ -236,7 +236,8 @@ docs/rules.md; GH #304."
   :serial t
   :components ((:file "package") (:file "facts") (:file "schema")
                (:file "compile") (:file "run") (:file "delta")
-               (:file "forward") (:file "thresholds"))
+               (:file "forward") (:file "thresholds")
+               (:file "productions"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test

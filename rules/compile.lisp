@@ -16,6 +16,24 @@ in.  FAMILY is the parent class's name, lowercase; SOURCE is :STORED or
   name version family head body (extent-policy :premises) (enabled t)
   source)
 
+(defstruct (production-spec (:include rule-spec)
+                            (:constructor %make-production-spec))
+  "A production as text (forward-rules design §7): a RULE-SPEC whose
+HEAD and BODY are synthesised -- the head a FIRING claim keyed by the
+instantiation, the body the author's plus INSTANTIATION-KEY over its
+premises (%PRODUCTION-RULE-SPEC) -- with SALIENCE, the relations the
+action WRITES, ACTION the name its function is registered under
+(*PRODUCTION-ACTIONS*), SOURCE-FAMILY the family the author named and
+TEXT the body as written.  SOURCE is :STORED or :DEF-PRODUCTION."
+  (salience 0) (writes '()) action source-family text)
+
+(defvar *def-productions* (make-hash-table :test 'equal)
+  "DEF-PRODUCTION's registry, name -> PRODUCTION-SPEC (unsynthesised).")
+
+(defvar *production-actions* (make-hash-table :test 'equal)
+  "Action name -> function of (EVENT MATCH); DEF-PRODUCTION registers
+its action under the production's name, a stored record names one.")
+
 (defvar *def-rules* (make-hash-table :test 'equal)
   "DEF-RULE's registry, name -> RULE-SPEC: rules that live in the image
 rather than in a store (spec §5).  Image-wide, so RUN-RULES filters it
@@ -61,6 +79,52 @@ store's other rules.  Returns NAME."
   (incf *def-rules-stamp*)
   (and (remhash name *def-rules*) t))
 
+(defun %register-def-production (name &key version family body
+                                           (salience 0) writes action)
+  (check-type name string)
+  (check-type version string)
+  (check-type body string)
+  (check-type salience real)
+  (check-type writes list)
+  (incf *def-rules-stamp*)
+  (setf (gethash name *production-actions*)
+        (etypecase action
+          (function action)
+          (symbol (symbol-function action))))
+  (setf (gethash name *def-productions*)
+        (%make-production-spec :name name :version version
+                               :family "firing" :source-family
+                               (%family-string family)
+                               :head "" :body body :text body
+                               :extent-policy :none :enabled t
+                               :salience salience :writes writes
+                               :action name :source :def-production))
+  name)
+
+(defmacro def-production (name &key version family body (salience 0)
+                                    writes action)
+  "Register a production in the image (forward-rules design §7): BODY
+is a rule body over FAMILY's claims (the parent class symbol,
+unevaluated); when it matches, a FIRING claim keyed by the premises'
+identities is derived and ACTION, a function of (EVENT MATCH) with
+EVENT :ADDED or :LOSS and MATCH a plist (:KEY :PREMISES :BINDINGS
+:FIRING), runs from the agenda in SALIENCE order (higher first).
+WRITES lists the relations the action may write; one it reads too is
+a cycle, refused.  Returns NAME."
+  `(%register-def-production ,name :version ,version :family ',family
+                             :body ,body :salience ,salience
+                             :writes ,writes :action ,action))
+
+(defun undef-production (name)
+  "Forget the DEF-PRODUCTION NAME and its action; T when there was one."
+  (incf *def-rules-stamp*)
+  (remhash name *production-actions*)
+  (and (remhash name *def-productions*) t))
+
+(defun find-def-production (name)
+  "The DEF-PRODUCTION NAME's PRODUCTION-SPEC, or NIL."
+  (values (gethash name *def-productions*)))
+
 (defun find-def-rule (name)
   "The DEF-RULE NAME's RULE-SPEC, or NIL."
   (values (gethash name *def-rules*)))
@@ -73,6 +137,7 @@ with only the name a prior COMPILE-RULE stored can re-compile it
 (GH #333)."
   (etypecase thing
     (rule-spec thing)
+    (production (%production-spec-of-record thing))
     (rule (%make-rule-spec :name (rule-name thing)
                            :version (rule-version thing)
                            :family (%family-string (rule-family thing))
@@ -87,6 +152,8 @@ with only the name a prior COMPILE-RULE stored can re-compile it
        (cond ((and stored (not (graph-db:deleted-p stored)))
               (rule-spec-of stored))
              ((find-def-rule thing))
+             ((%stored-production graph thing))
+             ((find-def-production thing))
              (t (error "No rule named ~S in ~(~S~) or the image."
                        thing
                        (and graph (graph-db:graph-name graph)))))))))
@@ -475,20 +542,105 @@ answers NIL rather than erring in MAP-VERTICES (T4-R2)."
     (mapcar #'rule-spec-of
             (remove-if #'graph-db:deleted-p nodes))))
 
+(defun %production-spec-of-record (record)
+  "A stored PRODUCTION record as an unsynthesised PRODUCTION-SPEC."
+  (%make-production-spec :name (production-name record)
+                         :version (production-version record)
+                         :family "firing"
+                         :source-family (%family-string
+                                         (production-family record))
+                         :head "" :body (production-body record)
+                         :text (production-body record)
+                         :extent-policy :none :enabled t
+                         :salience (production-salience record)
+                         :writes (production-writes record)
+                         :action (production-action record)
+                         :source :stored))
+
+(defun %stored-production (graph name)
+  "GRAPH's stored production NAME as a spec, or NIL."
+  (let ((stored (and graph (%graph-declares-p graph 'production)
+                     (first (graph-db:index-lookup
+                             graph 'production '(name) name)))))
+    (and stored (not (graph-db:deleted-p stored))
+         (%production-spec-of-record stored))))
+
+(defun %stored-productions (graph &key view)
+  "Every PRODUCTION record in GRAPH as specs, as %STORED-RULES reads
+rules."
+  (unless (%graph-declares-p graph 'production)
+    (return-from %stored-productions '()))
+  (let* ((committed (graph-db:map-vertices #'identity graph
+                                           :vertex-type 'production
+                                           :collect-p t))
+         (nodes (if view
+                    (loop for r in committed
+                          for n = (graph-db:view-node view (graph-db:id r))
+                          when n collect n)
+                    committed)))
+    (when view
+      (dolist (w (graph-db:view-writes view))
+        (let ((n (graph-db:view-node view (graph-db:id w))))
+          (when (and n (typep n 'production)
+                     (null (graph-db:view-old-node view n))
+                     (not (find (graph-db:id n) nodes
+                                :key #'graph-db:id :test #'equalp)))
+            (push n nodes)))))
+    (mapcar #'%production-spec-of-record
+            (remove-if #'graph-db:deleted-p nodes))))
+
+(defun %production-rule-spec (graph spec)
+  "SPEC, a PRODUCTION-SPEC, with its HEAD and BODY synthesised for the
+rule pipeline (forward-rules design §7): the head a unary FIRING claim
+under namespace production, keyed by ?instantiation-key, relation the
+production's name; the body the author's text plus an
+INSTANTIATION-KEY goal over its premise variables.  Text the guard
+refuses is passed through for COMPILE-RULE to refuse with the guard's
+reason."
+  (let* ((premises
+           (handler-case
+               (multiple-value-bind (vars goals)
+                   (let ((graph-db.query:*guarding-rule-text* t))
+                     (graph-db.query:guard-query-text
+                      (production-spec-text spec) graph))
+                 (declare (ignore vars))
+                 (%premise-vars goals))
+             (graph-db.query:prolog-guard-error () :unguardable)))
+         (copy (copy-production-spec spec)))
+    (setf (rule-spec-head copy)
+          (format nil "(claim ?c firing \"production\" ~
+?instantiation-key ~S nil nil)" (rule-spec-name spec))
+          (rule-spec-body copy)
+          (if (or (eq premises :unguardable) (null premises)
+                  (> (length premises) 8))
+              (production-spec-text spec)
+              (format nil "~A (instantiation-key ?instantiation-key~
+~{ ~(~A~)~})"
+                      (production-spec-text spec)
+                      (mapcar #'symbol-name premises))))
+    copy))
+
 (defun rules-in-scope (graph &key view)
   "The specs a compile checks a rule against (spec §6): every enabled
 stored rule of GRAPH -- through VIEW when a commit is in flight -- plus
-every enabled DEF-RULE (ruling T3-R5: ENABLED reads the same on both).
-A def-rule the store cannot run still constrains the cycle graph;
-RUN-RULES is what filters by family (ruling P8)."
+every enabled DEF-RULE (ruling T3-R5: ENABLED reads the same on both),
+plus every production, stored or DEF-PRODUCTION, synthesised as a rule
+over FIRING (%PRODUCTION-RULE-SPEC).  A def-rule the store cannot run
+still constrains the cycle graph; RUN-RULES is what filters by family
+(ruling P8)."
   (append (remove-if-not #'rule-spec-enabled
                          (%stored-rules graph :view view))
           (loop for spec being the hash-values of *def-rules*
-                when (rule-spec-enabled spec) collect spec)))
+                when (rule-spec-enabled spec) collect spec)
+          (mapcar (lambda (p) (%production-rule-spec graph p))
+                  (append (%stored-productions graph :view view)
+                          (alexandria:hash-table-values
+                           *def-productions*)))))
 
 (defun %edges (spec graph)
-  "SPEC's (head-relation . reads) for the dependency graph, or NIL when
-the spec's text does not guard -- such a rule cannot run and constrains
+  "SPEC's edges for the dependency graph, a list of (relation . reads)
+-- the head's, plus one per write for a production -- or NIL when the
+spec's text does not guard: such a rule cannot run and constrains
 nothing.  READS is what the body reads positively AND under a NOT: a
 negated read is a dependency like any other, so a cycle another rule
 closes only through negation reaches the SCC search here exactly as
@@ -502,12 +654,17 @@ as a read, which over-constrains rather than under-."
         (declare (ignore vars))
         (let ((head (first goals)))
           (when (%engine-goal-p head "CLAIM" 7)
-            (let ((reads (%body-reads (rest goals)))
-                  (negative (%negative-reads (rest goals))))
-              (cons (sixth head)
-                    (if (or (eq reads :any) (eq negative :any))
-                        :any
-                        (union reads negative :test #'string=)))))))
+            (let* ((reads (%body-reads (rest goals)))
+                   (negative (%negative-reads (rest goals)))
+                   (all (if (or (eq reads :any) (eq negative :any))
+                            :any
+                            (union reads negative :test #'string=))))
+              ;; A production's writes are relations its inputs feed
+              ;; (forward-rules design §7): one edge per write too.
+              (cons (cons (sixth head) all)
+                    (when (production-spec-p spec)
+                      (mapcar (lambda (w) (cons w all))
+                              (production-spec-writes spec))))))))
     (rule-compile-error () nil)))
 
 (defun %strata (relation reads graph others)
@@ -519,10 +676,9 @@ rule in OTHERS deriving a component relation, plus this one."
   (let ((edges (list (cons relation reads)))
         (derivers (list (cons relation nil))))
     (dolist (o others)
-      (let ((e (%edges o graph)))
-        (when e
-          (push e edges)
-          (push (cons (car e) (rule-spec-name o)) derivers))))
+      (dolist (e (%edges o graph))
+        (push e edges)
+        (push (cons (car e) (rule-spec-name o)) derivers)))
     (labels (;; An :ANY edge contributes none here: an unvalidated
              ;; other rule is an isolated node for stratification and
              ;; is refused on its own compile, not here (GH #333).
@@ -550,6 +706,67 @@ rule in OTHERS deriving a component relation, plus this one."
                             collect name)))
         (values (sort (copy-list names) #'string<)
                 (sort (copy-list component) #'string<))))))
+
+(defun %production-relations (spec reads negative relations graph others)
+  "A production's stratum relations: its firing relation's component
+plus its writes, after the §7 checks -- a body with no premise, a
+write it reads, or a cycle from a write back to a read, is refused."
+  (when (null (%premise-vars-of-text spec graph))
+    (%refuse spec "a production body needs a claim/7 goal"))
+  (let ((all-reads (union reads negative :test #'string=)))
+    (let ((bad (intersection (production-spec-writes spec) all-reads
+                             :test #'string=)))
+      (when bad
+        (%refuse spec "the production reads what it writes: ~{~A~^, ~}"
+                 bad)))
+    (dolist (w (production-spec-writes spec))
+      (multiple-value-bind (names component)
+          (%strata w all-reads graph others)
+        (declare (ignore names))
+        (let ((cycle (intersection component all-reads :test #'string=)))
+          (when cycle
+            (%refuse spec "a cycle runs from the production's write ~A ~
+back to its read ~{~A~^, ~}" w cycle)))))
+    (sort (remove-duplicates (append (production-spec-writes spec)
+                                     relations)
+                             :test #'string=)
+          #'string<)))
+
+(defun %premise-vars-of-text (spec graph)
+  "The premise variables of SPEC's authored body, NIL when it guards to
+none."
+  (handler-case
+      (multiple-value-bind (vars goals)
+          (let ((graph-db.query:*guarding-rule-text* t))
+            (graph-db.query:guard-query-text (production-spec-text spec)
+                                             graph))
+        (declare (ignore vars))
+        (%premise-vars goals))
+    (graph-db.query:prolog-guard-error () nil)))
+
+(defun compile-production (graph production &key (others nil others-p))
+  "PRODUCTION (a PRODUCTION record, a PRODUCTION-SPEC or a name)
+compiled through COMPILE-RULE as the rule over FIRING it is
+(%PRODUCTION-RULE-SPEC).  => COMPILED-RULE whose spec is a
+PRODUCTION-SPEC; signals RULE-COMPILE-ERROR."
+  (let* ((spec (etypecase production
+                 (production-spec production)
+                 (production (%production-spec-of-record production))
+                 (string (or (%stored-production graph production)
+                             (find-def-production production)
+                             (error "No production named ~S in ~(~S~) ~
+or the image." production (graph-db:graph-name graph))))))
+         (rule (if (production-spec-text spec)
+                   (%production-rule-spec graph spec)
+                   spec)))
+    (if others-p
+        (compile-rule graph rule :others others)
+        (compile-rule graph rule))))
+
+(defun compiled-production-p (compiled)
+  "COMPILED is a production's COMPILED-RULE."
+  (and (compiled-rule-p compiled)
+       (production-spec-p (compiled-rule-spec compiled))))
 
 (defun compile-rule (graph rule &key (others nil others-p))
   "RULE (a RULE record, a RULE-SPEC, or a stored rule's name) compiled
@@ -614,6 +831,10 @@ unbound: bind the relation"))
                 (when bad
                   (%refuse spec "negation over the rule's own stratum ~
 ~{~A~^, ~}: a NOT may read only an earlier stratum" bad)))
+              (when (production-spec-p spec)
+                (setf relations (%production-relations spec reads negative
+                                                       relations graph
+                                                       others)))
               (apply #'%make-compiled-rule
                      :spec spec
                      :vars (remove-duplicates
@@ -651,3 +872,28 @@ RULE class, and this validator is image-wide."
               (compile-rule graph r :others scope))))))))
 
 (pushnew '%validate-rule-writes graph-db:*commit-validators*)
+
+(defun %validate-production-writes (tx graph)
+  "GRAPH-DB:*COMMIT-VALIDATORS*: every PRODUCTION record this
+transaction writes names a registered action and compiles against
+the store as it will be after the commit (forward-rules design §7)."
+  (let ((class (find-class 'production nil)))
+    (when class
+      (let ((written (loop for w in (graph-db:writes tx)
+                           for node = (graph-db::node w)
+                           when (and (typep node class)
+                                     (not (graph-db:deleted-p node)))
+                             collect node)))
+        (when written
+          (let ((scope (rules-in-scope
+                        graph
+                        :view (graph-db:make-commit-view graph tx))))
+            (dolist (p written)
+              (unless (gethash (production-action p) *production-actions*)
+                (error 'rule-compile-error
+                       :rule (production-name p)
+                       :reason (format nil "action ~S is not registered"
+                                       (production-action p))))
+              (compile-production graph p :others scope))))))))
+
+(pushnew '%validate-production-writes graph-db:*commit-validators*)

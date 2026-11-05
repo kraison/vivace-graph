@@ -1194,6 +1194,67 @@ in memory, per enabled graph, on one thread named "forward timer";
 `enable-forward-rules` rebuilds the timers from the store when it runs
 `run-rules`. `forward-rules-status` counts them under `:timers`.
 
+**Productions (spec §7).** A production is a body and an action: when
+the body matches, the action runs. It is the OPS5 idea on top of the
+Datalog layer, and it shares the layer's machinery: a production is
+compiled as a rule whose head is a unary claim of the `firing` family
+(subject namespace `production`, subject key the instantiation's key,
+relation the production's name, producer `production/NAME`, rule
+version the production's), so forward evaluation derives, retracts
+and re-opens firings exactly as it does derived claims, provenance
+names each firing's premises, and `run-rules` repairs them.
+
+```lisp
+(graph-db.rules:def-production "web-watch"
+  :version "1" :family rt-claim :salience 10
+  :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+         (claim-current ?p)"
+  :writes '("watched")
+  :action (lambda (event match) ...))
+```
+
+The **instantiation key** is the premises' identity keys, sorted and
+joined with `|`, hashed to sixteen hex digits by a small FNV-1a-64
+written in the rules layer (`sxhash` is not stable across images and
+no hashing library is a dependency). A premise deleted and written
+again with the same identity is the same instantiation: the firing is
+re-opened, not duplicated. The body needs at least one `claim/7` goal
+and at most eight premises.
+
+A stored production is a `production` record (`make-production`,
+slots `name version family body salience writes action`), `action` a
+string naming a function registered in `*production-actions*`; a
+record naming no registered action, or whose body does not compile,
+is refused at commit. `def-production` registers both the spec and
+the action under the production's name in the image.
+
+**One stratification graph.** A production's `writes` are edges from
+each written relation to its reads, so a rule reading what a
+production writes runs in a later stratum, and a production that
+reads what it writes, or closes a cycle through its writes, is a
+`rule-compile-error`.
+
+**The agenda.** After a step's strata have run, the firings the step
+changed become agenda entries, `:added` for a derived or re-opened
+firing and `:lost` for a retracted one, sorted by salience descending,
+then arrival, then key, and each is fired:
+
+```lisp
+(funcall action event match)
+;; match => (:key "k1|k2" :premises (claims) :bindings (("?H" . "h1") ...)
+;;           :firing claim)
+```
+
+`:premises` are the premise claims that still exist, `:key` their
+identity keys from the firing's provenance records (so a `:lost` match
+whose premise is gone still has it), `:bindings` the body's variables
+for an `:added` match and NIL when the body no longer matches. An
+action may `with-transaction`; its commit queues a delta the running
+step takes next. A write to a relation outside the production's
+`writes` is recorded on `forward-rules-status`'s failures and the
+write stands; so is an action that signals, and the agenda goes on.
+`run-rules` maintains the firing claims and fires no action.
+
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it
 reports nothing derived and nothing swept. If it does not, that is a

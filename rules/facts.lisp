@@ -740,6 +740,46 @@ design §5.2)."
                      (local-time:timestamp+ x nsec :nsec)))
           (funcall cont))))))
 
+(defun %fnv-1a-64 (string)
+  "STRING's FNV-1a 64-bit hash over its character codes, as sixteen
+lowercase hex digits: stable across images, no dependency (forward-rules
+design §7, the firing subject key)."
+  (let ((h #xcbf29ce484222325))
+    (loop for ch across string
+          do (setf h (logand #xffffffffffffffff
+                             (* (logxor h (char-code ch))
+                                #x100000001b3))))
+    (format nil "~(~16,'0x~)" h)))
+
+(defun %joined-identity-keys (claims)
+  "CLAIMS' identity keys sorted and joined with |: a production
+instantiation's name in the clear."
+  (format nil "~{~A~^|~}"
+          (sort (mapcar #'graph-db.spacetime:claim-identity-key claims)
+                #'string<)))
+
+(defmacro %def-instantiation-key (n)
+  "INSTANTIATION-KEY/(N+1): ?KEY is the FNV-1a-64 hex of the N premise
+claims' joined identity keys.  The compiler appends this goal to a
+production's body (rules/compile.lisp); one arity per premise count."
+  (let* ((args (loop for i from 1 to n
+                     collect (intern (format nil "?P~D" i))))
+         (name (intern (format nil "INSTANTIATION-KEY/~D" (1+ n)))))
+    `(def-global-prolog-functor ,name (?key ,@args cont)
+       (let ((claims (list ,@(mapcar (lambda (a) `(%claim-arg ,a)) args))))
+         (when (every #'identity claims)
+           (%yield (?key (%fnv-1a-64 (%joined-identity-keys claims)))
+             (funcall cont)))))))
+
+(%def-instantiation-key 1)
+(%def-instantiation-key 2)
+(%def-instantiation-key 3)
+(%def-instantiation-key 4)
+(%def-instantiation-key 5)
+(%def-instantiation-key 6)
+(%def-instantiation-key 7)
+(%def-instantiation-key 8)
+
 (def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601
 string or a timestamp); a claim with no extent makes no validity

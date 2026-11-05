@@ -111,7 +111,12 @@ storage formats (#60).
   a threshold against the evaluation instant; a forward-enabled store
   schedules its own re-evaluation at the flip instant. The `graph-db`
   package now shadows `now`, so the guard resolves the functor rather
-  than local-time's.
+  than local-time's. `def-production` and the stored `production`
+  record add OPS5-style productions on the same machinery: a matching
+  body derives a durable `firing` claim keyed by the premises'
+  identities and the action runs from a salience-ordered agenda.
+  `def-rules-schema` now also declares the `production` record and
+  the `firing` family.
 
 - **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
   subject and object keys, tested with `>/2`'s own predicate as a filter

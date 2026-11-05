@@ -405,3 +405,19 @@ premise claim, so the flip instant is a function of the premises."
       (is (eq :gain (second (first
                              (graph-db.rules:compiled-rule-thresholds
                               c))))))))
+
+(defparameter *self-feeding-body*
+  "(claim ?a rt-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)")
+
+(test a-production-reading-what-it-writes-is-refused
+  "One stratification graph (spec §7): a production's writes are edges
+to its reads, so reading what it writes is a cycle."
+  (with-rules-graph (g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-production "loop" :version "1"
+             :family rt-claim :body *self-feeding-body*
+             :writes '("hosted-on") :action (lambda (e m) (list e m)))
+           (signals graph-db.rules:rule-compile-error
+             (graph-db.rules:compile-production g "loop")))
+      (graph-db.rules:undef-production "loop"))))

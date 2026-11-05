@@ -145,16 +145,36 @@ forward evaluation made itself (*FORWARD-HOOK-SUPPRESSED*) is
 ignored."
   (let ((state (%forward-state (graph-db::graph tx))))
     (when (and state (not *forward-hook-suppressed*))
-      (let ((writes (graph-db::writes tx)))
-        (when (some (lambda (w) (typep (graph-db::node w) 'rule)) writes)
+      (let ((writes (graph-db::writes tx))
+            (rule-class (find-class 'rule nil))
+            (production-class (find-class 'production nil)))
+        (when (some (lambda (w)
+                      (let ((node (graph-db::node w)))
+                        (or (and rule-class (typep node rule-class))
+                            (and production-class
+                                 (typep node production-class)))))
+                    writes)
           (setf (forward-state-cache-stamp state) nil))
         (let ((delta (claim-delta writes (forward-state-graph state))))
+          (when *agenda-production*
+            (%check-production-writes state *agenda-production* delta))
           (when (plusp (hash-table-count delta))
             (%enqueue-delta state delta)
             ;; A nested commit (spec §6): queue only; the outermost
             ;; commit's hook, outside every *TRANSACTION*, drains.
             (unless graph-db::*transaction*
               (forward-step (forward-state-graph state)))))))))
+
+(defun %check-production-writes (state compiled delta)
+  "An action's commit wrote DELTA: a relation outside the production's
+declared writes is recorded on FAILURES (spec §7); the write stands."
+  (let* ((spec (compiled-rule-spec compiled))
+         (writes (production-spec-writes spec)))
+    (loop for rel being the hash-keys of delta
+          unless (member rel writes :test #'string=)
+            do (%note-failure state (rule-spec-name spec)
+                              (format nil "wrote ~A outside its writes ~
+~S" rel writes)))))
 
 (defun enable-forward-rules (graph)
   "Derive at commit on GRAPH from now on (spec §5.3): installs the
