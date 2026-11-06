@@ -694,10 +694,27 @@ engine takes: ~A" text why))))
                                 do (incf i))
                           (when (or (= start i) (>= i n))
                             (refuse "a number must precede each unit"))
-                          (let* ((num (let ((*read-default-float-format*
-                                              'double-float))
-                                        (read-from-string
-                                         (subseq text start i))))
+                          (let* ((num (let ((value 0) (scale 1) (dot nil)
+                                            (digits 0))
+                                        (loop for j from start below i
+                                              for c = (char text j)
+                                              do (if (char= c #\.)
+                                                     (if dot
+                                                         (refuse
+                                                          "invalid number")
+                                                         (setf dot t))
+                                                     (progn
+                                                       (incf digits)
+                                                       (setf value
+                                                             (+ (* value 10)
+                                                                (digit-char-p
+                                                                 c)))
+                                                       (when dot
+                                                         (setf scale
+                                                               (* scale 10))))))
+                                        (when (zerop digits)
+                                          (refuse "missing number"))
+                                        (/ value scale)))
                                  (unit (char-upcase (char text i)))
                                  (per-unit
                                    (cond ((and (not time-part)
@@ -718,8 +735,6 @@ not fixed durations"))
                                          (t (refuse (format nil
                                                             "unknown unit ~A"
                                                             unit))))))
-                            (unless (realp num)
-                              (refuse "a number must precede each unit"))
                             (incf total (* num per-unit 1000000000))
                             (setf any t)
                             (incf i)))))))

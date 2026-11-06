@@ -298,6 +298,7 @@ retraction's own commit triggers re-opens it; RUN-RULES agrees."
         (when again
           (is (equalp before (graph-db:id again)))))
       (is (= 2 (length (derived g 'rt-claim "web-hosts" :current nil))))
+      (is (null (getf (graph-db.rules:forward-rules-status g) :failures)))
       (is-true (run-rules-is-quiet g)))))
 
 (defparameter *flagged-head*
@@ -372,7 +373,7 @@ its delta and returns; the running step drains it."
     (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
                   :head *web-hosts-head* :body *slow-web-hosts-body*)
     (graph-db.rules:enable-forward-rules g)
-    (setf *slow-seconds* 0.6)
+    (setf *slow-seconds* 1.0)
     (unwind-protect
          (let ((a (bt:make-thread
                    (lambda ()
@@ -381,7 +382,11 @@ its delta and returns; the running step drains it."
                    :name "committer a"))
                (depth nil)
                (elapsed nil))
-           (sleep 0.15)                 ; A is inside its step by now
+           (is-true (wait-until
+                     (lambda ()
+                       (getf (graph-db.rules:forward-rules-status g)
+                             :running-p))
+                     3))
            (let ((start (get-internal-real-time)))
              (commit-runs-web g "h2")
              (setf elapsed (/ (- (get-internal-real-time) start)
@@ -389,7 +394,7 @@ its delta and returns; the running step drains it."
            (setf depth (getf (graph-db.rules:forward-rules-status g)
                              :queue-depth))
            (bt:join-thread a)
-           (is (< elapsed 0.4) "the second commit waited ~,2F s" elapsed)
+           (is (< elapsed 0.5) "the second commit waited ~,2F s" elapsed)
            (is (eql 1 depth))
            (is (equal '("h1" "h2")
                       (sort (mapcar #'claim-object-key
@@ -533,6 +538,10 @@ touches the closed store afterwards."
     (graph-db.rules:enable-forward-rules g)
     (commit-runs-web g "h1")
     (is (eql 1 (getf (graph-db.rules:forward-rules-status g) :timers)))
+    (let ((delta (make-hash-table :test 'equal)))
+      (setf (gethash "runs" delta) (list (cons :claim 1)))
+      (graph-db.rules::%enqueue-delta (graph-db.rules::%forward-state g)
+                                      delta))
     (close-graph g)
     (is (equal '(:enabled nil) (graph-db.rules:forward-rules-status g)))
     (is-true (wait-until
@@ -1193,3 +1202,129 @@ unwound attempt's unsaved claim as standing."
             (is (= 0 count))
             (is-true (nth-value 1 (gethash key (graph-db.rules::%existing-table
                                                 lazy))))))))))
+
+(test a-commit-during-the-opt-in-queues-and-is-drained-after-it
+  (with-rules-graph (g)
+    (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                  :head *web-hosts-head* :body *slow-web-hosts-body*)
+    (commit-runs-web g "h1")
+    (setf *slow-seconds* 0.6)
+    (unwind-protect
+         (let ((thread (bt:make-thread
+                        (lambda ()
+                          (let ((graph-db:*graph* g))
+                            (graph-db.rules:enable-forward-rules g))))))
+           (is-true (wait-until
+                     (lambda ()
+                       (getf (graph-db.rules:forward-rules-status g)
+                             :running-p))
+                     3))
+           (commit-runs-web g "h2")
+           (bt:join-thread thread)
+           (is (equal '("h1" "h2")
+                      (sort (mapcar #'claim-object-key
+                                    (derived g 'rt-claim "web-hosts"))
+                            #'string<)))
+           (is (zerop (getf (graph-db.rules:forward-rules-status g)
+                            :queue-depth))))
+      (setf *slow-seconds* 0))))
+
+(defvar *late-events-464* nil)
+
+(defun late-action-464 (event match)
+  (declare (ignore event match))
+  (push :first *late-events-464*))
+
+(test a-rule-that-does-not-compile-is-noted-once-per-refresh-under-the-cap
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-rule "bad-464" :version "1" :family rt-claim
+             :head *web-hosts-head*
+             :body (concatenate 'string *web-hosts-body*
+                                " (no-such-functor ?p)"))
+           (commit-runs-web g "h1")
+           (is (find "bad-464"
+                     (getf (graph-db.rules:forward-rules-status g) :failures)
+                     :key #'car :test #'equal))
+           (let ((graph-db.rules::*forward-failures-kept* 2))
+             (loop for host in '("h2" "h3")
+                   do (setf (graph-db.rules::forward-state-cache-stamp
+                             (graph-db.rules::%forward-state g)) nil)
+                      (commit-runs-web g host))
+             (is (<= (length (getf (graph-db.rules:forward-rules-status g)
+                                   :failures))
+                     2))))
+      (graph-db.rules:undef-rule "bad-464"))))
+
+(test a-production-action-given-as-a-symbol-is-looked-up-at-fire-time
+  (with-rules-graph (g)
+    (let ((*late-events-464* nil)
+          (original (fdefinition 'late-action-464)))
+      (unwind-protect
+           (with-production ("late-464" :version "1" :family rt-claim
+                                         :body *web-watch-body*
+                                         :action 'late-action-464)
+             (graph-db.rules:enable-forward-rules g)
+             (commit-runs-web g "h1")
+             (setf (fdefinition 'late-action-464)
+                   (lambda (event match)
+                     (declare (ignore event match))
+                     (push :second *late-events-464*)))
+             (commit-runs-web g "h2")
+             (is (equal '(:first :second) (reverse *late-events-464*))))
+        (setf (fdefinition 'late-action-464) original)))))
+
+(test a-solutionless-run-reports-no-inherited-inferences
+  (with-rules-graph (g)
+    (let* ((rule (write-web-hosts g))
+           (compiled (graph-db.rules:compile-rule g rule))
+           (report (graph-db.rules::%make-rule-report :inferences 999)))
+      (is (null (graph-db.rules::%solutions compiled g report)))
+      (is (= 0 (graph-db.rules:rule-report-inferences report))))))
+
+(test the-full-path-does-not-recompile-a-non-recursive-rule
+  (with-rules-graph (g)
+    (write-rule g :name "unreached" :version "1" :family "rt-claim"
+                  :head *unreached-head* :body *unreached-body*)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-runs-web g "h1")
+    (commit-runs-web g "h2")
+    (let ((original (fdefinition 'graph-db.rules:compile-rule))
+          (calls 0))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db.rules:compile-rule)
+                   (lambda (&rest args)
+                     (incf calls)
+                     (apply original args)))
+             (seed-one g)
+             (is (= 0 calls))
+             (is (= 2 (length (unreached-hosts g)))))
+        (setf (fdefinition 'graph-db.rules:compile-rule) original)))))
+
+(test a-match-error-lands-on-failures
+  (with-rules-graph (g)
+    (with-production ("match-464" :version "1" :family rt-claim
+                                  :body *web-watch-body*
+                                  :action (note-firing "match-464"))
+      (graph-db.rules:enable-forward-rules g)
+      (commit-runs-web g "h1")
+      (let ((original (fdefinition 'graph-db.rules::%solutions)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db.rules::%solutions)
+                     (lambda (&rest args)
+                       (if (and (> (length args) 3)
+                                (eq '= (caar (fourth args))))
+                           (error "boom")
+                           (apply original args))))
+               (commit-runs-web g "h2")
+               (is (find-if (lambda (failure)
+                              (and (equal "match-464" (car failure))
+                                   (search "boom" (cdr failure))))
+                            (getf (graph-db.rules:forward-rules-status g)
+                                  :failures))))
+          (setf (fdefinition 'graph-db.rules::%solutions) original))))))

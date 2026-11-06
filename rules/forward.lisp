@@ -60,9 +60,8 @@ FAILURES and skipped."
         (when (%runnable-spec-p graph spec)
           (handler-case (push (compile-rule graph spec) compiled)
             (rule-compile-error (c)
-              (push (cons (rule-spec-name spec)
-                          (rule-compile-error-reason c))
-                    (forward-state-failures state))))))
+              (%note-failure state (rule-spec-name spec)
+                             (rule-compile-error-reason c))))))
       (setf (forward-state-compiled state) (nreverse compiled)
             (forward-state-cache-stamp state) *def-rules-stamp*)))
   (forward-state-compiled state))
@@ -224,18 +223,31 @@ declared writes is recorded on FAILURES (spec §7); the write stands."
 post-commit hook once per image, registers GRAPH, and runs RUN-RULES
 once so the store starts at its fixpoint -- a premise committed
 before the opt-in is not a delta.  Returns GRAPH's FORWARD-STATE."
-  (let ((state (bordeaux-threads:with-lock-held (*forward-states-lock*)
-                 (pushnew '%forward-hook graph-db:*after-commit-hooks*)
-                 (or (gethash graph *forward-states*)
-                     (setf (gethash graph *forward-states*)
-                           (%make-forward-state :graph graph))))))
-    (let ((*forward-hook-suppressed* t))
-      (run-rules graph))
+  (let* ((first-p nil)
+         (state (bordeaux-threads:with-lock-held (*forward-states-lock*)
+                  (pushnew '%forward-hook graph-db:*after-commit-hooks*)
+                  (or (gethash graph *forward-states*)
+                      (let ((new (%make-forward-state :graph graph)))
+                        (bordeaux-threads:with-lock-held
+                            ((forward-state-lock new))
+                          (setf (forward-state-running-p new) t))
+                        (setf first-p t
+                              (gethash graph *forward-states*) new))))))
+    (unwind-protect
+         (let ((*forward-hook-suppressed* t))
+           (run-rules graph))
+      (when first-p
+        (let ((queued (bordeaux-threads:with-lock-held
+                          ((forward-state-lock state))
+                        (setf (forward-state-running-p state) nil)
+                        (forward-state-queue state))))
+          (when queued (forward-step graph)))))
     state))
 
 (defun disable-forward-rules (graph)
   "Stop deriving at commit on GRAPH; pending deltas and timers are
-dropped, the timer thread stopped.  T when it was enabled."
+dropped, the timer thread stopped.  A step on another user thread is not
+waited for.  T when it was enabled."
   (let ((state (bordeaux-threads:with-lock-held (*forward-states-lock*)
                  (prog1 (gethash graph *forward-states*)
                    (remhash graph *forward-states*)))))
