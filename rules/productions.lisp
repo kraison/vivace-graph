@@ -32,7 +32,12 @@ value), or NIL when it no longer matches (a :LOST event)."
              (loop for v in vars
                    for value in row
                    collect (cons (symbol-name v) value))))
-    (error () nil)))
+    (error (c)
+      (let ((state (%forward-state graph)))
+        (when state
+          (%note-failure state (rule-spec-name (compiled-rule-spec compiled))
+                         (princ-to-string c))))
+      nil)))
 
 (defun %match-key (graph claim)
   "The instantiation's name in the clear: the premise identity keys the

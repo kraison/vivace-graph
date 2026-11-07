@@ -14,6 +14,13 @@ between releases; cutting a release renames it to the new version and dates it.
 This section carries a **MAJOR** change: the spatial contract and two
 storage formats (#60).
 
+### Fixed
+
+- Refuse malformed ISO duration numbers without invoking the Lisp reader,
+  queue commits during forward opt-in, and clarify shutdown, firing history
+  and costs; cap compile failures, late-bind production actions, reset
+  inference counts, reuse compiled rules, and report match errors (#464).
+
 ### Changed
 
 - **A forward rules step reads what it touches, not the touched rule's

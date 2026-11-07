@@ -1075,7 +1075,9 @@ follow-on transaction, not part of the committing one). Nothing calls
 `enable-forward-rules` registers the store and runs `run-rules` once,
 so a store with premises committed before the opt-in starts at its
 fixpoint. The opt-in is per open graph object and lives in the image:
-reopen the store, opt in again.
+reopen the store, opt in again. Disable and close do not wait for a
+step running on another user thread, even though status then says disabled.
+Stop the caller's committers before disabling or closing the graph.
 
 **The delta.** `claim-delta` renders a committed transaction's writes
 (every node of a registered claim family) as a table, relation →
@@ -1235,7 +1237,9 @@ slots `name version family body salience writes action`), `action` a
 string naming a function registered in `*production-actions*`; a
 record naming no registered action, or whose body does not compile,
 is refused at commit. `def-production` registers both the spec and
-the action under the production's name in the image.
+the action under the production's name in the image. `:action` takes a
+function, or a symbol that is looked up at fire time, so an action
+redefined at the REPL is the one that runs (#464).
 
 **One stratification graph.** A production's `writes` are edges from
 each written relation to its reads, so a rule reading what a
@@ -1262,7 +1266,10 @@ action may `with-transaction`; its commit queues a delta the running
 step takes next. A write to a relation outside the production's
 `writes` is recorded on `forward-rules-status`'s failures and the
 write stands; so is an action that signals, and the agenda goes on.
-`run-rules` maintains the firing claims and fires no action.
+Matches present at enable and repairs by `run-rules` get firing claims
+but no `:added` delivery; consumers read the firing claims for the initial
+set. A firing's history is readable through version history only: re-opening
+a kept derivation overwrites its transaction extent with an open-from-now one.
 
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it
@@ -1275,7 +1282,9 @@ resolved through the subject-relation index (the claims of one subject
 under one relation, from every producer), each swept or kept derived
 claim's provenance through the derivation family's subject index, and
 nothing enumerates the producer. The derivation itself is proportional
-to the delta's solutions. `forward-rules-status`'s `:last-step-elapsed`
+to the delta's solutions. On the targeted path, `*rules-max-inferences*`
+bounds each dependent's query separately, so the step total is that bound
+times the dependents it re-derives. `forward-rules-status`'s `:last-step-elapsed`
 is the last step's wall time; `bench-forward-step-reads` in
 `tests/perf/rules-bench.lisp` runs a one-claim step against two
 derived-set sizes and reports the ratio (near 1). The full path --

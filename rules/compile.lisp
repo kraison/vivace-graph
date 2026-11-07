@@ -90,7 +90,7 @@ store's other rules.  Returns NAME."
   (setf (gethash name *production-actions*)
         (etypecase action
           (function action)
-          (symbol (symbol-function action))))
+          (symbol action)))
   (setf (gethash name *def-productions*)
         (%make-production-spec :name name :version version
                                :family "firing" :source-family
@@ -767,6 +767,8 @@ or the image." production (graph-db:graph-name graph))))))
   "COMPILED is a production's COMPILED-RULE."
   (and (compiled-rule-p compiled)
        (production-spec-p (compiled-rule-spec compiled))))
+
+(declaim (notinline compile-rule))
 
 (defun compile-rule (graph rule &key (others nil others-p))
   "RULE (a RULE record, a RULE-SPEC, or a stored rule's name) compiled

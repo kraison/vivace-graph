@@ -974,3 +974,11 @@ absence and a subject with no claim at all are not answers."
     (is (null (select-flat (?s)
                 (claim-absent ?c rt-claim "host" "h5" "scanned" ?o ?ok)
                 (claim-standing ?c ?s))))))
+
+(test a-malformed-duration-number-is-refused-not-read
+  (dolist (text '("P.D" "P1.2.3D" "PT.S"))
+    (signals graph-db:query-precondition-error
+      (graph-db::%parse-iso-duration text)))
+  (is (= 1500000000 (graph-db::%parse-iso-duration "PT1.5S")))
+  (is (= (* 14 86400 1000000000)
+         (graph-db::%parse-iso-duration "P2W"))))

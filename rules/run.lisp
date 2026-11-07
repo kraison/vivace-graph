@@ -148,6 +148,8 @@ some store has run DEF-RULES-SCHEMA."
 
 ;;; Evaluating the body
 
+(declaim (notinline %solutions))
+
 (defun %solutions (compiled graph report
                    &optional (goals (compiled-rule-goals compiled))
                              (vars (compiled-rule-vars compiled)))
@@ -168,6 +170,7 @@ scheduler asks for others."
       (error "RUN-RULE needs a resource bound: *RULES-MAX-INFERENCES* ~
 or *RULES-TIMEOUT*, or the DSL defaults they fall back to (spec §7, ~
 ruling P4)."))
+    (setf (rule-report-inferences report) 0)
     (let ((graph-db::*query-default-max-inferences* max-inferences)
           (graph-db::*query-default-timeout* timeout)
           (graph-db::*query-default-limit* cap))
@@ -1383,34 +1386,17 @@ rounds" *rules-max-rounds*)))
         (mapcar #'%stratum-run-report runs)))))
 
 
-(defun run-rule (graph rule &key scope)
-  "Derive RULE afresh and reconcile the result with its previous
-derivation (spec §7, ruling P10).  RULE is a RULE record, a RULE-SPEC,
-or a name (stored first, then DEF-RULE).  SCOPE (spec §10) is the open
-stores the body may read, GRAPH put first and once; the rule writes
-GRAPH alone.  => RULE-REPORT.
-
-NIL or (GRAPH) is S2 exactly: evaluation and reconcile in one
-transaction.  With another store in SCOPE the body is evaluated BEFORE
-the write transaction, under %UNDER-SNAPSHOTS, because a read-write
-transaction refuses every read of another store (S3-P2, GH #53).  The
-trap: that evaluation is not serialised against a premise committed
-after its snapshots -- the next run sees such a premise, this one does
-not.
-
-A refusal of any kind -- compile, the rails, effects, a commit
-constraint, a missing extent -- is reported, never signalled, and
-unwinds the whole run so the previous derivation stands; an operator
-error (no resource bound, no such rule, a SCOPE that is not a list of
-open, keyword-named stores, a foreign store in SCOPE inside the
-caller's transaction) signals."
+(defun %run-compiled-rule (graph rule &key scope)
+  "Run RULE, compiling it if needed, and reconcile its derivation."
   (let* ((scope (%normalize-scope graph scope))
          (foreign (rest scope))
-         (spec (%resolve-rule graph rule))
+         (spec (if (compiled-rule-p rule)
+                   (compiled-rule-spec rule)
+                   (%resolve-rule graph rule)))
          (report (%make-rule-report :rule-name (rule-spec-name spec)
                                     :version (rule-spec-version spec)))
          (start (get-internal-real-time))
-         (compiled nil)
+         (compiled (and (compiled-rule-p rule) rule))
          (graph-db::*evaluation-instant*
            (or graph-db::*evaluation-instant*
                (graph-db.spacetime::%st-now))))
@@ -1447,10 +1433,13 @@ caller's transaction) signals."
                        :text (format nil "~(~S~) does not carry ~(~A~)"
                                      (graph-db:graph-name graph)
                                      needed))))
-            (setf compiled (compile-rule graph spec)))
+            (unless compiled
+              (setf compiled (compile-rule graph spec))))
         (rule-compile-error (c)
+          (setf compiled nil)
           (refuse :rule (rule-compile-error-reason c)))
         (rule-run-refusal (c)
+          (setf compiled nil)
           (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c))))
       (when compiled
         ;; I2: the STRATUM decides the path, not this rule's own
@@ -1558,6 +1547,29 @@ caller's transaction) signals."
           (/ (- (get-internal-real-time) start)
              (float internal-time-units-per-second 1.0d0)))
     report))
+
+(defun run-rule (graph rule &key scope)
+  "Derive RULE afresh and reconcile the result with its previous
+derivation (spec §7, ruling P10).  RULE is a RULE record, a RULE-SPEC,
+or a name (stored first, then DEF-RULE).  SCOPE (spec §10) is the open
+stores the body may read, GRAPH put first and once; the rule writes
+GRAPH alone.  => RULE-REPORT.
+
+NIL or (GRAPH) is S2 exactly: evaluation and reconcile in one
+transaction.  With another store in SCOPE the body is evaluated BEFORE
+the write transaction, under %UNDER-SNAPSHOTS, because a read-write
+transaction refuses every read of another store (S3-P2, GH #53).  The
+trap: that evaluation is not serialised against a premise committed
+after its snapshots -- the next run sees such a premise, this one does
+not.
+
+A refusal of any kind -- compile, the rails, effects, a commit
+constraint, a missing extent -- is reported, never signalled, and
+unwinds the whole run so the previous derivation stands; an operator
+error (no resource bound, no such rule, a SCOPE that is not a list of
+open, keyword-named stores, a foreign store in SCOPE inside the
+caller's transaction) signals."
+  (%run-compiled-rule graph rule :scope scope))
 
 ;;; Every rule a store can run
 
@@ -1946,9 +1958,8 @@ post-commit hook.  => the RULE-REPORTs, in the order run."
                                     (mapcar (lambda (c)
                                               (unit
                                                (lambda ()
-                                                 (run-rule
-                                                  graph
-                                                  (compiled-rule-spec c)))))
+                                                 (%run-compiled-rule
+                                                  graph c))))
                                             stratum))))))))
             (dolist (r rs) (push r reports))
             (unless (some (lambda (r)
