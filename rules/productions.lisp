@@ -14,10 +14,15 @@
 
 (defun %match-bindings (graph compiled premises)
   "The body's variable bindings for the match PREMISES -- the body run
-once with its premise variables bound -- as an alist of (name .
-value), or NIL when it no longer matches (a :LOST event)."
+once with each premise variable bound to its own premise, body order
+(#466) -- as an alist of (name . value) over COMPILED-RULE-BODY-VARS,
+or NIL when it no longer matches (a :LOST event) or a premise is gone
+(a NIL in PREMISES: the body is not run, so no other row is reported
+as this one)."
+  (when (some #'null premises)
+    (return-from %match-bindings nil))
   (handler-case
-      (let* ((vars (compiled-rule-vars compiled))
+      (let* ((vars (compiled-rule-body-vars compiled))
              (binders (loop for v in (compiled-rule-premise-vars compiled)
                             for p in premises
                             collect (list '= v p)))
@@ -39,26 +44,25 @@ value), or NIL when it no longer matches (a :LOST event)."
                          (princ-to-string c))))
       nil)))
 
-(defun %match-key (graph claim)
-  "The instantiation's name in the clear: the premise identity keys the
-FIRING claim's DERIVED-FROM records name, sorted and joined with |.
-Read from the records, not the premises, so a :LOST match whose
-premise is gone still has its key."
-  (let ((keys (remove-duplicates
-               (mapcar #'graph-db.spacetime:claim-object-key
-                       (claims-touching-provenance graph claim))
-               :test #'string=)))
-    (format nil "~{~A~^|~}" (sort keys #'string<))))
+(defun %match-keys (claim)
+  "The FIRING claim CLAIM's premise identity keys in body order, read
+from its object key (#471) -- so a :LOST match whose premise is gone
+still has them."
+  (graph-db::%split-joined-keys
+   (graph-db.spacetime:claim-object-key claim)))
 
-(defun claims-touching-provenance (graph claim)
-  "CLAIM's DERIVED-FROM records, current or retracted."
-  (remove-if-not (lambda (r)
-                   (string= "derived-from"
-                            (graph-db.spacetime:claim-relation r)))
-                 (graph-db.spacetime:claims-touching
-                  graph 'derivation :claim
-                  (graph-db.spacetime:claim-identity-key claim)
-                  :role :subject)))
+(defun match-row (match)
+  "MATCH, an action's second argument, as RUN-GUARDED-PROLOG :FORMAT
+:DATA renders that solution of the body: (VALUES COLUMNS CELLS),
+COLUMNS the body's variables as camelCase field names, CELLS
+JSON-shaped (a node its id string).  Both NIL when the match carries
+no bindings -- a :LOST whose body no longer matches (#466)."
+  (let ((bindings (getf match :bindings)))
+    (values (mapcar (lambda (b)
+                      (graph-db::%query-var-field (make-symbol (car b))))
+                    bindings)
+            (mapcar (lambda (b) (graph-db::%query-value->json (cdr b)))
+                    bindings))))
 
 (defun %fire-production (graph state compiled event claim)
   "One agenda entry: the action, with the match's key, premises and
@@ -66,8 +70,9 @@ bindings; a signal is recorded on FAILURES and the agenda goes on."
   (let* ((spec (compiled-rule-spec compiled))
          (name (rule-spec-name spec))
          (action (gethash (production-spec-action spec) *production-actions*))
-         (premises (sort (premises-of graph claim) #'string<
-                         :key #'graph-db.spacetime:claim-identity-key)))
+         (keys (%match-keys claim))
+         (premises (mapcar (lambda (k) (%claim-by-identity-key graph k))
+                           keys)))
     (if (null action)
         (%note-failure state name
                        (format nil "action ~S is not registered"
@@ -75,8 +80,8 @@ bindings; a signal is recorded on FAILURES and the agenda goes on."
         (handler-case
             (let ((*agenda-production* compiled))
               (funcall action event
-                       (list :key (%match-key graph claim)
-                             :premises premises
+                       (list :key (format nil "~{~A~^|~}" keys)
+                             :premises (remove nil premises)
                              :bindings (%match-bindings graph compiled
                                                         premises)
                              :firing claim)))

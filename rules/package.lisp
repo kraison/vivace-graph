@@ -51,7 +51,7 @@
    #:production-spec #:production-spec-p #:production-spec-salience
    #:production-spec-writes #:production-spec-action
    #:compile-production #:compiled-production-p #:run-agenda
-   #:firing #:*production-actions*
+   #:firing #:*production-actions* #:match-row #:find-production
    ;; forward evaluation (forward-rules design, #456)
    #:claim-delta #:delta-touches-p
    #:enable-forward-rules #:disable-forward-rules

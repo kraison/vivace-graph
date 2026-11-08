@@ -1227,13 +1227,19 @@ names each firing's premises, and `run-rules` repairs them.
   :action (lambda (event match) ...))
 ```
 
-The **instantiation key** is the premises' identity keys, sorted and
-joined with `|`, hashed to sixteen hex digits by a small FNV-1a-64
-written in the rules layer (`sxhash` is not stable across images and
-no hashing library is a dependency). A premise deleted and written
-again with the same identity is the same instantiation: the firing is
-re-opened, not duplicated. The body needs at least one `claim/7` goal
-and at most eight premises.
+The **instantiation key** is the premises' identity keys **in body
+order**, each with its own `|` escaped, joined with `|`, hashed to
+sixteen hex digits by a small FNV-1a-64 written in the rules layer
+(`sxhash` is not stable across images and no hashing library is a
+dependency). Body order is what makes a self-join's `(a,b)` and
+`(b,a)` two instantiations, as they are two rows of the query (#471).
+The firing claim is binary: subject key the hash, object namespace
+`instantiation`, object key the joined keys in the clear, so a match
+reads its key off the firing and keeps it after a premise is deleted.
+A premise deleted and written again with the same identity is the same
+instantiation: the firing is re-opened, not duplicated. The body needs
+at least one top-level `claim/7` goal and at most eight premises, and
+a body with neither is refused in those words (#466).
 
 A stored production is a `production` record (`make-production`,
 slots `name version family body salience writes action`), `action` a
@@ -1261,11 +1267,19 @@ then arrival, then key, and each is fired:
 ;;           :firing claim)
 ```
 
-`:premises` are the premise claims that still exist, `:key` their
-identity keys from the firing's provenance records (so a `:lost` match
-whose premise is gone still has it), `:bindings` the body's variables
-for an `:added` match and NIL when the body no longer matches. An
-action may `with-transaction`; its commit queues a delta the running
+`:premises` are the premise claims that still exist, in body order;
+`:key` their identity keys in body order joined with `|`, read from the
+firing claim (so a `:lost` match whose premise is gone still has it);
+`:bindings` every variable the body text names, in first-appearance
+order, each premise variable bound to its own premise -- `(("?P" .
+claim) ("?H" . "h1") ...)` -- for an `:added` match, and NIL when the
+body no longer matches or a premise is gone. Nothing synthesised
+appears, and a body may name `?c` or `?instantiation-key` (#466).
+`(match-row match)` renders a match as `run-guarded-prolog :format
+:data` renders that solution, `(values columns cells)`: columns the
+camelCase field names, a node its id string; both NIL without
+bindings. `(find-production graph name)` answers the stored
+`production` record or NIL. An action may `with-transaction`; its commit queues a delta the running
 step takes next. A write to a relation outside the production's
 `writes` is recorded on `forward-rules-status`'s failures and the
 write stands; so is an action that signals, and the agenda goes on.

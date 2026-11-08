@@ -28,6 +28,19 @@ storage formats (#60).
 
 ### Changed
 
+- **A production's instantiation key keeps body position, and its
+  firing claim carries the key in the clear** (#471, #466). The key was
+  the premises' identity keys sorted, so a self-join's `(a,b)` and
+  `(b,a)` were one instantiation and a standing query missed a row. The
+  firing claim is now binary, object namespace `instantiation`, object
+  key the joined keys. **Firing claims written before this change have
+  other keys**: the first `run-rules` or forward step that touches the
+  production retracts them and derives the instantiations afresh, and
+  no action is called for either, as for any repair. A match's
+  `:bindings` now carries every body variable in first-appearance order
+  with each premise bound to its own variable, a body may name any
+  variable, the premise-count refusals say what they measure, and
+  `match-row` and `find-production` are exported.
 - **A forward rules step reads what it touches, not the touched rule's
   whole derivation** (#457). The forward and targeted paths resolve
   each identity they derive through the subject-relation index and

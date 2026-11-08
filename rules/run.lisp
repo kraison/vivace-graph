@@ -131,7 +131,7 @@ some store has run DEF-RULES-SCHEMA."
     ((rule-spec-p rule) rule)
     ((let ((class (find-class 'production nil)))
        (and class (typep rule class)))
-     (%production-rule-spec graph (%production-spec-of-record rule)))
+     (%production-spec-of-record rule))
     ((stringp rule)
      (let ((stored (and (%graph-declares-p graph 'rule)
                         (first (graph-db:index-lookup
@@ -139,9 +139,8 @@ some store has run DEF-RULES-SCHEMA."
        (cond ((and stored (not (graph-db:deleted-p stored)))
               (rule-spec-of stored))
              ((find-def-rule rule))
-             ((let ((p (or (%stored-production graph rule)
-                           (find-def-production rule))))
-                (and p (%production-rule-spec graph p))))
+             ((or (%stored-production graph rule)
+                  (find-def-production rule)))
              (t (error "No rule named ~S in ~(~S~) or the image."
                        rule (graph-db:graph-name graph))))))
     (t (rule-spec-of rule))))

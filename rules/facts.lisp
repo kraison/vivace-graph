@@ -766,25 +766,60 @@ design §7, the firing subject key)."
                                 #x100000001b3))))
     (format nil "~(~16,'0x~)" h)))
 
+(defun %escape-joined-field (string)
+  "STRING with its \\ and | escaped, the identity key's own rule, so
+%JOINED-IDENTITY-KEYS splits back exactly."
+  (with-output-to-string (out)
+    (loop for ch across string
+          do (when (or (char= ch #\\) (char= ch #\|))
+               (write-char #\\ out))
+             (write-char ch out))))
+
 (defun %joined-identity-keys (claims)
-  "CLAIMS' identity keys sorted and joined with |: a production
-instantiation's name in the clear."
+  "CLAIMS' identity keys in the order given -- body order, which is
+what makes (a,b) and (b,a) two instantiations (#471) -- each escaped
+by %ESCAPE-JOINED-FIELD and joined with |: a production
+instantiation's name in the clear, the FIRING claim's object key."
   (format nil "~{~A~^|~}"
-          (sort (mapcar #'graph-db.spacetime:claim-identity-key claims)
-                #'string<)))
+          (mapcar (lambda (c)
+                    (%escape-joined-field
+                     (graph-db.spacetime:claim-identity-key c)))
+                  claims)))
+
+(defun %split-joined-keys (string)
+  "The identity keys %JOINED-IDENTITY-KEYS joined into STRING, in
+order."
+  (let ((keys '())
+        (field (make-string-output-stream))
+        (i 0)
+        (n (length string)))
+    (loop while (< i n)
+          do (let ((ch (char string i)))
+               (cond ((char= ch #\\)
+                      (incf i)
+                      (when (< i n) (write-char (char string i) field)))
+                     ((char= ch #\|)
+                      (push (get-output-stream-string field) keys))
+                     (t (write-char ch field)))
+               (incf i)))
+    (push (get-output-stream-string field) keys)
+    (nreverse keys)))
 
 (defmacro %def-instantiation-key (n)
-  "INSTANTIATION-KEY/(N+1): ?KEY is the FNV-1a-64 hex of the N premise
-claims' joined identity keys.  The compiler appends this goal to a
-production's body (rules/compile.lisp); one arity per premise count."
+  "INSTANTIATION-KEY/(N+2): ?KEY is the FNV-1a-64 hex of the N premise
+claims' joined identity keys and ?CLEAR that joined string itself.  The
+compiler appends this goal to a production's body (rules/compile.lisp);
+one arity per premise count."
   (let* ((args (loop for i from 1 to n
                      collect (intern (format nil "?P~D" i))))
-         (name (intern (format nil "INSTANTIATION-KEY/~D" (1+ n)))))
-    `(def-global-prolog-functor ,name (?key ,@args cont)
+         (name (intern (format nil "INSTANTIATION-KEY/~D" (+ n 2)))))
+    `(def-global-prolog-functor ,name (?key ?clear ,@args cont)
        (let ((claims (list ,@(mapcar (lambda (a) `(%claim-arg ,a)) args))))
          (when (every #'identity claims)
-           (%yield (?key (%fnv-1a-64 (%joined-identity-keys claims)))
-             (funcall cont)))))))
+           (let ((clear (%joined-identity-keys claims)))
+             (%yield (?key (%fnv-1a-64 clear))
+               (%yield (?clear clear)
+                 (funcall cont)))))))))
 
 (%def-instantiation-key 1)
 (%def-instantiation-key 2)

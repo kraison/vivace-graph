@@ -328,8 +328,9 @@ forward-rules state; the write stands (it is committed) and
 `run-rules` is the repair.
 
 **Instantiation and refraction.** An instantiation is the production's
-name and version plus the sorted **identity keys** of its premise
-claims (`claim-identity-key`, which survives a premise being swept and
+name and version plus the **identity keys** of its premise claims in
+body order (sorted until #471, which made a self-join's two orders one
+instantiation and lost a row) (`claim-identity-key`, which survives a premise being swept and
 re-derived or deleted and re-registered; node ids do not). The step
 records each firing as a claim of a new unary family `firing`
 (relation = production name, subject key = a digest of those identity

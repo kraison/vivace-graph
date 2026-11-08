@@ -749,9 +749,14 @@ processed."
             (claim ?p rt-claim "host" ?h "runs" "app" "web")
             (claim-current ?p))))
 
+(defun joined-keys (claims)
+  "CLAIMS' identity keys joined with |, in the order given: a match's
+:KEY for those premises in body order (#471)."
+  (format nil "~{~A~^|~}" (mapcar #'claim-identity-key claims)))
+
 (defun q2-keys (g)
   (declare (ignore g))
-  (mapcar (lambda (row) (graph-db::%joined-identity-keys row))
+  (mapcar #'joined-keys
           (select (:max-inferences 10000000) (?p ?u)
             (claim ?p rt-claim "host" ?h "runs" "app" ?a) (claim-current ?p)
             (claim ?u rt-claim "host" ?h "up" nil nil) (claim-current ?u))))
@@ -917,6 +922,266 @@ reads cannot pin the committing thread; the step stops after
           (is (find :rounds (getf status :failures) :key #'car))
           (is (eql 0 (getf status :queue-depth)))
           (is-false (getf status :running-p)))))))
+
+;;; A match's bindings and premises, the body-ordered instantiation
+;;; key, MATCH-ROW and FIND-PRODUCTION (#466, #471)
+
+(defvar *matches* '()
+  "Full deliveries, newest first: (name event match).")
+
+(defun note-match (name)
+  (lambda (event match) (push (list name event match) *matches*)))
+
+(defun matches (name &optional event)
+  "The matches delivered to production NAME, oldest first, EVENT's only
+when given."
+  (loop for (n e m) in (reverse *matches*)
+        when (and (string= n name) (or (null event) (eq e event)))
+          collect m))
+
+(defun binding-names (match)
+  (mapcar #'car (getf match :bindings)))
+
+(defun binding (match name)
+  (cdr (assoc name (getf match :bindings) :test #'string=)))
+
+(defun relation-of (x)
+  (and x (claim-relation x)))
+
+(defun commit-host-claim (g host relation producer &optional object)
+  "One claim about HOST by PRODUCER, binary when OBJECT (an app) is
+given, in its own transaction.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (if object
+        (make-rt-claim-binary :graph g :subject-namespace :host
+                              :subject-key host :relation relation
+                              :object-namespace :app :object-key object
+                              :producer producer :standing :observed)
+        (make-rt-claim-unary :graph g :subject-namespace :host
+                             :subject-key host :relation relation
+                             :producer producer :standing :observed))))
+
+(defparameter *runs-app-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a) (claim-current ?p)")
+
+(test a-match-carries-every-body-variable-in-first-appearance-order
+  "#466 item 1: :BINDINGS is the body's variables, premises included,
+and nothing synthesised."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("row" :version "1" :family rt-claim
+                              :body *runs-app-body*
+                              :action (note-match "row"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (let ((m (first (matches "row" :added))))
+          (is (equal '("?P" "?H" "?A") (binding-names m)))
+          (is (equal (claim-identity-key (runs-web-premise g "h1"))
+                     (and (binding m "?P")
+                          (claim-identity-key (binding m "?P")))))
+          (is (equal "h1" (binding m "?H")))
+          (is (equal "web" (binding m "?A"))))))))
+
+(defparameter *runs-and-up-body*
+  "(claim ?a rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim ?b rt-claim \"host\" ?h \"up\" nil nil)")
+
+(test premises-pair-with-their-own-variables-whatever-the-key-order
+  "#466 item 2: ?a is the runs claim and ?b the up claim whichever
+producer's identity key sorts first, and :PREMISES are in body order."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("pair" :version "1" :family rt-claim
+                               :body *runs-and-up-body*
+                               :action (note-match "pair"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "runs" "z-scan" "web")
+        (commit-host-claim g "h1" "up" "a-scan")
+        (commit-host-claim g "h2" "runs" "a-scan" "web")
+        (commit-host-claim g "h2" "up" "z-scan")
+        (is (= 2 (length (matches "pair" :added))))
+        (dolist (m (matches "pair" :added))
+          (is (equal "runs" (relation-of (binding m "?A"))))
+          (is (equal "up" (relation-of (binding m "?B"))))
+          (is (equal '("runs" "up")
+                     (mapcar #'relation-of (getf m :premises)))))))))
+
+(defparameter *self-join-body*
+  "(claim ?a rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?a)
+   (claim ?b rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?b)")
+
+(defun self-join-rows (g)
+  (declare (ignore g))
+  (mapcar #'joined-keys
+          (select (:max-inferences 10000000) (?a ?b)
+            (claim ?a rt-claim "host" ?h "up" nil nil) (claim-current ?a)
+            (claim ?b rt-claim "host" ?h "up" nil nil) (claim-current ?b))))
+
+(defun up-claim-by (g host producer)
+  (find producer (claims-touching g 'rt-claim :host host :role :subject
+                                  :relation "up")
+        :key #'claim-producer :test #'string=))
+
+(test a-self-join-delivers-one-firing-per-row
+  "#471: the instantiation key keeps body position, so (a,b) and (b,a)
+are two instantiations; a retraction loses one firing per row; a
+premise deleted and re-written re-opens its firings; a reopened store
+keeps refraction."
+  (with-rules-graph-dir (g dir)
+    (let ((*matches* '()))
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-production "self" :version "1"
+               :family rt-claim :body *self-join-body*
+               :action (note-match "self"))
+             (graph-db.rules:enable-forward-rules g)
+             (commit-host-claim g "h1" "up" "scan-a")
+             (commit-host-claim g "h1" "up" "scan-b")
+             (is (= 4 (length (self-join-rows g))))
+             (is (= 4 (length (firings g "self"))))
+             (is (set-equal-p (self-join-rows g)
+                              (mapcar (lambda (m) (getf m :key))
+                                      (matches "self" :added))))
+             (dolist (m (matches "self" :added))
+               (is (equal (getf m :key)
+                          (joined-keys (list (binding m "?A")
+                                             (binding m "?B"))))))
+             (retract-claim (up-claim-by g "h1" "scan-b"))
+             (is (= 1 (length (self-join-rows g))))
+             (is (= 3 (length (matches "self" :lost))))
+             (is (= 1 (length (firings g "self"))))
+             (is-true (run-rules-is-quiet g))
+             (let ((all-before (claims-by-producer g 'graph-db.rules:firing
+                                                   "production/self")))
+               (is (= 4 (length all-before)))
+               (with-transaction ((graph-db::transaction-manager g))
+                 (mark-deleted (up-claim-by g "h1" "scan-b")))
+               (commit-host-claim g "h1" "up" "scan-b")
+               (is (= 4 (length (firings g "self"))))
+               (is (= 4 (length (claims-by-producer
+                                 g 'graph-db.rules:firing
+                                 "production/self"))))
+               (is (= 7 (length (matches "self" :added))))
+               (is-true (run-rules-is-quiet g)))
+             (close-graph g)
+             (let ((g2 (open-graph *graph-name* (namestring dir)))
+                   (delivered (length *matches*)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g2))
+                      (graph-db.rules:enable-forward-rules g2)
+                      (is (= 4 (length (firings g2 "self"))))
+                      (is (= delivered (length *matches*)))
+                      (is-true (run-rules-is-quiet g2)))
+                 (close-graph g2))))
+        (graph-db.rules:undef-production "self")))))
+
+(defparameter *any-variable-body*
+  "(claim ?c rt-claim \"host\" ?instantiation-key \"runs\" \"app\" \"web\")
+   (claim-current ?c)")
+
+(test a-production-body-may-name-any-variable
+  "#466 item 3: ?c and ?instantiation-key are the author's."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("anyvar" :version "1" :family rt-claim
+                                 :body *any-variable-body*
+                                 :action (note-match "anyvar"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (is (= 1 (length (matches "anyvar" :added))))
+        (let ((m (first (matches "anyvar" :added))))
+          (is (equal '("?C" "?INSTANTIATION-KEY") (binding-names m)))
+          (is (equal "h1" (binding m "?INSTANTIATION-KEY"))))))))
+
+(defun production-refusal (g name body)
+  "The reason COMPILE-PRODUCTION refuses BODY under NAME, or NIL."
+  (unwind-protect
+       (progn
+         (graph-db.rules:def-production name :version "1" :family rt-claim
+           :body body :action (lambda (e m) (list e m)))
+         (handler-case (progn (graph-db.rules:compile-production g name)
+                              nil)
+           (graph-db.rules:rule-compile-error (c)
+             (graph-db.rules:rule-compile-error-reason c))))
+    (graph-db.rules:undef-production name)))
+
+(test production-refusals-name-the-documented-rule
+  "#466 item 4: no claim/7 goal, nine premises, and a claim read only
+under OR each refuse in the documented words, not as an unbound head
+key."
+  (with-rules-graph (g)
+    (is (search "needs a claim/7 goal"
+                (production-refusal g "none" "(= ?x 1)")))
+    (is (search "at most eight"
+                (production-refusal
+                 g "nine"
+                 (format nil "~{(claim ?p~D rt-claim \"host\" ?h \"up\" ~
+nil nil)~^ ~}" '(1 2 3 4 5 6 7 8 9)))))
+    (is (search "needs a claim/7 goal"
+                (production-refusal
+                 g "orred"
+                 "(or (claim ?a rt-claim \"host\" ?h \"a\" nil nil)
+                      (claim ?a rt-claim \"host\" ?h \"b\" nil nil))")))))
+
+(defun match-rows (name)
+  (mapcar (lambda (m) (nth-value 1 (graph-db.rules:match-row m)))
+          (matches name :added)))
+
+(test match-row-agrees-with-the-guarded-runner-cell-for-cell
+  "#466 item 6: MATCH-ROW renders a match as RUN-GUARDED-PROLOG :DATA
+renders that solution, for a single premise, a join and a self-join."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("row" :version "1" :family rt-claim
+                              :body *runs-app-body*
+                              :action (note-match "row"))
+        (with-production ("pair" :version "1" :family rt-claim
+                                 :body *runs-and-up-body*
+                                 :action (note-match "pair"))
+          (with-production ("self" :version "1" :family rt-claim
+                                   :body *self-join-body*
+                                   :action (note-match "self"))
+            (graph-db.rules:enable-forward-rules g)
+            (commit-host-claim g "h1" "runs" "z-scan" "web")
+            (commit-host-claim g "h1" "up" "a-scan")
+            (commit-host-claim g "h1" "up" "scan-b")
+            (commit-host-claim g "h2" "runs" "a-scan" "db")
+            (loop for (name body) in (list (list "row" *runs-app-body*)
+                                           (list "pair" *runs-and-up-body*)
+                                           (list "self" *self-join-body*))
+                  do (multiple-value-bind (cols rows)
+                         (graph-db.query:run-guarded-prolog body g)
+                       (is (plusp (length rows)) "~A: no rows" name)
+                       (is (equal cols
+                                  (nth-value 0 (graph-db.rules:match-row
+                                                (first (matches name
+                                                                :added)))))
+                           "~A: columns" name)
+                       (is (null (set-exclusive-or rows (match-rows name)
+                                                   :test #'equal))
+                           "~A: rows ~S vs matches ~S" name rows
+                           (match-rows name))))))))))
+
+(test find-production-answers-the-stored-record-or-nil
+  "#466 item 7."
+  (with-rules-graph (g)
+    (is (null (graph-db.rules:find-production g "stored")))
+    (setf (gethash "stored-action" graph-db.rules:*production-actions*)
+          (lambda (e m) (list e m)))
+    (unwind-protect
+         (progn
+           (with-transaction ((graph-db::transaction-manager g))
+             (graph-db.rules:make-production
+              :graph g :name "stored" :version "1" :family "rt-claim"
+              :body *runs-app-body* :salience 0 :writes '()
+              :action "stored-action"))
+           (let ((p (graph-db.rules:find-production g "stored")))
+             (is (graph-db.rules:production-p p))
+             (is (equal "stored" (and p (graph-db.rules:production-name p))))
+             (with-transaction ((graph-db::transaction-manager g))
+               (mark-deleted p)))
+           (is (null (graph-db.rules:find-production g "stored"))))
+      (remhash "stored-action" graph-db.rules:*production-actions*))))
 
 ;;; The rounds guard counts the step's own drains only (#472)
 
