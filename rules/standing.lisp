@@ -9,11 +9,14 @@
     ;; a filter on a premise: its flip is the premise's own delta
     ("claim-current/1" . :filter)
     ;; readers of a slot no update changes
-    ("claim-relation/2" . :reader) ("claim-rule-version/2" . :reader)
-    ("claim-recorded-at/2" . :reader)
+    ("claim-relation/2" . :reader)
     ;; the producer: a reader of a premise, a generator otherwise
     ("claim-producer/2" . :producer)
-    ;; readers of a slot an update can change: a filter with a literal
+    ;; readers of a slot an update can change: a filter with a literal.
+    ;; A re-open moves recorded-at, an in-place save or %REFRESH-KEPT
+    ;; moves rule-version (#470 review).
+    ("claim-recorded-at/2" . :mutable-reader)
+    ("claim-rule-version/2" . :mutable-reader)
     ("claim-standing/2" . :mutable-reader)
     ("claim-valid-from/2" . :mutable-reader)
     ("claim-valid-to/2" . :mutable-reader)
@@ -24,16 +27,20 @@
     ("=/2" . :test) ("/=/2" . :test) ("==/2" . :test) ("</2" . :test)
     ("<=/2" . :test) (">/2" . :test) (">=/2" . :test) ("is/2" . :test)
     ("atom/1" . :test) ("numberp/1" . :test) ("var/1" . :test)
-    ("not-in-list/2" . :test) ("unique/1" . :test) ("valid-date-p/1" . :test)
+    ("not-in-list/2" . :test) ("valid-date-p/1" . :test)
     ("regex-match/2" . :test) ("fail/0" . :test)
     ("instant</2" . :test) ("instant<=/2" . :test) ("instant>/2" . :test)
     ("instant>=/2" . :test) ("instant=/2" . :test) ("instant-offset/3" . :test)
     ;; negation as failure: over a premise form or a test
     ("not/1" . :not)
+    ;; a row per true branch, unless once or not collapses them
+    ("or/2" . :or)
     ;; control: a claim read under it is invisible to the delta
-    ("or/2" . :control) ("once/1" . :control) ("if/2" . :control)
-    ("if/3" . :control) ("forall/2" . :control)
-    ;; aggregation and meta-call
+    ("once/1" . :control) ("if/2" . :control) ("if/3" . :control)
+    ("forall/2" . :control)
+    ;; aggregation and meta-call; unique/1 keeps a seen-table across
+    ;; the query's solutions
+    ("unique/1" . :meta)
     ("findall/3" . :meta) ("bagof/3" . :meta) ("setof/3" . :meta)
     ("call/1" . :meta) ("catch/3" . :meta) ("throw/1" . :meta)
     ("map-query/5" . :meta) ("select/2" . :meta)
@@ -77,9 +84,10 @@ PROLOG-FUNCTOR-INVENTORY-IS-PINNED asks.  The classes:
 :PREMISE a claim read the delta answers; :FILTER a currency filter on a
 premise; :READER a premise slot no update changes; :PRODUCER a reader of
 a premise or a generator; :MUTABLE-READER a slot an update can change,
-a filter with a literal only; :TEST over bound values; :NOT; :CONTROL
-whose claim reads the delta cannot see; :META aggregation or
-meta-call; :EFFECT; :CLOCK; :WITHHELD; :STORE-READ.")
+a filter with a literal only; :TEST over bound values; :NOT; :OR, a row
+per true branch unless under once or not; :CONTROL whose claim reads
+the delta cannot see; :META aggregation, meta-call or a seen-table
+across solutions; :EFFECT; :CLOCK; :WITHHELD; :STORE-READ.")
 
 (defun %functor-key (goal)
   "GOAL's head as the inventory spells it: lowercase name/arity."
@@ -130,15 +138,20 @@ family, and a literal relation or a family-wide read (#469)."
 (defun %classify-goal (goal premises bound add &optional nested)
   "Classify GOAL for a standing query, calling ADD with each reason.
 PREMISES are the body's premise variables, BOUND the variables earlier
-goals bound; NESTED names the control construct GOAL sits under."
+goals bound; NESTED the control constructs GOAL sits under, innermost
+first.  A claim read under NOT is a negative read at any depth, which
+the full path handles; under anything else it is invisible to the
+delta.  An OR is a row per true branch unless ONCE or NOT collapses
+them (#470 review)."
   (let ((class (%functor-class goal))
         (label (%goal-label goal)))
-    (flet ((premise-var-p (x) (member x premises)))
+    (flet ((premise-var-p (x) (member x premises))
+           (under-p (name) (member name nested :test #'string=)))
       (ecase class
         (:premise
-         (cond (nested
+         (cond ((and nested (not (under-p "not")))
                 (funcall add (format nil "~A is a claim read nested under ~
-~A: the delta cannot see it" label nested)))
+~A: the delta cannot see it" label (first nested))))
                ((not (%premise-form-p goal))
                 (funcall add (format nil "~A leaves its family or relation ~
 unbound without a literal family and namespace: the delta cannot route it"
@@ -163,17 +176,32 @@ change into the row: the row would change with no delivery; compare ~
 with a literal instead" label)))))
         (:not
          (let ((inner (second goal)))
-           (cond ((%premise-form-p inner)
-                  (when nested
-                    (funcall add (format nil "~A is a claim read nested ~
-under ~A: the delta cannot see it" label nested))))
+           (cond ((eq (%functor-class inner) :premise)
+                  ;; A negated read needs a literal relation: the
+                  ;; compiler refuses it unbound, family-wide included.
+                  (unless (and (%premise-form-p inner)
+                               (stringp (sixth inner)))
+                    (funcall add (format nil "~A negates a claim read ~
+whose relation is unbound: compile-rule refuses it, bind the relation"
+                                         label))))
                  ((member (%functor-class inner) '(:filter :test)))
-                 (t (%classify-goal inner premises bound add nested)))))
+                 (t (%classify-goal inner premises bound add
+                                    (cons "not" nested))))))
+        (:or
+         (if (or (under-p "once") (under-p "not"))
+             (dolist (sub (rest goal))
+               (when (consp sub)
+                 (%classify-goal sub premises bound add
+                                 (cons "or" nested))))
+             (funcall add (format nil "~A yields a row per true branch, ~
+and a production holds one row per instantiation: put it under once, ~
+or split the query" label))))
         (:control
          (let ((name (string-downcase (symbol-name (first goal)))))
            (dolist (sub (rest goal))
              (when (consp sub)
-               (%classify-goal sub premises bound add name)))))
+               (%classify-goal sub premises bound add
+                               (cons name nested))))))
         (:meta
          (funcall add (format nil "~A aggregates or meta-calls: no delta ~
 form" label)))
@@ -197,8 +225,9 @@ top-level claim/7 and claim-absent/7 with a variable ?c and a literal
 relation or a family-wide read; NOT over those; tests over bound values;
 a premise's slot read as a filter with a literal, or a slot no update
 changes.  Everything else is a reason: another store read, a claim read
-under or, once, if or forall, a mutable slot read into the row, an
-effect, repeat, now, no premise, more than eight.  The classes live in
+under once, if or forall, an or not under once or not, a mutable slot
+read into the row, an effect, repeat, now, no premise, more than
+eight.  The classes live in
 *STANDING-QUERY-FUNCTOR-CLASSES*.  Text the guard refuses is one
 reason, the guard's."
   (handler-case

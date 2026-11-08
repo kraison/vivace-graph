@@ -1673,18 +1673,22 @@ detected (S3-P5)."
         (compiled '())
         (graph-db::*evaluation-instant*
           (or graph-db::*evaluation-instant* (graph-db.spacetime::%st-now))))
-    (dolist (spec (rules-in-scope graph))
-      (when (%runnable-spec-p graph spec)
-        (handler-case (push (compile-rule graph spec) compiled)
-          (rule-compile-error (c)
-            (push (%make-rule-report
-                   :rule-name (rule-spec-name spec)
-                   :version (rule-spec-version spec)
-                   :outcome :refused
-                   :condition c
-                   :refusals (list (cons :rule
-                                         (rule-compile-error-reason c))))
-                  reports)))))
+    ;; One scope and one edges cache for every rule compiled (#474).
+    (let ((scope (rules-in-scope graph)))
+      (with-edges-cache ()
+        (dolist (spec scope)
+          (when (%runnable-spec-p graph spec)
+            (handler-case (push (compile-rule graph spec :others scope)
+                                compiled)
+              (rule-compile-error (c)
+                (push (%make-rule-report
+                       :rule-name (rule-spec-name spec)
+                       :version (rule-spec-version spec)
+                       :outcome :refused
+                       :condition c
+                       :refusals (list (cons :rule
+                                             (rule-compile-error-reason c))))
+                      reports)))))))
     (setf compiled (nreverse compiled))
     (dolist (stratum (%strata-order compiled))
       ;; SOME, not just the first rule: a genuine cycle's every member
@@ -1890,7 +1894,7 @@ RULE-REPORT with PATH :TARGETED."
           (refuse :budget (princ-to-string c) c))
         (graph-db.spacetime:missing-claim-identity-component (c)
           (refuse (graph-db.spacetime:claim-family-parent family)
-                  (princ-to-string c)))
+                  (princ-to-string c) c))
         (graph-db:constraint-violation (c)
           (refuse (%violation-family c) (princ-to-string c) c))
         (graph-db:query-precondition-error (c)

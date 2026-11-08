@@ -503,7 +503,10 @@ that leaves its relation unbound -- it would read *every* relation,
 its own included, so that refusal says to bind the relation -- unless
 it is a family-wide read, below. The graph is the rule's own store's,
 plus the image's `def-rule`s -- a `:scope` does not widen it (see
-"Cross-store scope").
+"Cross-store scope"). A recompile of every rule in scope -- a forward
+store's after a `rule` or `production` write, `run-rules`' at its
+start -- guards each rule's text once for its own compile and once for
+its edges, not once per other rule (#474).
 
 **A family-wide read (#469).** `(claim ?p fam "ns" ?k ?r ?ons ?ok)`,
 the relation free under a *literal* family and a *literal* subject
@@ -1177,11 +1180,14 @@ opened a transaction never has a step run inside it. A body that
 unwinds after a nested commit leaves that delta queued until the next
 outermost commit in the image, or an explicit `forward-step`. A step
 that never quiesces -- an action that keeps writing what the
-production reads -- is stopped after `*rules-max-rounds*` consecutive
-drains that took a delta an action committed: those deltas are
-dropped with a `:rounds` failure on the status, and the deltas other
-threads queued meanwhile are kept and run. A foreign commit never
-counts toward the bound, however steady the stream (#472).
+production reads -- is stopped by a **generation** on each queued
+delta: a commit from outside the step is generation 0, an action's
+commit is the generation of the delta being run plus one, and a delta
+at `*rules-max-rounds*` is dropped with a `:rounds` failure on the
+status while everything else is run. So a foreign commit never counts
+toward the bound, however steady the stream, and neither does an
+action that writes on every match without feeding its own read; only
+a chain of deltas each fed from the last is stopped (#472, #475).
 
 **`:drain :caller` (#467).** `(enable-forward-rules graph :drain
 :caller :on-queue fn)` keeps the committing thread out of it: the hook
@@ -1275,10 +1281,11 @@ in memory, per enabled graph, on one thread named "forward timer";
 **Productions (spec §7).** A production is a body and an action: when
 the body matches, the action runs. It is the OPS5 idea on top of the
 Datalog layer, and it shares the layer's machinery: a production is
-compiled as a rule whose head is a unary claim of the `firing` family
+compiled as a rule whose head is a binary claim of the `firing` family
 (subject namespace `production`, subject key the instantiation's key,
-relation the production's name, producer `production/NAME`, rule
-version the production's), so forward evaluation derives, retracts
+relation the production's name, object namespace `instantiation`,
+object key the premises' identity keys in the clear, producer
+`production/NAME`, rule version the production's), so forward evaluation derives, retracts
 and re-opens firings exactly as it does derived claims, provenance
 names each firing's premises, and `run-rules` repairs them.
 
@@ -1361,17 +1368,28 @@ production over `text` delivers, commit by commit, exactly the rows a
 full re-evaluation of `text` would add and lose, else a list of
 reasons, each naming its goal. Admitted: top-level `claim/7` and
 `claim-absent/7` with a variable `?c` and a literal relation, or a
-family-wide read (#469); `not` over those; tests over bound values
-(`=`, `<`, `instant<`, `instant-offset`, ...); `claim-current`; a
-premise's slot read as a filter with a literal, `(claim-standing ?p
-"observed")`, or a slot no update changes (`claim-relation`,
-`claim-producer` of a premise, `claim-recorded-at`,
-`claim-rule-version`). Refused: every other store read (`is-a`,
-`related`, `claimed`, `find-*`, views, edges, `node-slot-value`, a
-`claim-producer` generator); a claim read nested under `or`, `once`,
-`if` or `forall`; a slot an update can change read into a variable
-(the row changes, the instantiation does not, so nothing is
-delivered); an effect or `repeat`; `now`; no premise; more than eight.
+family-wide read (#469); `not` over those, with a literal relation;
+tests over bound values (`=`, `<`, `instant<`, `instant-offset`, ...),
+`once`, `if` and `forall` over tests, and `or` under `once` or `not`;
+`claim-current`; a premise's slot read as a filter with a literal,
+`(claim-standing ?p "observed")`, or a slot no update changes
+(`claim-relation`, `claim-producer` of a premise). Refused: every other
+store read (`is-a`, `related`, `claimed`, `find-*`, views, edges,
+`node-slot-value`, a `claim-producer` generator); a claim read nested
+under `once`, `if` or `forall`; an `or` anywhere else, since it yields
+a row per true branch and a production holds one row per
+instantiation; `unique`, which keeps a seen-table across the query's
+solutions; a slot an update can change read into a variable (the row
+changes, the instantiation does not, so nothing is delivered --
+`claim-standing`, the extent instants, and also `claim-recorded-at`,
+which a re-open moves, and `claim-rule-version`, which an in-place
+save moves); an effect or `repeat`; `now`; no premise; more than
+eight. One timing caveat stands even for an admitted body: under
+`:drain :caller`, a premise deleted and written again under the same
+identity *between two drains* keeps its instantiation, so there is no
+`:lost` and no `:added` though the query's row now carries the new
+node's id; with a drain between the two commits the events are right,
+and a retraction and re-open is unaffected.
 The classification is `*standing-query-functor-classes*`
 (`rules/standing.lisp`), one entry per registered functor; the rules
 suite insists every functor has one, so a new functor chooses.

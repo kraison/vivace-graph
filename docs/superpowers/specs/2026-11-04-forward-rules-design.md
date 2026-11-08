@@ -332,9 +332,10 @@ name and version plus the **identity keys** of its premise claims in
 body order (sorted until #471, which made a self-join's two orders one
 instantiation and lost a row) (`claim-identity-key`, which survives a premise being swept and
 re-derived or deleted and re-registered; node ids do not). The step
-records each firing as a claim of a new unary family `firing`
+records each firing as a binary claim of a new family `firing`
 (relation = production name, subject key = a digest of those identity
-keys, producer = the production), so refraction is durable, auditable,
+keys, object key = the keys in the clear since #471, producer = the
+production), so refraction is durable, auditable,
 and survives restart without a side table. A match that is lost
 retracts its `firing` claim (D4) and delivers `:lost`; a match regained
 re-opens it and delivers `:added` again, so the firing history of an
