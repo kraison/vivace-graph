@@ -687,6 +687,7 @@ resolved.
 | `elapsed` | seconds |
 | `rounds` | the fixpoint rounds run, 1 outside a recursive stratum |
 | `stratum` | its stratum's rules, its own name alone for a rule with none |
+| `condition` | the condition caught behind a `:refused` outcome, else NIL (#468) |
 
 Every count is a total over the run: `disjoint-premises` included,
 across each variant and round of a recursive stratum.
@@ -701,7 +702,8 @@ else one of:
   (`prolog-permission-error`, recon note A16), or a head term is not a
   namespace or key this image knows;
 - `:budget` -- the rails: the inference budget, the timeout, or a goal
-  refused as `cost-unbounded`;
+  refused as `cost-unbounded` -- told apart by `condition`, a
+  `prolog-cost-unbounded-error` for the last;
 - `:solutions` -- the `*rules-max-solutions*` cap.
 
 The vocabulary is closed: a `constraint-violation` none of the three
@@ -1217,7 +1219,27 @@ and recorded the same way under the name `:step`.
 The last hundred failures are kept, newest first; `:last-step-elapsed`
 is the wall seconds of the last `forward-step` drain, NIL before one.
 `run-rules` after a failure reports the same refusal and repairs the
-rest.
+rest. The opt-in's own `run-rules` lands its refusals here too.
+
+**The failure signal (#468).** `(enable-forward-rules graph
+:on-failure fn)` calls `fn` with `(name tag text condition)` once for
+everything that lands on `:failures`: `name` the rule or production
+(or `:step`, `:rounds`, `:timer`, `:on-queue`), `tag` as a report
+carries it (`:rule`, `:budget`, `:solutions`, a family name) or the
+failure's own (`:action` for an action's error or an unregistered
+action, `:writes` for a write outside the declared ones, `:match` for a
+match that could not be rendered, `:scheduling`, `:timer`, `:step`,
+`:rounds`, `:on-queue`), `text` the rendering on the status, and
+`condition` the condition caught, or NIL where none was (`:rounds`, an
+unregistered action). A cost-unbounded goal and a budget overrun are
+both `:budget`; the condition tells them apart, a
+`prolog-cost-unbounded-error` for the first. `fn` runs outside the
+step's transactions, so it may record state or delete the stored
+production whose action failed; the step stays sound and the
+production fires no more. A signal from `fn` is logged and the step
+goes on. `rule-report-condition` carries the same condition on a
+`run-rule` or `run-rules` report, so a consumer that seeds one
+production with `run-rule` reads a refusal the same way.
 
 **Thresholds (D3).** A body may say `(now ?t)` and compare `?t` with
 an instant of a premise claim: one of `claim-valid-from/2`,

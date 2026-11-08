@@ -41,7 +41,7 @@ as this one)."
       (let ((state (%forward-state graph)))
         (when state
           (%note-failure state (rule-spec-name (compiled-rule-spec compiled))
-                         (princ-to-string c))))
+                         (princ-to-string c) :tag :match :condition c)))
       nil)))
 
 (defun %match-keys (claim)
@@ -76,7 +76,8 @@ bindings; a signal is recorded on FAILURES and the agenda goes on."
     (if (null action)
         (%note-failure state name
                        (format nil "action ~S is not registered"
-                               (production-spec-action spec)))
+                               (production-spec-action spec))
+                       :tag :action)
         (handler-case
             (let ((*agenda-production* compiled))
               (funcall action event
@@ -88,7 +89,8 @@ bindings; a signal is recorded on FAILURES and the agenda goes on."
           (error (c)
             (log:error "production ~A on ~S: ~A" name
                        (graph-db:graph-name graph) c)
-            (%note-failure state name (princ-to-string c)))))))
+            (%note-failure state name (princ-to-string c)
+                           :tag :action :condition c))))))
 
 (defun run-agenda (graph compiled-rules changes)
   "*AGENDA-RUNNER*: the FIRING claims among CHANGES (a step's (claim .

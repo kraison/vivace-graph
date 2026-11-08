@@ -104,7 +104,8 @@ recorded on the status, never signalled into the step."
             (error (e)
               (%note-failure state
                              (rule-spec-name (compiled-rule-spec c))
-                             (format nil "scheduling: ~A" e)))))))))
+                             (format nil "scheduling: ~A" e)
+                             :tag :scheduling :condition e))))))))
 
 (setf *threshold-scheduler* '%schedule-thresholds)
 
@@ -228,7 +229,8 @@ leaves when TIMER-STOP is set (DISABLE-FORWARD-RULES)."
         (when due
           (handler-case (%fire-threshold state due)
             (error (e)
-              (%note-failure state :timer (princ-to-string e)))))))))
+              (%note-failure state :timer (princ-to-string e)
+                             :tag :timer :condition e))))))))
 
 (defun %ensure-timer-thread (state)
   "Under STATE's lock: the timer thread, started if none runs."

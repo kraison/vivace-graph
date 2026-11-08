@@ -1873,6 +1873,219 @@ of it, and the opt-in drains nothing at its end."
                               #'string<))))
         (setf *slow-seconds* 0)))))
 
+;;; :on-failure and rule-report-condition (#468)
+
+(defvar *heard* '()
+  "What an :ON-FAILURE function heard, newest first:
+(name tag text condition-type in-transaction-p).")
+
+(defun hear-failure (name tag text condition)
+  (push (list name tag text (type-of condition)
+              (and graph-db::*transaction* t))
+        *heard*))
+
+(defun heard (&optional tag)
+  (loop for h in (reverse *heard*)
+        when (or (null tag) (eq tag (second h))) collect h))
+
+(defparameter *unbounded-up-body*
+  "(claim ?p rt-claim ?ns ?k \"up\" nil nil) (claim-current ?p)"
+  "A body whose claim/7 goal walks the family: refused at run as
+cost-unbounded, which is a :BUDGET report with its own condition.")
+
+(test on-failure-hears-a-compile-refusal-and-a-bodys-refusal
+  "#468: a production that stops compiling and a rule body that refuses
+each reach FN once, with the report's tag and the caught condition,
+outside any transaction."
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+      ;; Both after the opt-in, so each refuses once, at the commit.
+      (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                    :head *web-hosts-head* :body *refusing-web-hosts-body*)
+      (with-production ("loop" :version "1" :family rt-claim
+                               :body *self-feeding-body*
+                               :writes '("hosted-on")
+                               :action (note-firing "loop"))
+        (commit-runs-web g "h1")
+        (let ((compile (heard :rule)))
+          (is (find "loop" compile :key #'first :test #'equal))
+          (is (find "web-hosts" compile :key #'first :test #'equal))
+          (is (equal '(graph-db.rules:rule-compile-error)
+                     (mapcar #'fourth
+                             (remove "loop" compile :key #'first
+                                                    :test-not #'equal))))
+          (is (equal '(graph-db.rules::rule-run-refusal)
+                     (mapcar #'fourth
+                             (remove "web-hosts" compile :key #'first
+                                                         :test-not #'equal))))
+          (is (every #'null (mapcar #'fifth *heard*)))
+          (is (= (length *heard*)
+                 (length (getf (status g) :failures)))))))))
+
+(test on-failure-hears-an-actions-error-and-the-rounds-guard
+  (with-rules-graph (g)
+    (let ((*heard* '())
+          (*fired* '())
+          (graph-db.rules:*rules-max-rounds* 3))
+      (with-production ("boom" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (declare (ignore event match))
+                                         (error "boom")))
+        (with-production
+            ("echo" :version "1" :family rt-claim :body *echo-body*
+                    :writes '()
+                    :action (lambda (event match)
+                              (when (eq event :added)
+                                (push (list "echo" event (getf match :key))
+                                      *fired*)
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (make-rt-claim-unary
+                                   :graph g :subject-namespace :host
+                                   :subject-key (format nil "h~D"
+                                                        (length *fired*))
+                                   :relation "ping" :producer "echo"
+                                   :standing :inferred)))))
+          (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+          (commit-host-claim g "h1" "up" "scan-t")
+          (is (equal '(("boom" :action simple-error))
+                     (mapcar (lambda (h) (list (first h) (second h)
+                                               (fourth h)))
+                             (heard :action))))
+          (commit-host-claim g "h0" "ping" "scan-t")
+          (is (= 1 (length (heard :rounds))))
+          (is (eq 'null (fourth (first (heard :rounds)))))
+          (is (every #'null (mapcar #'fifth *heard*)))
+          (is (= (length *heard*)
+                 (length (getf (status g) :failures)))))))))
+
+(test on-failure-hears-an-escape-from-the-step
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (with-production ("web-watch" :version "1" :family rt-claim
+                                    :body *web-watch-body*
+                                    :action (note-firing "web-watch"))
+        (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+        (let ((original (fdefinition 'graph-db.rules:run-forward-strata)))
+          (unwind-protect
+               (progn
+                 (setf (fdefinition 'graph-db.rules:run-forward-strata)
+                       (lambda (&rest args)
+                         (declare (ignore args))
+                         (error "escaped")))
+                 (commit-runs-web g "h1")
+                 (is (equal '((:step :step simple-error nil))
+                            (mapcar (lambda (h) (list (first h) (second h)
+                                                      (fourth h) (fifth h)))
+                                    (heard :step))))
+                 (is (search "escaped" (third (first (heard :step))))))
+            (setf (fdefinition 'graph-db.rules:run-forward-strata)
+                  original)))))))
+
+(test on-failure-hears-the-opt-ins-own-refusals
+  "#468: a production over budget at the opt-in lands on :FAILURES and
+reaches FN, and a cost-unbounded goal is told from a budget overrun by
+its condition."
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (commit-host-claim g "h1" "up" "scan-t")
+      (with-production ("unbounded" :version "1" :family rt-claim
+                                    :body *unbounded-up-body*
+                                    :action (note-firing "unbounded"))
+        (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+        (is (equal '(("unbounded" :budget
+                      graph-db::prolog-cost-unbounded-error nil))
+                   (mapcar (lambda (h) (list (first h) (second h)
+                                             (fourth h) (fifth h)))
+                           (heard))))
+        (is (equal '("unbounded")
+                   (mapcar #'car (getf (status g) :failures))))))))
+
+(test a-signal-from-on-failure-is-logged-and-the-step-goes-on
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("boom" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (declare (ignore event match))
+                                         (error "boom")))
+        (with-production ("web-watch" :version "1" :family rt-claim
+                                      :body *web-watch-body*
+                                      :action (note-firing "web-watch"))
+          (graph-db.rules:enable-forward-rules
+           g :on-failure (lambda (&rest args)
+                           (declare (ignore args))
+                           (error "the listener broke")))
+          (finishes (commit-host-claim g "h1" "up" "scan-t"))
+          (finishes (commit-runs-web g "h1"))
+          (is (equal '(:added) (mapcar #'second (fired))))
+          (is (find "boom" (getf (status g) :failures)
+                    :key #'car :test #'equal))
+          (is (eql 0 (getf (status g) :queue-depth))))))))
+
+(test deleting-a-stored-production-from-on-failure-stops-it-firing
+  "#468: FN runs outside the step's transactions, so it may delete the
+record whose action failed; the production fires no more and the step
+stays sound."
+  (with-rules-graph (g)
+    (let ((calls 0))
+      (setf (gethash "fragile-action" graph-db.rules:*production-actions*)
+            (lambda (event match)
+              (declare (ignore event match))
+              (incf calls)
+              (error "fragile")))
+      (unwind-protect
+           (progn
+             (with-transaction ((graph-db::transaction-manager g))
+               (graph-db.rules:make-production
+                :graph g :name "fragile" :version "1" :family "rt-claim"
+                :body *q3-body* :salience 0 :writes '()
+                :action "fragile-action"))
+             (graph-db.rules:enable-forward-rules
+              g :on-failure (lambda (name tag text condition)
+                              (declare (ignore tag text condition))
+                              (when (equal name "fragile")
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (mark-deleted
+                                   (graph-db.rules:find-production
+                                    g "fragile"))))))
+             (commit-host-claim g "h1" "up" "scan-t")
+             (is (= 1 calls))
+             (is (null (graph-db.rules:find-production g "fragile")))
+             (commit-host-claim g "h2" "up" "scan-t")
+             (is (= 1 calls))
+             (is (eql 0 (getf (status g) :queue-depth)))
+             (is-true (run-rules-is-quiet g)))
+        (remhash "fragile-action" graph-db.rules:*production-actions*)))))
+
+(test rule-report-condition-carries-the-caught-condition
+  "#468: RUN-RULE's report keeps the condition behind its refusal, so a
+consumer seeding one production with RUN-RULE reads a refusal the same
+way FN does."
+  (with-rules-graph (g)
+    (commit-runs-web g "h1")
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "loud" :version "1" :family "rt-claim"
+                      :head *web-hosts-head*
+                      :body *refusing-web-hosts-body*))))
+      (is (eq :refused (graph-db.rules:rule-report-outcome r)))
+      (is (typep (graph-db.rules:rule-report-condition r)
+                 'graph-db.rules::rule-run-refusal)))
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "unbounded" :version "1" :family "rt-claim"
+                      :head *flag-from-up-head* :body *unbounded-up-body*))))
+      (is (equal '(:budget) (mapcar #'car (graph-db.rules:rule-report-refusals
+                                           r))))
+      (is (typep (graph-db.rules:rule-report-condition r)
+                 'graph-db::prolog-cost-unbounded-error)))
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "ok" :version "1" :family "rt-claim"
+                      :head *web-hosts-head* :body *web-hosts-body*))))
+      (is (null (graph-db.rules:rule-report-condition r))))))
+
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)
 

@@ -108,10 +108,13 @@ rails) or :SOLUTIONS (the cap).  INFERENCES is the count at the last
 solution; ELAPSED is seconds.  ROUNDS is the fixpoint rounds a
 recursive stratum ran (1 otherwise), STRATUM the names it ran with
 (GH #333).  PATH is NIL from RUN-RULE and RUN-RULES, and from a forward
-step :FORWARD, :TARGETED or :FULL (forward-rules design §4.2)."
+step :FORWARD, :TARGETED or :FULL (forward-rules design §4.2).
+CONDITION is the condition caught behind a :REFUSED outcome, or NIL --
+a PROLOG-COST-UNBOUNDED-ERROR tells a cost-unbounded goal from a
+budget overrun, both tagged :BUDGET (#468)."
   rule-name version (outcome :derived) (derived 0) (kept 0) (swept 0)
   (disjoint-premises 0) (refusals '()) (inferences 0) (elapsed 0)
-  (rounds 1) (stratum '()) (path nil))
+  (rounds 1) (stratum '()) (path nil) (condition nil))
 
 (defun rule-producer (rule)
   "The producer string RULE writes as: rule/NAME for a rule, given as
@@ -1035,9 +1038,10 @@ whole derivation, the job's own size."
 (#457 spec §2)."
   (%make-existing :lazy-p t :graph graph :compiled compiled))
 
-(defun %refuse-stratum (runs tag text foreign)
-  "Every RUN's report refused with TAG/TEXT: a refusal anywhere in a
-stratum stops the whole stratum, the previous derivation standing.
+(defun %refuse-stratum (runs tag text foreign &optional condition)
+  "Every RUN's report refused with TAG/TEXT (and CONDITION, the one
+caught, #468): a refusal anywhere in a stratum stops the whole
+stratum, the previous derivation standing.
 KEPT and SWEPT are always 0 here: FINISH-RUN's reconcile (the only
 place either is set) is itself inside the transaction that just
 unwound, on both paths, so its DECF never ran either.  Single-store:
@@ -1052,7 +1056,8 @@ GH #333)."
             (rule-report-swept r) 0)
       (unless foreign
         (setf (rule-report-derived r) 0))
-      (setf (rule-report-refusals r) (list (cons tag text))))))
+      (setf (rule-report-condition r) condition
+            (rule-report-refusals r) (list (cons tag text))))))
 
 (defun %run-stratum (graph stratum scope &key forward-delta)
   "STRATUM (compiled rules sharing a recursive stratum) to its fixpoint
@@ -1369,17 +1374,17 @@ rounds" *rules-max-rounds*)))
                   (run-to-fixpoint)))
           (rule-run-refusal (c)
             (%refuse-stratum runs (rule-run-refusal-tag c)
-                             (rule-run-refusal-text c) foreign))
+                             (rule-run-refusal-text c) foreign c))
           ;; Before PROLOG-ERROR, its superclass (recon A16, PF2).
           (graph-db:prolog-permission-error (c)
-            (%refuse-stratum runs :rule (princ-to-string c) foreign))
+            (%refuse-stratum runs :rule (princ-to-string c) foreign c))
           (graph-db:prolog-error (c)
-            (%refuse-stratum runs :budget (princ-to-string c) foreign))
+            (%refuse-stratum runs :budget (princ-to-string c) foreign c))
           (graph-db:constraint-violation (c)
             (%refuse-stratum runs (%violation-family c)
-                             (princ-to-string c) foreign))
+                             (princ-to-string c) foreign c))
           (graph-db:query-precondition-error (c)
-            (%refuse-stratum runs :rule (princ-to-string c) foreign)))
+            (%refuse-stratum runs :rule (princ-to-string c) foreign c)))
         (dolist (run runs)
           (setf (rule-report-rounds (%stratum-run-report run)) round
                 (rule-report-elapsed (%stratum-run-report run))
@@ -1403,12 +1408,13 @@ rounds" *rules-max-rounds*)))
            (or graph-db::*evaluation-instant*
                (graph-db.spacetime::%st-now))))
     (%check-no-foreign-read-in-transaction "RUN-RULE" foreign)
-    (flet ((refuse (tag text)
+    (flet ((refuse (tag text &optional condition)
              (setf (rule-report-outcome report) :refused
                    (rule-report-derived report) 0
                    (rule-report-kept report) 0
                    (rule-report-swept report) 0
-                   (rule-report-disjoint-premises report) 0)
+                   (rule-report-disjoint-premises report) 0
+                   (rule-report-condition report) condition)
              (setf (rule-report-refusals report)
                    (append (rule-report-refusals report)
                            (list (cons tag text))))))
@@ -1439,10 +1445,10 @@ rounds" *rules-max-rounds*)))
               (setf compiled (compile-rule graph spec))))
         (rule-compile-error (c)
           (setf compiled nil)
-          (refuse :rule (rule-compile-error-reason c)))
+          (refuse :rule (rule-compile-error-reason c) c))
         (rule-run-refusal (c)
           (setf compiled nil)
-          (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c))))
+          (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c) c)))
       (when compiled
         ;; I2: the STRATUM decides the path, not this rule's own
         ;; recursiveness -- RUN-RULES gates on SOME member being
@@ -1489,7 +1495,8 @@ rounds" *rules-max-rounds*)))
           (setf (rule-report-stratum report) names)
           (if (some #'%compiled-recursive-p (or others (list compiled)))
               (cond
-                (broken (refuse :rule (rule-compile-error-reason broken)))
+                (broken (refuse :rule (rule-compile-error-reason broken)
+                                broken))
                 ;; Never %RUN-STRATUM without the rule that was asked
                 ;; for: a stratum missing its own member is not a
                 ;; smaller fixpoint, it is a wrong one.
@@ -1529,18 +1536,18 @@ rounds" *rules-max-rounds*)))
                                      order)))))
                 (rule-run-refusal (c)
                   (refuse (rule-run-refusal-tag c)
-                          (rule-run-refusal-text c)))
+                          (rule-run-refusal-text c) c))
                 ;; Before PROLOG-ERROR, its superclass (recon A16, PF2).
                 (graph-db:prolog-permission-error (c)
-                  (refuse :rule (princ-to-string c)))
+                  (refuse :rule (princ-to-string c) c))
                 (graph-db:prolog-error (c)
-                  (refuse :budget (princ-to-string c)))
+                  (refuse :budget (princ-to-string c) c))
                 (graph-db.spacetime:missing-claim-identity-component (c)
-                  (refuse family (princ-to-string c)))
+                  (refuse family (princ-to-string c) c))
                 (graph-db:constraint-violation (c)
-                  (refuse (%violation-family c) (princ-to-string c)))
+                  (refuse (%violation-family c) (princ-to-string c) c))
                 (graph-db:query-precondition-error (c)
-                  (refuse :rule (princ-to-string c)))))))))
+                  (refuse :rule (princ-to-string c) c))))))))
     ;; M4: on the recursive path REPORT is now %RUN-STRATUM's own, a
     ;; different object than the one made above -- this deliberately
     ;; overwrites ITS elapsed with the whole RUN-RULE call's, siblings'
@@ -1674,6 +1681,7 @@ detected (S3-P5)."
                    :rule-name (rule-spec-name spec)
                    :version (rule-spec-version spec)
                    :outcome :refused
+                   :condition c
                    :refusals (list (cons :rule
                                          (rule-compile-error-reason c))))
                   reports)))))
@@ -1833,11 +1841,12 @@ RULE-REPORT with PATH :TARGETED."
                                               compiled)
                                     :path :targeted))
          (start (get-internal-real-time)))
-    (flet ((refuse (tag text)
+    (flet ((refuse (tag text &optional condition)
              (setf (rule-report-outcome report) :refused
                    (rule-report-derived report) 0
                    (rule-report-kept report) 0
                    (rule-report-swept report) 0
+                   (rule-report-condition report) condition
                    (rule-report-refusals report) (list (cons tag text)))))
       (handler-case
           (graph-db:with-transaction (:graph graph)
@@ -1874,18 +1883,18 @@ RULE-REPORT with PATH :TARGETED."
                 (%reconcile-provenance compiled graph desired standing
                                        :sweep-keys sweep :swept swept))))
         (rule-run-refusal (c)
-          (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c)))
+          (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c) c))
         (graph-db:prolog-permission-error (c)
-          (refuse :rule (princ-to-string c)))
+          (refuse :rule (princ-to-string c) c))
         (graph-db:prolog-error (c)
-          (refuse :budget (princ-to-string c)))
+          (refuse :budget (princ-to-string c) c))
         (graph-db.spacetime:missing-claim-identity-component (c)
           (refuse (graph-db.spacetime:claim-family-parent family)
                   (princ-to-string c)))
         (graph-db:constraint-violation (c)
-          (refuse (%violation-family c) (princ-to-string c)))
+          (refuse (%violation-family c) (princ-to-string c) c))
         (graph-db:query-precondition-error (c)
-          (refuse :rule (princ-to-string c)))))
+          (refuse :rule (princ-to-string c) c))))
     (setf (rule-report-elapsed report)
           (/ (- (get-internal-real-time) start)
              (float internal-time-units-per-second 1.0d0)))

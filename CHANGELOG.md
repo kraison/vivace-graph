@@ -21,6 +21,12 @@ storage formats (#60).
   literal family and namespace, compiles and is touched by a claim of
   any relation of that family. Production `writes` may name a write's
   family as `("family" "relation")`, and must beside such a read.
+- **`enable-forward-rules graph :on-failure fn`** (#468): `fn` of
+  `(name tag text condition)` is called once for everything that lands
+  on the status's failures, outside the step's transactions, the opt-in's
+  own `run-rules` refusals included; `rule-report-condition` carries the
+  caught condition on any report, which tells a cost-unbounded goal from
+  a budget overrun.
 - **`enable-forward-rules graph :drain :caller :on-queue fn`** (#467):
   the commit hook only queues and the application calls `forward-step`
   on a thread of its own, told by `fn` outside every lock whenever a
