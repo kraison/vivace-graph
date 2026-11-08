@@ -2762,3 +2762,196 @@ unwound attempt's unsaved claim as standing."
                             (getf (graph-db.rules:forward-rules-status g)
                                   :failures))))
           (setf (fdefinition 'graph-db.rules::%solutions) original))))))
+
+;;; A retired rule's derivations are withdrawn (#477)
+
+(defparameter *alarm-head*
+  "(claim ?c rt-claim \"host\" ?k \"alarm\" nil nil)")
+(defparameter *alarm-body*
+  "(claim ?p rt-claim \"host\" ?k \"flag\" nil nil) (claim-current ?p)")
+(defparameter *alarm-watch-body*
+  "(claim ?p rt-claim \"host\" ?k \"alarm\" nil nil) (claim-current ?p)")
+
+(defmacro with-retire-scenario ((g) &body body)
+  "The issue's store: stored rules FLAG from UP and ALARM from FLAG,
+each tracking currency, and the stored production WATCH over ALARM,
+its action NOTE-MATCH onto the GLOBAL *MATCHES*, cleared first and
+restored after: a LET binding is invisible to a drainer thread's
+action."
+  `(with-rules-graph (,g)
+     (let ((saved *matches*))
+       (setf *matches* '()
+             (gethash "watch-action" graph-db.rules:*production-actions*)
+             (note-match "watch"))
+       (unwind-protect
+            (progn
+              (write-rule ,g :name "flag" :version "1" :family "rt-claim"
+                          :head *flag-from-up-head*
+                          :body *flag-from-up-body*)
+              (write-rule ,g :name "alarm" :version "1" :family "rt-claim"
+                          :head *alarm-head* :body *alarm-body*)
+              (with-transaction ((graph-db::transaction-manager ,g))
+                (graph-db.rules:make-production
+                 :graph ,g :name "watch" :version "1" :family "rt-claim"
+                 :body *alarm-watch-body* :salience 0 :writes '()
+                 :action "watch-action"))
+              ,@body)
+         (setf *matches* saved)
+         (remhash "watch-action" graph-db.rules:*production-actions*)))))
+
+(defun producer-records (g producer &key (current t))
+  "PRODUCER's DERIVED-FROM records, current only unless CURRENT is NIL."
+  (let ((all (claims-by-producer g 'graph-db.rules:derivation producer)))
+    (if current (remove-if-not #'claim-current-p all) all)))
+
+(defun retired-rule-cascades (g &rest enable-args)
+  "#477's acceptance scenario under ENABLE-ARGS: after RETIRE-RULE and
+a step, FLAG and ALARM are gone with both sets of records, the watcher
+heard one :LOST per ALARM claim, and RUN-RULES is quiet."
+  (let ((caller (eq (getf enable-args :drain) :caller)))
+    (flet ((drain () (when caller (caller-drains g))))
+      (apply #'graph-db.rules:enable-forward-rules g enable-args)
+      (commit-host-claim g "h1" "up" "scan-a")
+      (commit-host-claim g "h2" "up" "scan-a")
+      (drain)
+      (is (= 2 (length (derived g 'rt-claim "alarm"))))
+      (is (= 2 (length (matches "watch" :added))))
+      (let ((report (graph-db.rules:retire-rule g "flag")))
+        (is (eq :retired (graph-db.rules:rule-report-outcome report)))
+        (is (equal "flag" (graph-db.rules:rule-report-rule-name report)))
+        (is (= 2 (graph-db.rules:rule-report-swept report)))
+        (is (= 2 (graph-db.rules:rule-report-records report))))
+      (drain)
+      (is (null (derived g 'rt-claim "flag")))
+      (is (null (derived g 'rt-claim "alarm")))
+      (is (null (producer-records g "rule/flag")))
+      (is (null (producer-records g "rule/alarm")))
+      (is (= 2 (length (producer-records g "rule/flag" :current nil))))
+      (is (= 2 (length (matches "watch" :lost))))
+      (is (null (firings g "watch")))
+      (is-true (run-rules-is-quiet g)))))
+
+(test a-retired-rules-derivations-cascade-under-drain-commit
+  (with-retire-scenario (g)
+    (retired-rule-cascades g)))
+
+(test a-retired-rules-derivations-cascade-under-drain-caller
+  (with-retire-scenario (g)
+    (retired-rule-cascades g :drain :caller)))
+
+(test a-retired-rules-dependent-keeps-a-premise-that-still-stands
+  "#477: ALARM h1 also rests on a FLAG another producer wrote by hand;
+retiring FLAG leaves that claim, ALARM h1 and its record of the
+standing premise alone, and withdraws ALARM h2."
+  (with-retire-scenario (g)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-host-claim g "h1" "up" "scan-a")
+    (commit-host-claim g "h2" "up" "scan-a")
+    (commit-host-claim g "h1" "flag" "scan-b")
+    (is (= 2 (length (derived g 'rt-claim "alarm"))))
+    (is (= 2 (length (matches "watch" :added))))
+    (graph-db.rules:retire-rule g "flag")
+    (is (equal '("h1") (mapcar #'claim-subject-key
+                               (derived g 'rt-claim "alarm"))))
+    (let ((by-hand (find "scan-b" (claims-touching g 'rt-claim :host "h1"
+                                                   :role :subject
+                                                   :relation "flag")
+                         :key #'claim-producer :test #'string=))
+          (alarm (derived-subject g "alarm" "h1")))
+      (is (and by-hand (claim-current-p by-hand)))
+      (when alarm
+        (is (= 1 (count-if #'claim-current-p
+                           (derived-from-records g alarm))))))
+    ;; A :LOST match has no bindings once its body no longer matches
+    ;; (#466); the premise names the alarm withdrawn.
+    (is (equal '("h2") (mapcar (lambda (m)
+                                 (claim-subject-key
+                                  (first (getf m :premises))))
+                               (matches "watch" :lost))))
+    (is-true (run-rules-is-quiet g))))
+
+(test a-retired-rules-claims-stay-on-record
+  "#477: retraction, not deletion -- PREMISES-OF and DEPENDENTS-OF still
+answer through the retracted claims, and an :AS-OF read from before
+the retirement sees them current."
+  (with-retire-scenario (g)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-host-claim g "h1" "up" "scan-a")
+    (let ((flag (first (derived g 'rt-claim "flag")))
+          (alarm (first (derived g 'rt-claim "alarm")))
+          (before (graph-db.spacetime::%st-now)))
+      (is (and flag alarm))
+      (sleep 0.01)
+      (graph-db.rules:retire-rule g "flag")
+      (when (and flag alarm)
+        (is (equal (list (graph-db:id alarm))
+                   (mapcar #'graph-db:id
+                           (graph-db.rules:dependents-of g flag))))
+        (is (null (graph-db.rules:dependents-of g flag :current t)))
+        (is (equal (list (graph-db:id flag))
+                   (mapcar #'graph-db:id
+                           (graph-db.rules:premises-of g alarm))))
+        (let ((then (claims-by-producer g 'rt-claim "rule/flag"
+                                        :as-of before)))
+          (is (= 1 (length then)))
+          (is (every #'claim-current-p then)))
+        (is (null (derived g 'rt-claim "flag")))))))
+
+(test a-rewritten-retired-rule-re-opens-its-claims-as-kept
+  "#477: the rule enabled again does nothing until RUN-RULE, which
+re-opens the same claims and reports them KEPT; the step cascades and
+RUN-RULES is quiet."
+  (with-retire-scenario (g)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-host-claim g "h1" "up" "scan-a")
+    (commit-host-claim g "h2" "up" "scan-a")
+    (let ((ids (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
+                     #'string< :key #'princ-to-string)))
+      (graph-db.rules:retire-rule g "flag")
+      (is (null (derived g 'rt-claim "alarm")))
+      (with-transaction ((graph-db::transaction-manager g))
+        (let ((r (copy (first (graph-db:index-lookup
+                               g 'graph-db.rules:rule
+                               '(graph-db.rules::name) "flag")))))
+          (setf (graph-db.rules:rule-enabled r) t)
+          (save r)))
+      (is (null (derived g 'rt-claim "flag")))
+      (let ((report (graph-db.rules:run-rule g "flag")))
+        (is (= 2 (graph-db.rules:rule-report-kept report)))
+        (is (zerop (graph-db.rules:rule-report-derived report))))
+      (is (equal ids
+                 (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
+                       #'string< :key #'princ-to-string)))
+      (is (= 2 (length (derived g 'rt-claim "alarm"))))
+      (is (= 4 (length (matches "watch" :added))))
+      (is (= 2 (length (producer-records g "rule/flag"))))
+      (is-true (run-rules-is-quiet g)))))
+
+(test a-retired-production-withdraws-its-firings-without-hearing-lost
+  "#477: retiring the stored production retracts its firings and their
+records, deletes its record, and its own action hears no :LOST."
+  (with-retire-scenario (g)
+    (graph-db.rules:enable-forward-rules g)
+    (commit-host-claim g "h1" "up" "scan-a")
+    (commit-host-claim g "h2" "up" "scan-a")
+    (is (= 2 (length (firings g "watch"))))
+    (let ((report (graph-db.rules:retire-rule g "watch")))
+      (is (eq :retired (graph-db.rules:rule-report-outcome report)))
+      (is (= 2 (graph-db.rules:rule-report-swept report)))
+      (is (= 2 (graph-db.rules:rule-report-records report))))
+    (is (null (firings g "watch")))
+    (is (null (graph-db.rules:find-production g "watch")))
+    (is (null (matches "watch" :lost)))
+    (is (null (producer-records g "production/watch")))
+    (is (= 2 (length (derived g 'rt-claim "alarm"))))
+    (is-true (run-rules-is-quiet g))))
+
+(test retiring-a-name-with-no-stored-rule-or-production-signals
+  (with-retire-scenario (g)
+    (signals error (graph-db.rules:retire-rule g "nobody"))
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-rule "in-image" :version "1"
+             :family rt-claim :head *alarm-head* :body *alarm-body*)
+           (signals error (graph-db.rules:retire-rule g "in-image")))
+      (graph-db.rules:undef-rule "in-image"))))

@@ -40,9 +40,9 @@
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
-   #:rule-report-path #:rule-report-condition
-   ;; provenance (spec §9)
-   #:premises-of #:dependents-of
+   #:rule-report-path #:rule-report-condition #:rule-report-records
+   ;; provenance (spec §9), and withdrawing a rule's conclusions (#477)
+   #:premises-of #:dependents-of #:retire-rule
    ;; productions (forward-rules design §7, #456)
    #:def-production #:undef-production #:find-def-production
    #:production #:make-production #:production-p #:production-name
