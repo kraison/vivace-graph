@@ -1180,11 +1180,14 @@ opened a transaction never has a step run inside it. A body that
 unwinds after a nested commit leaves that delta queued until the next
 outermost commit in the image, or an explicit `forward-step`. A step
 that never quiesces -- an action that keeps writing what the
-production reads -- is stopped after `*rules-max-rounds*` consecutive
-drains that took a delta an action committed: those deltas are
-dropped with a `:rounds` failure on the status, and the deltas other
-threads queued meanwhile are kept and run. A foreign commit never
-counts toward the bound, however steady the stream (#472).
+production reads -- is stopped by a **generation** on each queued
+delta: a commit from outside the step is generation 0, an action's
+commit is the generation of the delta being run plus one, and a delta
+at `*rules-max-rounds*` is dropped with a `:rounds` failure on the
+status while everything else is run. So a foreign commit never counts
+toward the bound, however steady the stream, and neither does an
+action that writes on every match without feeding its own read; only
+a chain of deltas each fed from the last is stopped (#472, #475).
 
 **`:drain :caller` (#467).** `(enable-forward-rules graph :drain
 :caller :on-queue fn)` keeps the committing thread out of it: the hook

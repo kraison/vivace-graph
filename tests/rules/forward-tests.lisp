@@ -1814,11 +1814,11 @@ delta queued on whatever step is running.  Returns nothing."
 
 (defun echo-stops-and-the-foreign-pong-fires (g &rest enable-args)
   "#472's second acceptance line: the echo production is stopped at the
-bound, and a foreign commit queued in the very drain the guard drops
-still fires.  The pong is committed at the sixth echo: with a bound of
-5 the guard trips at the check after that drain, so the pong is in the
-queue the guard inspects, and a guard that dropped the whole queue
-would lose it (review of #472).  ENABLE-ARGS go to
+bound, and a foreign commit queued beside the delta the guard drops
+still fires.  The pong is committed at the fifth echo, which runs the
+delta of generation 4 and queues generation 5, the one the bound of 5
+drops: the pong is in the queue with it, and a guard that dropped the
+whole queue would lose it (review of #472; #475).  ENABLE-ARGS go to
 ENABLE-FORWARD-RULES; under :DRAIN :CALLER a helper thread drains."
   (let ((echoes 0)
         (pongs '())
@@ -1843,7 +1843,7 @@ ENABLE-FORWARD-RULES; under :DRAIN :CALLER a helper thread drains."
                          (when (eq event :added)
                            (let ((n (bt:with-lock-held (lock)
                                       (incf echoes))))
-                             (when (= n 6) (commit-pong-elsewhere g))
+                             (when (= n 5) (commit-pong-elsewhere g))
                              (with-transaction
                                  ((graph-db::transaction-manager g))
                                (make-rt-claim-unary

@@ -14,8 +14,9 @@ the dedupe set (thresholds.lisp)."
 
 (defstruct (forward-state (:constructor %make-forward-state))
   "One enabled graph's forward evaluation: QUEUE of pending (delta .
-own-p) under LOCK, OWN-P true for a delta an action's commit queued
-(#472), DRAIN :COMMIT when the committing thread drains it or :CALLER
+generation) under LOCK, GENERATION 0 for a commit from outside the
+step and one more than the running delta's for an action's commit
+(#472, #475), DRAIN :COMMIT when the committing thread drains it or :CALLER
 when only FORWARD-STEP does, ON-QUEUE a function of the graph called
 outside every lock whenever a delta is queued, or NIL (#467),
 ON-FAILURE a function of (name tag text condition) called for every
@@ -81,17 +82,23 @@ FAILURES and skipped."
             (forward-state-cache-stamp state) *def-rules-stamp*)))
   (forward-state-compiled state))
 
-(defun %enqueue-delta (state delta &optional own-p)
-  "Queue DELTA on STATE; OWN-P marks it as fed by the running step's
-own action (#472), what the rounds guard counts."
+(defvar *delta-generation* 0
+  "The generation of the delta the running step is on: 0 for a commit
+from outside the step, one more for each delta an action's commit fed
+from the last (#475).  Bound by %RUN-DELTA; read by the hook.")
+
+(defun %enqueue-delta (state delta &optional (generation 0))
+  "Queue DELTA on STATE at GENERATION, what the rounds guard measures
+(#475)."
   (bordeaux-threads:with-lock-held ((forward-state-lock state))
     (setf (forward-state-queue state)
-          (append (forward-state-queue state) (list (cons delta own-p))))))
+          (append (forward-state-queue state)
+                  (list (cons delta generation))))))
 
-(defun %queue-delta (state delta &optional own-p)
-  "Queue DELTA and tell ON-QUEUE, outside every lock; a signal from it
-is logged and recorded under :ON-QUEUE (#467)."
-  (%enqueue-delta state delta own-p)
+(defun %queue-delta (state delta &optional (generation 0))
+  "Queue DELTA at GENERATION and tell ON-QUEUE, outside every lock; a
+signal from it is logged and recorded under :ON-QUEUE (#467)."
+  (%enqueue-delta state delta generation)
   (let ((fn (forward-state-on-queue state)))
     (when fn
       (handler-case (funcall fn (forward-state-graph state))
@@ -139,14 +146,17 @@ ON-FAILURE."
                      :tag (car (first (rule-report-refusals r)))
                      :condition (rule-report-condition r)))))
 
-(defun %run-delta (graph state delta)
-  "One delta through RUN-FORWARD-STRATA: a refused report and a signal
-out of the step both land on FAILURES (spec §4.4) and the step goes
-on; the commit that queued the delta is durable either way."
+(defun %run-delta (graph state entry)
+  "One queue ENTRY, (delta . generation), through RUN-FORWARD-STRATA
+with *DELTA-GENERATION* bound for the actions' commits: a refused
+report and a signal out of the step both land on FAILURES (spec §4.4)
+and the step goes on; the commit that queued the delta is durable
+either way."
   (handler-case
       (let* ((graph-db::*evaluation-instant* (graph-db.spacetime::%st-now))
+             (*delta-generation* (cdr entry))
              (reports (run-forward-strata
-                       graph (%forward-compiled graph state) delta)))
+                       graph (%forward-compiled graph state) (car entry))))
         (setf (forward-state-last-reports state) reports)
         (%note-refused-reports state reports))
     (error (c)
@@ -161,14 +171,15 @@ them, retake it -- until the queue is empty; a later entrant finds
 RUNNING-P set and returns at once, its delta left for the running
 step.  So a commit never waits on another commit's derivation, and a
 reader must not expect a derivation the moment WITH-TRANSACTION
-returns (docs/rules.md).  The rounds guard (spec §4.3) counts only
-drains that took a delta an action fed: after *RULES-MAX-ROUNDS* such
-drains in a row those deltas are dropped with a :ROUNDS failure, and
-the foreign deltas other threads queued are kept and run (#472).
+returns (docs/rules.md).  The rounds guard (spec §4.3) measures a
+chain of deltas each fed by an action from the last: a queue entry's
+generation is 0 for a commit from outside the step and one more than
+the running delta's for an action's commit, and an entry at
+*RULES-MAX-ROUNDS* is dropped with a :ROUNDS failure while everything
+else, foreign commits and shorter chains alike, is run (#472, #475).
 Returns nothing."
   (let ((state (%forward-state graph))
-        (start (get-internal-real-time))
-        (own-drains 0))
+        (start (get-internal-real-time)))
     (when state
       (bordeaux-threads:with-lock-held ((forward-state-lock state))
         (when (forward-state-running-p state)
@@ -176,32 +187,23 @@ Returns nothing."
         (setf (forward-state-running-p state) t))
       (unwind-protect
            (loop
-             (let ((taken
-                     (bordeaux-threads:with-lock-held
-                         ((forward-state-lock state))
-                       (let ((queue (forward-state-queue state)))
-                         (cond ((null queue) (return))
-                               ;; An action feeding its own read: drop
-                               ;; what it fed, keep the rest.
-                               ((and (>= own-drains *rules-max-rounds*)
-                                     (some #'cdr queue))
-                                (setf (forward-state-queue state)
-                                      (remove-if #'cdr queue))
-                                :rounds)
-                               (t (setf (forward-state-queue state) '())
-                                  queue))))))
-               (cond ((eq taken :rounds)
-                      (%note-failure state :rounds
-                                     (format nil "no quiescence after ~
-~D drains of the deltas an action fed; those deltas were dropped"
-                                             *rules-max-rounds*)
-                                     :tag :rounds)
-                      (setf own-drains 0))
-                     (t
-                      (setf own-drains
-                            (if (some #'cdr taken) (1+ own-drains) 0))
-                      (dolist (entry taken)
-                        (%run-delta graph state (car entry)))))))
+             (let ((taken (bordeaux-threads:with-lock-held
+                              ((forward-state-lock state))
+                            (prog1 (forward-state-queue state)
+                              (setf (forward-state-queue state) '())))))
+               (when (null taken) (return))
+               (let ((dropped (count-if (lambda (e)
+                                          (>= (cdr e) *rules-max-rounds*))
+                                        taken)))
+                 (when (plusp dropped)
+                   (%note-failure state :rounds
+                                  (format nil "no quiescence: an action ~
+fed a chain of ~D deltas each from the last; ~D at its end dropped"
+                                          *rules-max-rounds* dropped)
+                                  :tag :rounds))
+                 (dolist (entry taken)
+                   (when (< (cdr entry) *rules-max-rounds*)
+                     (%run-delta graph state entry))))))
         ;; Every exit, normal or not: the queue is empty or dropped.
         (bordeaux-threads:with-lock-held ((forward-state-lock state))
           (setf (forward-state-last-step-elapsed state)
@@ -272,8 +274,11 @@ ignored."
           (when *agenda-production*
             (%check-production-writes state *agenda-production* delta))
           (when (plusp (hash-table-count delta))
-            ;; An action's commit is the step's own delta (#472).
-            (%queue-delta state delta (and *agenda-production* t))))))))
+            ;; An action's commit continues the running delta's
+            ;; chain (#472, #475).
+            (%queue-delta state delta (if *agenda-production*
+                                          (1+ *delta-generation*)
+                                          0))))))))
 
 (defun %check-production-writes (state compiled delta)
   "An action's commit wrote DELTA: a relation outside the production's
