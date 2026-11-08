@@ -1361,17 +1361,28 @@ production over `text` delivers, commit by commit, exactly the rows a
 full re-evaluation of `text` would add and lose, else a list of
 reasons, each naming its goal. Admitted: top-level `claim/7` and
 `claim-absent/7` with a variable `?c` and a literal relation, or a
-family-wide read (#469); `not` over those; tests over bound values
-(`=`, `<`, `instant<`, `instant-offset`, ...); `claim-current`; a
-premise's slot read as a filter with a literal, `(claim-standing ?p
-"observed")`, or a slot no update changes (`claim-relation`,
-`claim-producer` of a premise, `claim-recorded-at`,
-`claim-rule-version`). Refused: every other store read (`is-a`,
-`related`, `claimed`, `find-*`, views, edges, `node-slot-value`, a
-`claim-producer` generator); a claim read nested under `or`, `once`,
-`if` or `forall`; a slot an update can change read into a variable
-(the row changes, the instantiation does not, so nothing is
-delivered); an effect or `repeat`; `now`; no premise; more than eight.
+family-wide read (#469); `not` over those, with a literal relation;
+tests over bound values (`=`, `<`, `instant<`, `instant-offset`, ...),
+`once`, `if` and `forall` over tests, and `or` under `once` or `not`;
+`claim-current`; a premise's slot read as a filter with a literal,
+`(claim-standing ?p "observed")`, or a slot no update changes
+(`claim-relation`, `claim-producer` of a premise). Refused: every other
+store read (`is-a`, `related`, `claimed`, `find-*`, views, edges,
+`node-slot-value`, a `claim-producer` generator); a claim read nested
+under `once`, `if` or `forall`; an `or` anywhere else, since it yields
+a row per true branch and a production holds one row per
+instantiation; `unique`, which keeps a seen-table across the query's
+solutions; a slot an update can change read into a variable (the row
+changes, the instantiation does not, so nothing is delivered --
+`claim-standing`, the extent instants, and also `claim-recorded-at`,
+which a re-open moves, and `claim-rule-version`, which an in-place
+save moves); an effect or `repeat`; `now`; no premise; more than
+eight. One timing caveat stands even for an admitted body: under
+`:drain :caller`, a premise deleted and written again under the same
+identity *between two drains* keeps its instantiation, so there is no
+`:lost` and no `:added` though the query's row now carries the new
+node's id; with a drain between the two commits the events are right,
+and a retraction and re-open is unaffected.
 The classification is `*standing-query-functor-classes*`
 (`rules/standing.lisp`), one entry per registered functor; the rules
 suite insists every functor has one, so a new functor chooses.

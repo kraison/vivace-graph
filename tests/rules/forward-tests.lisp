@@ -1349,7 +1349,15 @@ read family is refused."
         "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
          (claim-producer ?u ?who) (claim-relation ?u ?r)"
         "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
-         (claim-absent ?a rt-claim \"host\" ?h \"down\" nil nil)")
+         (claim-absent ?a rt-claim \"host\" ?h \"down\" nil nil)"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (once (or (= ?x \"a\") (= ?x \"b\")))"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (not (or (= ?h \"zz\") (= ?h \"zy\")))"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (if (> ?h \"a\") (= ?x 1) (= ?x 2))"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-recorded-at ?u \"2026-01-01T00:00:00Z\")")
   "Bodies STANDING-QUERY-PROBLEMS admits: a production over each
 delivers exactly the query's rows.")
 
@@ -1383,7 +1391,20 @@ delivers exactly the query's rows.")
       (now ?t) (claim-recorded-at ?p ?r) (instant< ?r ?t)" "now")
     ("(= ?x 1)" "claim/7")
     ("(claim ?p rt-claim \"host\" ?h ?r nil nil)
-      (claim ?q ?f \"host\" ?h \"up\" nil nil)" "relation"))
+      (claim ?q ?f \"host\" ?h \"up\" nil nil)" "relation")
+    ;; Kevin's review (#470): rows a production cannot hold.
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (or (= ?x \"a\") (= ?x \"b\"))" "or")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (if (> ?h \"a\") (or (= ?x 1) (= ?x 2)) (= ?x 3))" "or")
+    ("(claim ?a rt-claim \"host\" ?h \"up\" nil nil)
+      (claim ?b rt-claim \"host\" ?h \"up\" nil nil) (unique ?a)" "unique")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (claim-recorded-at ?p ?r)" "claim-recorded-at")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (claim-rule-version ?p ?v)" "claim-rule-version")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (not (claim ?q rt-claim \"host\" ?h ?r nil nil))" "relation"))
   "Bodies STANDING-QUERY-PROBLEMS refuses, each with a word its reason
 must carry: the issue's table (#470) and the admitted list's edges.")
 
@@ -1449,6 +1470,103 @@ under OR -- each as a query whose rows change with no action call."
             (commit-host-claim g "h1" "b" "scan-t")
             (is (= 1 (length (guarded-rows or-body g))))
             (is (null (matches "orred")))))))))
+
+(defparameter *or-body*
+  "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+   (or (= ?x \"a\") (= ?x \"b\"))")
+
+(test an-or-outside-once-yields-rows-a-production-cannot-hold
+  "Review of #470: an OR with two true branches is two rows of the
+query and one instantiation of the production."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("orrows" :version "1" :family rt-claim
+                                 :body *or-body* :action (note-match "orrows"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "up" "scan-t")
+        (is (= 2 (length (guarded-rows *or-body* g))))
+        (is (= 1 (length (matches "orrows" :added))))
+        (is (some (lambda (r) (search "(or " r))
+                  (graph-db.rules:standing-query-problems *or-body* g)))))))
+
+(defparameter *unique-body*
+  "(claim ?a rt-claim \"host\" ?h \"up\" nil nil)
+   (claim ?b rt-claim \"host\" ?h \"up\" nil nil) (unique ?a)")
+
+(test unique-keeps-a-seen-table-across-the-querys-solutions
+  "Review of #470: UNIQUE/1 passes each ?a once per query, but once per
+instantiation under a production."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("uniq" :version "1" :family rt-claim
+                               :body *unique-body* :action (note-match "uniq"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "up" "scan-a")
+        (commit-host-claim g "h1" "up" "scan-b")
+        (is (= 2 (length (guarded-rows *unique-body* g))))
+        (is (< 2 (length (matches "uniq" :added))))
+        (is (some (lambda (r) (search "(unique " r))
+                  (graph-db.rules:standing-query-problems *unique-body* g)))))))
+
+(defparameter *recorded-at-body*
+  "(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-recorded-at ?p ?r)")
+
+(test claim-recorded-at-moves-when-a-premise-is-re-opened
+  "Review of #470: a retraction and a re-open move the premise's
+recorded-at; the query's cell moves and the production, whose
+instantiation is unchanged, delivers nothing."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("rec" :version "1" :family rt-claim
+                              :body *recorded-at-body*
+                              :action (note-match "rec"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "up" "scan-t")
+        (let ((before (guarded-rows *recorded-at-body* g)))
+          (sleep 1.1)
+          (retract-claim (up-claim-by g "h1" "scan-t"))
+          (reopen-claim g (up-claim-by g "h1" "scan-t"))
+          (is (= 1 (length before)))
+          (is (not (equal before (guarded-rows *recorded-at-body* g))))
+          (is (= 1 (length (matches "rec"))))
+          (is (some (lambda (r) (search "(claim-recorded-at " r))
+                    (graph-db.rules:standing-query-problems
+                     *recorded-at-body* g))))))))
+
+(defparameter *rule-version-body*
+  "(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-rule-version ?p ?v)")
+
+(test claim-rule-version-moves-on-an-in-place-save
+  "Review of #470: an in-place save changes the premise's rule-version;
+the query's cell moves and the production delivers nothing."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("ver" :version "1" :family rt-claim
+                              :body *rule-version-body*
+                              :action (note-match "ver"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "up" "scan-t")
+        (let ((before (guarded-rows *rule-version-body* g)))
+          (with-transaction ((graph-db::transaction-manager g))
+            (let ((copy (graph-db::copy (up-claim-by g "h1" "scan-t"))))
+              (setf (claim-rule-version copy) "2")
+              (graph-db::save copy)))
+          (is (= 1 (length before)))
+          (is (not (equal before (guarded-rows *rule-version-body* g))))
+          (is (= 1 (length (matches "ver"))))
+          (is (some (lambda (r) (search "(claim-rule-version " r))
+                    (graph-db.rules:standing-query-problems
+                     *rule-version-body* g))))))))
+
+(test a-not-over-a-family-wide-read-gets-a-reason
+  "Review of #470: COMPILE-RULE refuses a negated goal with its relation
+unbound, so STANDING-QUERY-PROBLEMS must not promise delivery."
+  (with-rules-graph (g)
+    (let ((body "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+                 (not (claim ?q rt-claim \"host\" ?h ?r nil nil))"))
+      (is (search "relation" (production-refusal g "notwide" body)))
+      (is (some (lambda (r) (search "(not " r))
+                (graph-db.rules:standing-query-problems body g))))))
 
 (defvar *rows* (make-hash-table :test 'equal)
   "Firing object key -> the row delivered with its :ADDED.")
