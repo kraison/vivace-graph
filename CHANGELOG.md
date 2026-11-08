@@ -16,6 +16,11 @@ storage formats (#60).
 
 ### Fixed
 
+- **A forward step's rounds guard counts only the deltas an action fed**
+  (#472). A steady stream of commits from other threads used to trip it
+  and drop the whole queue, losing those commits' derivations and
+  firings until a `run-rules`; now only an action feeding its own read
+  is stopped, only its deltas are dropped, and foreign deltas run.
 - Refuse malformed ISO duration numbers without invoking the Lisp reader,
   queue commits during forward opt-in, and clarify shutdown, firing history
   and costs; cap compile failures, late-bind production actions, reset

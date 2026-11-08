@@ -1152,8 +1152,11 @@ opened a transaction never has a step run inside it. A body that
 unwinds after a nested commit leaves that delta queued until the next
 outermost commit in the image, or an explicit `forward-step`. A step
 that never quiesces -- an action that keeps writing what the
-production reads -- is stopped after `*rules-max-rounds*` drains with
-the queue dropped and a `:rounds` failure on the status.
+production reads -- is stopped after `*rules-max-rounds*` consecutive
+drains that took a delta an action committed: those deltas are
+dropped with a `:rounds` failure on the status, and the deltas other
+threads queued meanwhile are kept and run. A foreign commit never
+counts toward the bound, however steady the stream (#472).
 
 **Failure (spec §4.4).** A rule that refuses in a step -- the rails,
 a constraint, a bad instant, a functor's own refusal -- is reported

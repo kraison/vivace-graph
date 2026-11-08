@@ -13,8 +13,9 @@ the dedupe set (thresholds.lisp)."
   (if heap (fill-pointer (timer-heap-items heap)) 0))
 
 (defstruct (forward-state (:constructor %make-forward-state))
-  "One enabled graph's forward evaluation: QUEUE of pending deltas under
-LOCK, RUNNING-P while a step drains it (D5), FAILURES as (name .
+  "One enabled graph's forward evaluation: QUEUE of pending (delta .
+own-p) under LOCK, OWN-P true for a delta an action's commit queued
+(#472), RUNNING-P while a step drains it (D5), FAILURES as (name .
 text) newest first, COMPILED the rule set cached while CACHE-STAMP
 matches *DEF-RULES-STAMP* (NIL invalidates), TIMERS a TIMER-HEAP of
 pending THRESHOLD-TIMERs or NIL, with TIMER-THREAD, TIMER-CV and
@@ -66,10 +67,12 @@ FAILURES and skipped."
             (forward-state-cache-stamp state) *def-rules-stamp*)))
   (forward-state-compiled state))
 
-(defun %enqueue-delta (state delta)
+(defun %enqueue-delta (state delta &optional own-p)
+  "Queue DELTA on STATE; OWN-P marks it as fed by the running step's
+own action (#472), what the rounds guard counts."
   (bordeaux-threads:with-lock-held ((forward-state-lock state))
     (setf (forward-state-queue state)
-          (append (forward-state-queue state) (list delta)))))
+          (append (forward-state-queue state) (list (cons delta own-p))))))
 
 (defparameter *forward-failures-kept* 100
   "How many failures FORWARD-RULES-STATUS keeps, newest first.")
@@ -108,37 +111,46 @@ them, retake it -- until the queue is empty; a later entrant finds
 RUNNING-P set and returns at once, its delta left for the running
 step.  So a commit never waits on another commit's derivation, and a
 reader must not expect a derivation the moment WITH-TRANSACTION
-returns (docs/rules.md).  Returns nothing."
+returns (docs/rules.md).  The rounds guard (spec §4.3) counts only
+drains that took a delta an action fed: after *RULES-MAX-ROUNDS* such
+drains in a row those deltas are dropped with a :ROUNDS failure, and
+the foreign deltas other threads queued are kept and run (#472).
+Returns nothing."
   (let ((state (%forward-state graph))
-        (start (get-internal-real-time)))
+        (start (get-internal-real-time))
+        (own-drains 0))
     (when state
       (bordeaux-threads:with-lock-held ((forward-state-lock state))
         (when (forward-state-running-p state)
           (return-from forward-step nil))
         (setf (forward-state-running-p state) t))
       (unwind-protect
-           (loop for drains from 0
-                 do (let ((deltas
-                            (bordeaux-threads:with-lock-held
-                                ((forward-state-lock state))
-                              (cond ((null (forward-state-queue state))
-                                     (return))
-                                    ;; Spec §4.3: a step that never
-                                    ;; quiesces -- an action feeding its
-                                    ;; own read -- stops here.
-                                    ((>= drains *rules-max-rounds*)
-                                     (setf (forward-state-queue state) '())
-                                     :rounds)
-                                    (t (prog1 (forward-state-queue state)
-                                         (setf (forward-state-queue state)
-                                               '())))))))
-                      (when (eq deltas :rounds)
-                        (%note-failure state :rounds
-                                       (format nil "no quiescence after ~
-~D drains; the queue was dropped" *rules-max-rounds*))
-                        (return))
-                      (dolist (delta deltas)
-                        (%run-delta graph state delta))))
+           (loop
+             (let ((taken
+                     (bordeaux-threads:with-lock-held
+                         ((forward-state-lock state))
+                       (let ((queue (forward-state-queue state)))
+                         (cond ((null queue) (return))
+                               ;; An action feeding its own read: drop
+                               ;; what it fed, keep the rest.
+                               ((and (>= own-drains *rules-max-rounds*)
+                                     (some #'cdr queue))
+                                (setf (forward-state-queue state)
+                                      (remove-if #'cdr queue))
+                                :rounds)
+                               (t (setf (forward-state-queue state) '())
+                                  queue))))))
+               (cond ((eq taken :rounds)
+                      (%note-failure state :rounds
+                                     (format nil "no quiescence after ~
+~D drains of the deltas an action fed; those deltas were dropped"
+                                             *rules-max-rounds*))
+                      (setf own-drains 0))
+                     (t
+                      (setf own-drains
+                            (if (some #'cdr taken) (1+ own-drains) 0))
+                      (dolist (entry taken)
+                        (%run-delta graph state (car entry)))))))
         ;; Every exit, normal or not: the queue is empty or dropped.
         (bordeaux-threads:with-lock-held ((forward-state-lock state))
           (setf (forward-state-last-step-elapsed state)
@@ -205,7 +217,8 @@ made itself (*FORWARD-HOOK-SUPPRESSED*) is ignored."
           (when *agenda-production*
             (%check-production-writes state *agenda-production* delta))
           (when (plusp (hash-table-count delta))
-            (%enqueue-delta state delta)))))))
+            ;; An action's commit is the step's own delta (#472).
+            (%enqueue-delta state delta (and *agenda-production* t))))))))
 
 (defun %check-production-writes (state compiled delta)
   "An action's commit wrote DELTA: a relation outside the production's

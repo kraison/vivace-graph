@@ -918,6 +918,120 @@ reads cannot pin the committing thread; the step stops after
           (is (eql 0 (getf status :queue-depth)))
           (is-false (getf status :running-p)))))))
 
+;;; The rounds guard counts the step's own drains only (#472)
+
+(defun commit-up-paced (g prefix n pause)
+  "N \"up\" claims keyed PREFIX0.., each in its own transaction, PAUSE
+seconds apart, on the calling thread.  Returns nothing."
+  (let ((graph-db:*graph* g))
+    (dotimes (i n)
+      (with-transaction ((graph-db::transaction-manager g))
+        (make-rt-claim-unary :graph g :subject-namespace :host
+                             :subject-key (format nil "~A~D" prefix i)
+                             :relation "up" :producer "scan-t"
+                             :standing :observed))
+      (sleep pause))))
+
+(test foreign-commits-never-trip-the-rounds-guard
+  "#472: two threads commit faster than a 30 ms action serves them, so
+the running step's queue is never empty between drains.  Those drains
+are foreign commits, not an action feeding its own read: nothing is
+dropped at any bound."
+  (with-rules-graph (g)
+    (let ((calls 0)
+          (lock (bt:make-lock "paced"))
+          (rounds graph-db.rules:*rules-max-rounds*))
+      ;; Set, not bound: the steps run on the writer threads.  Three
+      ;; drains of a growing queue take about a dozen deltas; the
+      ;; writers supply eighty, so the stream outlasts the bound.
+      (setf graph-db.rules:*rules-max-rounds* 3)
+      (unwind-protect
+           (with-production ("paced" :version "1" :family rt-claim
+                                     :body *q3-body*
+                                     :action (lambda (event match)
+                                               (declare (ignore match))
+                                               (when (eq event :added)
+                                                 (bt:with-lock-held (lock)
+                                                   (incf calls)))
+                                               (sleep 0.03)))
+             (graph-db.rules:enable-forward-rules g)
+             (let ((a (bt:make-thread
+                       (lambda () (commit-up-paced g "a" 40 0.01))
+                       :name "paced a"))
+                   (b (bt:make-thread
+                       (lambda () (commit-up-paced g "b" 40 0.01))
+                       :name "paced b")))
+               (bt:join-thread a)
+               (bt:join-thread b))
+             (let ((status (graph-db.rules:forward-rules-status g)))
+               (is (eql 0 (getf status :queue-depth)))
+               (is (null (find :rounds (getf status :failures) :key #'car)))
+               (is (= 80 calls))
+               (is (= 80 (length (firings g "paced"))))))
+        (setf graph-db.rules:*rules-max-rounds* rounds)))))
+
+(defparameter *pong-body*
+  "(claim ?p rt-claim \"host\" ?h \"pong\" nil nil) (claim-current ?p)")
+
+(defun commit-pong-elsewhere (g)
+  "One \"pong\" claim committed on a helper thread and joined: a foreign
+delta queued on whatever step is running.  Returns nothing."
+  (bt:join-thread
+   (bt:make-thread
+    (lambda ()
+      (let ((graph-db:*graph* g))
+        (with-transaction ((graph-db::transaction-manager g))
+          (make-rt-claim-unary :graph g :subject-namespace :host
+                               :subject-key "p1" :relation "pong"
+                               :producer "scan-t" :standing :observed))))
+    :name "pong committer")))
+
+(test the-rounds-guard-drops-only-the-deltas-the-action-fed
+  "#472: when the echo production is stopped at the bound, a foreign
+commit queued in the same drain still gets its step, and its production
+fires."
+  (with-rules-graph (g)
+    (let ((*fired* '())
+          (graph-db.rules:*rules-max-rounds* 5))
+      ;; Bound, not set: this step runs on the test thread.
+      (with-production ("pong" :version "1" :family rt-claim
+                               :body *pong-body*
+                               :action (note-firing "pong"))
+        (with-production
+            ("echo" :version "1" :family rt-claim :body *echo-body*
+                    :writes '()
+                    :action (lambda (event match)
+                              (when (eq event :added)
+                                (push (list "echo" event (getf match :key))
+                                      *fired*)
+                                (when (= 5 (count "echo" *fired*
+                                                  :key #'first
+                                                  :test #'string=))
+                                  (commit-pong-elsewhere g))
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (make-rt-claim-unary
+                                   :graph g :subject-namespace :host
+                                   :subject-key (format nil "h~D"
+                                                        (length *fired*))
+                                   :relation "ping" :producer "echo"
+                                   :standing :inferred)))))
+          (graph-db.rules:enable-forward-rules g)
+          (finishes
+            (with-transaction ((graph-db::transaction-manager g))
+              (make-rt-claim-unary :graph g :subject-namespace :host
+                                   :subject-key "h0" :relation "ping"
+                                   :producer "scan-t" :standing :observed)))
+          (let ((status (graph-db.rules:forward-rules-status g)))
+            (is (find :rounds (getf status :failures) :key #'car))
+            (is (<= (count "echo" *fired* :key #'first :test #'string=) 7))
+            (is (equal '(("pong" :added))
+                       (loop for (name event) in (fired)
+                             when (string= name "pong")
+                               collect (list name event))))
+            (is (eql 0 (getf status :queue-depth)))
+            (is-false (getf status :running-p))))))))
+
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)
 
