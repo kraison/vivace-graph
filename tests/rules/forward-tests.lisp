@@ -1812,51 +1812,68 @@ delta queued on whatever step is running.  Returns nothing."
                                :producer "scan-t" :standing :observed))))
     :name "pong committer")))
 
+(defun echo-stops-and-the-foreign-pong-fires (g &rest enable-args)
+  "#472's second acceptance line: the echo production is stopped at the
+bound, and a foreign commit queued in the very drain the guard drops
+still fires.  The pong is committed at the sixth echo: with a bound of
+5 the guard trips at the check after that drain, so the pong is in the
+queue the guard inspects, and a guard that dropped the whole queue
+would lose it (review of #472).  ENABLE-ARGS go to
+ENABLE-FORWARD-RULES; under :DRAIN :CALLER a helper thread drains."
+  (let ((echoes 0)
+        (pongs '())
+        (lock (bt:make-lock "echo"))
+        (rounds graph-db.rules:*rules-max-rounds*)
+        (caller-p (eq :caller (getf enable-args :drain))))
+    ;; Set, not bound: under :caller the step runs on the drainer.
+    (setf graph-db.rules:*rules-max-rounds* 5)
+    (unwind-protect
+         (with-production ("pong" :version "1" :family rt-claim
+                                  :body *pong-body*
+                                  :action (lambda (event match)
+                                            (declare (ignore match))
+                                            (bt:with-lock-held (lock)
+                                              (push event pongs))))
+           (with-production
+               ("echo" :version "1" :family rt-claim :body *echo-body*
+                       :writes '()
+                       :action
+                       (lambda (event match)
+                         (declare (ignore match))
+                         (when (eq event :added)
+                           (let ((n (bt:with-lock-held (lock)
+                                      (incf echoes))))
+                             (when (= n 6) (commit-pong-elsewhere g))
+                             (with-transaction
+                                 ((graph-db::transaction-manager g))
+                               (make-rt-claim-unary
+                                :graph g :subject-namespace :host
+                                :subject-key (format nil "h~D" n)
+                                :relation "ping" :producer "echo"
+                                :standing :inferred))))))
+             (apply #'graph-db.rules:enable-forward-rules g enable-args)
+             (finishes
+               (with-transaction ((graph-db::transaction-manager g))
+                 (make-rt-claim-unary :graph g :subject-namespace :host
+                                      :subject-key "h0" :relation "ping"
+                                      :producer "scan-t"
+                                      :standing :observed)))
+             (when caller-p (caller-drains g))
+             (let ((status (status g)))
+               (is (find :rounds (getf status :failures) :key #'car))
+               (is (<= echoes 7))
+               (is (equal '(:added) pongs))
+               (is (eql 0 (getf status :queue-depth)))
+               (is-false (getf status :running-p)))))
+      (setf graph-db.rules:*rules-max-rounds* rounds))))
+
 (test the-rounds-guard-drops-only-the-deltas-the-action-fed
-  "#472: when the echo production is stopped at the bound, a foreign
-commit queued in the same drain still gets its step, and its production
-fires."
   (with-rules-graph (g)
-    (let ((*fired* '())
-          (graph-db.rules:*rules-max-rounds* 5))
-      ;; Bound, not set: this step runs on the test thread.
-      (with-production ("pong" :version "1" :family rt-claim
-                               :body *pong-body*
-                               :action (note-firing "pong"))
-        (with-production
-            ("echo" :version "1" :family rt-claim :body *echo-body*
-                    :writes '()
-                    :action (lambda (event match)
-                              (when (eq event :added)
-                                (push (list "echo" event (getf match :key))
-                                      *fired*)
-                                (when (= 5 (count "echo" *fired*
-                                                  :key #'first
-                                                  :test #'string=))
-                                  (commit-pong-elsewhere g))
-                                (with-transaction
-                                    ((graph-db::transaction-manager g))
-                                  (make-rt-claim-unary
-                                   :graph g :subject-namespace :host
-                                   :subject-key (format nil "h~D"
-                                                        (length *fired*))
-                                   :relation "ping" :producer "echo"
-                                   :standing :inferred)))))
-          (graph-db.rules:enable-forward-rules g)
-          (finishes
-            (with-transaction ((graph-db::transaction-manager g))
-              (make-rt-claim-unary :graph g :subject-namespace :host
-                                   :subject-key "h0" :relation "ping"
-                                   :producer "scan-t" :standing :observed)))
-          (let ((status (graph-db.rules:forward-rules-status g)))
-            (is (find :rounds (getf status :failures) :key #'car))
-            (is (<= (count "echo" *fired* :key #'first :test #'string=) 7))
-            (is (equal '(("pong" :added))
-                       (loop for (name event) in (fired)
-                             when (string= name "pong")
-                               collect (list name event))))
-            (is (eql 0 (getf status :queue-depth)))
-            (is-false (getf status :running-p))))))))
+    (echo-stops-and-the-foreign-pong-fires g)))
+
+(test the-rounds-guard-drops-only-the-deltas-the-action-fed-under-drain-caller
+  (with-rules-graph (g)
+    (echo-stops-and-the-foreign-pong-fires g :drain :caller)))
 
 ;;; :drain :caller -- the hook queues, the caller drains (#467)
 
