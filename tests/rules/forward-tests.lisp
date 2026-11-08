@@ -1093,12 +1093,12 @@ keeps refraction."
           (is (equal '("?C" "?INSTANTIATION-KEY") (binding-names m)))
           (is (equal "h1" (binding m "?INSTANTIATION-KEY"))))))))
 
-(defun production-refusal (g name body)
+(defun production-refusal (g name body &key writes)
   "The reason COMPILE-PRODUCTION refuses BODY under NAME, or NIL."
   (unwind-protect
        (progn
          (graph-db.rules:def-production name :version "1" :family rt-claim
-           :body body :action (lambda (e m) (list e m)))
+           :body body :writes writes :action (lambda (e m) (list e m)))
          (handler-case (progn (graph-db.rules:compile-production g name)
                               nil)
            (graph-db.rules:rule-compile-error (c)
@@ -2255,6 +2255,102 @@ for its edges -- not once per other rule."
                                   state))))
                (is (<= calls 60) "~D guard calls for 20 rules" calls)))
         (dolist (n names) (graph-db.rules:undef-production n))))))
+
+;;; A production's write read by a rule is an order, not a cycle (#469
+;;; follow-up, found by #475's test)
+
+(defparameter *from-audit-head*
+  "(claim ?c rt-claim \"host\" ?k \"audited\" nil nil)")
+(defparameter *from-audit-body*
+  "(claim ?p rt-claim \"host\" ?k \"audit\" nil nil)")
+(defparameter *up-from-x-head*
+  "(claim ?c rt-claim \"host\" ?k \"up\" nil nil)")
+(defparameter *up-from-x-body*
+  "(claim ?p rt-claim \"host\" ?k \"x\" nil nil)")
+
+(test a-write-a-rule-reads-orders-the-rule-after-and-is-no-cycle
+  "A production writing audit beside a rule deriving from audit
+compiles; one writing x beside a rule deriving the production's own
+read up from x is the cycle."
+  (with-rules-graph (g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-rule "from-audit" :version "1"
+             :family rt-claim :head *from-audit-head*
+             :body *from-audit-body*)
+           (graph-db.rules:def-rule "up-from-x" :version "1"
+             :family rt-claim :head *up-from-x-head* :body *up-from-x-body*)
+           (is (null (production-refusal g "writes-audit" *q3-body*
+                                         :writes '("audit"))))
+           (is (search "cycle" (production-refusal g "writes-x" *q3-body*
+                                                   :writes '("x")))))
+      (graph-db.rules:undef-rule "from-audit")
+      (graph-db.rules:undef-rule "up-from-x"))))
+
+;;; The rounds guard counts a chain of deltas, not drains (#475)
+
+(defparameter *audited-head*
+  "(claim ?c rt-claim \"host\" ?k \"audited\" nil nil)")
+(defparameter *audited-body*
+  "(claim ?p rt-claim \"host\" ?k \"audit\" nil nil) (claim-current ?p)")
+
+(test an-action-that-writes-on-every-match-never-trips-the-rounds-guard
+  "#475: under a steady foreign stream an action that writes an audit
+claim nothing feeds back is not an action feeding its own read, so at
+any bound nothing is dropped, and a rule reading audit derives for
+every match."
+  (with-rules-graph (g)
+    (let ((rounds graph-db.rules:*rules-max-rounds*))
+      (setf graph-db.rules:*rules-max-rounds* 5)
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-rule "audited" :version "1"
+               :family rt-claim :head *audited-head* :body *audited-body*)
+             (with-production
+                 ("auditor" :version "1" :family rt-claim :body *q3-body*
+                            :writes '("audit")
+                            :action
+                            (lambda (event match)
+                              (when (eq event :added)
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (make-rt-claim-unary
+                                   :graph g :subject-namespace :host
+                                   :subject-key (binding match "?H")
+                                   :relation "audit" :producer "auditor"
+                                   :standing :inferred)))))
+               (graph-db.rules:enable-forward-rules g :drain :caller)
+               (let* ((done nil)
+                      (drainer
+                        (bt:make-thread
+                         (lambda ()
+                           (let ((graph-db:*graph* g))
+                             (loop
+                               (graph-db.rules:forward-step g)
+                               (when (and done
+                                          (zerop (getf (status g)
+                                                       :queue-depth)))
+                                 (return))
+                               (sleep 0.005))))
+                         :name "audit drainer"))
+                      (a (bt:make-thread
+                          (lambda () (commit-up-paced g "a" 40 0.01))
+                          :name "audit a"))
+                      (b (bt:make-thread
+                          (lambda () (commit-up-paced g "b" 40 0.01))
+                          :name "audit b")))
+                 (bt:join-thread a)
+                 (bt:join-thread b)
+                 (setf done t)
+                 (bt:join-thread drainer))
+               (let ((status (status g)))
+                 (is (null (find :rounds (getf status :failures)
+                                 :key #'car)))
+                 (is (= 80 (length (firings g "auditor"))))
+                 (is (= 80 (length (derived g 'rt-claim "audited"))))
+                 (is-true (run-rules-is-quiet g)))))
+        (graph-db.rules:undef-rule "audited")
+        (setf graph-db.rules:*rules-max-rounds* rounds)))))
 
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)

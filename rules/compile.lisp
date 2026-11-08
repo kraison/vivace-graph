@@ -810,7 +810,9 @@ expanded here against every head and write in scope (#469)."
                             collect name)))
         (values (sort (copy-list names) #'string<)
                 (sort (copy-list component) #'string<)
-                (cdr (first edges))))))))
+                ;; The subject's own reads, expanded -- not the first
+                ;; edge of the list, which is another rule's.
+                (%expand-family-markers reads triples)))))))
 
 (defun %production-relations (spec reads families negative relations
                               graph others)
