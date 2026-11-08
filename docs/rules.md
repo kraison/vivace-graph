@@ -500,9 +500,29 @@ components and a rule's component is its **stratum** (see "Recursive
 rules"). Two things are still refused, naming the rule: a `not` whose
 goal reads a relation of the rule's own stratum, and a body `claim/7`
 that leaves its relation unbound -- it would read *every* relation,
-its own included, so that refusal says to bind the relation. The graph
-is the rule's own store's, plus the image's `def-rule`s -- a `:scope`
-does not widen it (see "Cross-store scope").
+its own included, so that refusal says to bind the relation -- unless
+it is a family-wide read, below. The graph is the rule's own store's,
+plus the image's `def-rule`s -- a `:scope` does not widen it (see
+"Cross-store scope").
+
+**A family-wide read (#469).** `(claim ?p fam "ns" ?k ?r ?ons ?ok)`,
+the relation free under a *literal* family and a *literal* subject
+namespace, reads every relation of `fam` under `ns` -- the vocabulary
+route (GH #389), bounded by the namespace's keys -- and compiles.
+`compiled-rule-family-reads` lists such families. For stratification
+it is a read of every relation a rule in scope derives in that family
+and every relation a production declares it writes there (a write
+declared without its family counts for every family), so the rule runs
+after all of them. A rule whose head is in that family is refused as
+reading its own relation; a family-wide read of `firing` or
+`derivation` is refused. A production with such a read names each
+write's family, `:writes '(("rt-claim" "flag"))`: a write into the
+read family is "reads what it writes", a bare relation is refused
+asking for its family. With the family or the namespace unbound the
+goal is still refused as reading every relation. In forward mode a
+delta entry touches the rule when its claim is of that family, whatever
+its relation, and the forward path's `rule-delta/2` variant answers
+only that family's claims; the targeted path is unchanged.
 
 **A name belongs to one source.** A stored `rule` and a `def-rule` of
 the same name is a collision, refused whichever arrives second.
@@ -667,6 +687,7 @@ resolved.
 | `elapsed` | seconds |
 | `rounds` | the fixpoint rounds run, 1 outside a recursive stratum |
 | `stratum` | its stratum's rules, its own name alone for a rule with none |
+| `condition` | the condition caught behind a `:refused` outcome, else NIL (#468) |
 
 Every count is a total over the run: `disjoint-premises` included,
 across each variant and round of a recursive stratum.
@@ -681,7 +702,8 @@ else one of:
   (`prolog-permission-error`, recon note A16), or a head term is not a
   namespace or key this image knows;
 - `:budget` -- the rails: the inference budget, the timeout, or a goal
-  refused as `cost-unbounded`;
+  refused as `cost-unbounded` -- told apart by `condition`, a
+  `prolog-cost-unbounded-error` for the last;
 - `:solutions` -- the `*rules-max-solutions*` cap.
 
 The vocabulary is closed: a `constraint-violation` none of the three
@@ -1070,6 +1092,8 @@ follow-on transaction, not part of the committing one). Nothing calls
 (graph-db.rules:enable-forward-rules graph)    ; runs run-rules once
 (graph-db.rules:forward-rules-enabled-p graph) ; => T
 (graph-db.rules:disable-forward-rules graph)   ; drops the queue
+(graph-db.rules:enable-forward-rules graph     ; #467: the hook queues,
+  :drain :caller :on-queue #'wake-my-drainer)  ; the application drains
 ```
 
 `enable-forward-rules` registers the store and runs `run-rules` once,
@@ -1077,7 +1101,8 @@ so a store with premises committed before the opt-in starts at its
 fixpoint. The opt-in is per open graph object and lives in the image:
 reopen the store, opt in again. Disable and close do not wait for a
 step running on another user thread, even though status then says disabled.
-Stop the caller's committers before disabling or closing the graph.
+Stop the caller's committers -- and under `:drain :caller` its
+drainer -- before disabling or closing the graph.
 
 **The delta.** `claim-delta` renders a committed transaction's writes
 (every node of a registered claim family) as a table, relation →
@@ -1152,8 +1177,30 @@ opened a transaction never has a step run inside it. A body that
 unwinds after a nested commit leaves that delta queued until the next
 outermost commit in the image, or an explicit `forward-step`. A step
 that never quiesces -- an action that keeps writing what the
-production reads -- is stopped after `*rules-max-rounds*` drains with
-the queue dropped and a `:rounds` failure on the status.
+production reads -- is stopped after `*rules-max-rounds*` consecutive
+drains that took a delta an action committed: those deltas are
+dropped with a `:rounds` failure on the status, and the deltas other
+threads queued meanwhile are kept and run. A foreign commit never
+counts toward the bound, however steady the stream (#472).
+
+**`:drain :caller` (#467).** `(enable-forward-rules graph :drain
+:caller :on-queue fn)` keeps the committing thread out of it: the hook
+queues the delta and returns, so a commit runs no body and no action,
+holds no lock a body would wait on, and an action may take the
+application's own locks. The outermost commit's drain skips such a
+graph, nested commits included, and a threshold timer's delta only
+queues too. The application calls `forward-step` on a thread of its
+choosing; it drains in commit order under the same D5 contract, and
+returns at once when another thread's step is already running or the
+graph is disabled. `fn`, a function of the graph, is called outside
+every lock whenever a delta is queued -- by a commit, a timer, or a
+commit during the opt-in's hold -- so a drainer can wake on it without
+a signal of its own; a signal from `fn` is logged and recorded under
+`:on-queue`. `forward-rules-status` reports `:drain`. Before
+`disable-forward-rules` or `close-graph`, stop the committers and the
+drainer: neither waits for a `forward-step` in flight on another
+thread, and a `forward-step` that starts after the disable returns
+having done nothing. The default, `:commit`, is unchanged.
 
 **Failure (spec §4.4).** A rule that refuses in a step -- the rails,
 a constraint, a bad instant, a functor's own refusal -- is reported
@@ -1172,7 +1219,27 @@ and recorded the same way under the name `:step`.
 The last hundred failures are kept, newest first; `:last-step-elapsed`
 is the wall seconds of the last `forward-step` drain, NIL before one.
 `run-rules` after a failure reports the same refusal and repairs the
-rest.
+rest. The opt-in's own `run-rules` lands its refusals here too.
+
+**The failure signal (#468).** `(enable-forward-rules graph
+:on-failure fn)` calls `fn` with `(name tag text condition)` once for
+everything that lands on `:failures`: `name` the rule or production
+(or `:step`, `:rounds`, `:timer`, `:on-queue`), `tag` as a report
+carries it (`:rule`, `:budget`, `:solutions`, a family name) or the
+failure's own (`:action` for an action's error or an unregistered
+action, `:writes` for a write outside the declared ones, `:match` for a
+match that could not be rendered, `:scheduling`, `:timer`, `:step`,
+`:rounds`, `:on-queue`), `text` the rendering on the status, and
+`condition` the condition caught, or NIL where none was (`:rounds`, an
+unregistered action). A cost-unbounded goal and a budget overrun are
+both `:budget`; the condition tells them apart, a
+`prolog-cost-unbounded-error` for the first. `fn` runs outside the
+step's transactions, so it may record state or delete the stored
+production whose action failed; the step stays sound and the
+production fires no more. A signal from `fn` is logged and the step
+goes on. `rule-report-condition` carries the same condition on a
+`run-rule` or `run-rules` report, so a consumer that seeds one
+production with `run-rule` reads a refusal the same way.
 
 **Thresholds (D3).** A body may say `(now ?t)` and compare `?t` with
 an instant of a premise claim: one of `claim-valid-from/2`,
@@ -1224,13 +1291,19 @@ names each firing's premises, and `run-rules` repairs them.
   :action (lambda (event match) ...))
 ```
 
-The **instantiation key** is the premises' identity keys, sorted and
-joined with `|`, hashed to sixteen hex digits by a small FNV-1a-64
-written in the rules layer (`sxhash` is not stable across images and
-no hashing library is a dependency). A premise deleted and written
-again with the same identity is the same instantiation: the firing is
-re-opened, not duplicated. The body needs at least one `claim/7` goal
-and at most eight premises.
+The **instantiation key** is the premises' identity keys **in body
+order**, each with its own `|` escaped, joined with `|`, hashed to
+sixteen hex digits by a small FNV-1a-64 written in the rules layer
+(`sxhash` is not stable across images and no hashing library is a
+dependency). Body order is what makes a self-join's `(a,b)` and
+`(b,a)` two instantiations, as they are two rows of the query (#471).
+The firing claim is binary: subject key the hash, object namespace
+`instantiation`, object key the joined keys in the clear, so a match
+reads its key off the firing and keeps it after a premise is deleted.
+A premise deleted and written again with the same identity is the same
+instantiation: the firing is re-opened, not duplicated. The body needs
+at least one top-level `claim/7` goal and at most eight premises, and
+a body with neither is refused in those words (#466).
 
 A stored production is a `production` record (`make-production`,
 slots `name version family body salience writes action`), `action` a
@@ -1245,7 +1318,9 @@ redefined at the REPL is the one that runs (#464).
 each written relation to its reads, so a rule reading what a
 production writes runs in a later stratum, and a production that
 reads what it writes, or closes a cycle through its writes, is a
-`rule-compile-error`.
+`rule-compile-error`. A write is a relation string, or `("family"
+"relation")` when the body reads a family wide (#469); the run-time
+check then holds the action to that family too.
 
 **The agenda.** After a step's strata have run, the firings the step
 changed become agenda entries, `:added` for a derived or re-opened
@@ -1258,11 +1333,19 @@ then arrival, then key, and each is fired:
 ;;           :firing claim)
 ```
 
-`:premises` are the premise claims that still exist, `:key` their
-identity keys from the firing's provenance records (so a `:lost` match
-whose premise is gone still has it), `:bindings` the body's variables
-for an `:added` match and NIL when the body no longer matches. An
-action may `with-transaction`; its commit queues a delta the running
+`:premises` are the premise claims that still exist, in body order;
+`:key` their identity keys in body order joined with `|`, read from the
+firing claim (so a `:lost` match whose premise is gone still has it);
+`:bindings` every variable the body text names, in first-appearance
+order, each premise variable bound to its own premise -- `(("?P" .
+claim) ("?H" . "h1") ...)` -- for an `:added` match, and NIL when the
+body no longer matches or a premise is gone. Nothing synthesised
+appears, and a body may name `?c` or `?instantiation-key` (#466).
+`(match-row match)` renders a match as `run-guarded-prolog :format
+:data` renders that solution, `(values columns cells)`: columns the
+camelCase field names, a node its id string; both NIL without
+bindings. `(find-production graph name)` answers the stored
+`production` record or NIL. An action may `with-transaction`; its commit queues a delta the running
 step takes next. A write to a relation outside the production's
 `writes` is recorded on `forward-rules-status`'s failures and the
 write stands; so is an action that signals, and the agenda goes on.
@@ -1270,6 +1353,33 @@ Matches present at enable and repairs by `run-rules` get firing claims
 but no `:added` delivery; consumers read the firing claims for the initial
 set. A firing's history is readable through version history only: re-opening
 a kept derivation overwrites its transaction extent with an open-from-now one.
+
+**Standing queries (#470).** "A standing query is a production whose
+body is the query" (design §8) holds for the bodies
+`(standing-query-problems text graph)` admits: it answers NIL when a
+production over `text` delivers, commit by commit, exactly the rows a
+full re-evaluation of `text` would add and lose, else a list of
+reasons, each naming its goal. Admitted: top-level `claim/7` and
+`claim-absent/7` with a variable `?c` and a literal relation, or a
+family-wide read (#469); `not` over those; tests over bound values
+(`=`, `<`, `instant<`, `instant-offset`, ...); `claim-current`; a
+premise's slot read as a filter with a literal, `(claim-standing ?p
+"observed")`, or a slot no update changes (`claim-relation`,
+`claim-producer` of a premise, `claim-recorded-at`,
+`claim-rule-version`). Refused: every other store read (`is-a`,
+`related`, `claimed`, `find-*`, views, edges, `node-slot-value`, a
+`claim-producer` generator); a claim read nested under `or`, `once`,
+`if` or `forall`; a slot an update can change read into a variable
+(the row changes, the instantiation does not, so nothing is
+delivered); an effect or `repeat`; `now`; no premise; more than eight.
+The classification is `*standing-query-functor-classes*`
+(`rules/standing.lisp`), one entry per registered functor; the rules
+suite insists every functor has one, so a new functor chooses.
+`compile-rule` does *not* refuse the rest: `run-rules` runs every
+body correctly, forward mode's repair is `run-rules`, and a
+`claim-producer` generator is the fixpoint's own idiom (ruling P5).
+The check is the consumer's, at the moment it decides a body is a
+standing query.
 
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it

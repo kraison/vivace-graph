@@ -14,8 +14,40 @@ between releases; cutting a release renames it to the new version and dates it.
 This section carries a **MAJOR** change: the spatial contract and two
 storage formats (#60).
 
+### Added
+
+- **A rule or production body may read a family wide** (#469):
+  `(claim ?p fam "ns" ?k ?r ?ons ?ok)`, the relation free under a
+  literal family and namespace, compiles and is touched by a claim of
+  any relation of that family. Production `writes` may name a write's
+  family as `("family" "relation")`, and must beside such a read.
+- **`enable-forward-rules graph :on-failure fn`** (#468): `fn` of
+  `(name tag text condition)` is called once for everything that lands
+  on the status's failures, outside the step's transactions, the opt-in's
+  own `run-rules` refusals included; `rule-report-condition` carries the
+  caught condition on any report, which tells a cost-unbounded goal from
+  a budget overrun.
+- **`enable-forward-rules graph :drain :caller :on-queue fn`** (#467):
+  the commit hook only queues and the application calls `forward-step`
+  on a thread of its own, told by `fn` outside every lock whenever a
+  delta is queued; `forward-rules-status` reports `:drain`. The default
+  `:commit` is unchanged.
+- **`standing-query-problems`** (#470) says whether a production over a
+  body delivers exactly its query's rows, commit by commit, or why not,
+  goal by goal; `*standing-query-functor-classes*` classifies every
+  registered functor, and the rules suite requires an entry for each.
+  The design's standing-query equivalence test now compares rows, not
+  instantiation keys, over a join, a `not`, a comparison, a standing
+  filter and a family-wide read, through retractions, deletions and a
+  slot update.
+
 ### Fixed
 
+- **A forward step's rounds guard counts only the deltas an action fed**
+  (#472). A steady stream of commits from other threads used to trip it
+  and drop the whole queue, losing those commits' derivations and
+  firings until a `run-rules`; now only an action feeding its own read
+  is stopped, only its deltas are dropped, and foreign deltas run.
 - Refuse malformed ISO duration numbers without invoking the Lisp reader,
   queue commits during forward opt-in, and clarify shutdown, firing history
   and costs; cap compile failures, late-bind production actions, reset
@@ -23,6 +55,19 @@ storage formats (#60).
 
 ### Changed
 
+- **A production's instantiation key keeps body position, and its
+  firing claim carries the key in the clear** (#471, #466). The key was
+  the premises' identity keys sorted, so a self-join's `(a,b)` and
+  `(b,a)` were one instantiation and a standing query missed a row. The
+  firing claim is now binary, object namespace `instantiation`, object
+  key the joined keys. **Firing claims written before this change have
+  other keys**: the first `run-rules` or forward step that touches the
+  production retracts them and derives the instantiations afresh, and
+  no action is called for either, as for any repair. A match's
+  `:bindings` now carries every body variable in first-appearance order
+  with each premise bound to its own variable, a body may name any
+  variable, the premise-count refusals say what they measure, and
+  `match-row` and `find-production` are exported.
 - **A forward rules step reads what it touches, not the touched rule's
   whole derivation** (#457). The forward and targeted paths resolve
   each identity they derive through the subject-relation index and

@@ -57,11 +57,18 @@ writes belong to, unused for now."
     delta))
 
 (defun delta-touches-p (compiled delta)
-  "DELTA names a relation COMPILED reads, positively or under a NOT."
+  "DELTA names a relation COMPILED reads, positively or under a NOT,
+or holds a claim of a family it reads wide (#469)."
   (let ((reads (compiled-rule-reads compiled))
+        (families (compiled-rule-family-reads compiled))
         (negative (compiled-rule-negative-reads compiled)))
-    (loop for rel being the hash-keys of delta
+    (loop for rel being the hash-keys of delta using (hash-value entries)
           thereis (or (eq reads :any)
                       (member rel reads :test #'string=)
                       (eq negative :any)
-                      (member rel negative :test #'string=)))))
+                      (member rel negative :test #'string=)
+                      (and families
+                           (some (lambda (e)
+                                   (member (%claim-family-name (car e))
+                                           families :test #'string-equal))
+                                 entries))))))

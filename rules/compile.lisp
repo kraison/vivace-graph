@@ -19,12 +19,12 @@ in.  FAMILY is the parent class's name, lowercase; SOURCE is :STORED or
 (defstruct (production-spec (:include rule-spec)
                             (:constructor %make-production-spec))
   "A production as text (forward-rules design §7): a RULE-SPEC whose
-HEAD and BODY are synthesised -- the head a FIRING claim keyed by the
-instantiation, the body the author's plus INSTANTIATION-KEY over its
-premises (%PRODUCTION-RULE-SPEC) -- with SALIENCE, the relations the
-action WRITES, ACTION the name its function is registered under
-(*PRODUCTION-ACTIONS*), SOURCE-FAMILY the family the author named and
-TEXT the body as written.  SOURCE is :STORED or :DEF-PRODUCTION."
+HEAD is empty and whose BODY is the author's TEXT -- the FIRING head and
+the INSTANTIATION-KEY goal are built from fresh symbols at compile
+(%GUARD-PRODUCTION, #466) -- with SALIENCE, the relations the action
+WRITES, ACTION the name its function is registered under
+(*PRODUCTION-ACTIONS*) and SOURCE-FAMILY the family the author named.
+SOURCE is :STORED or :DEF-PRODUCTION."
   (salience 0) (writes '()) action source-family text)
 
 (defvar *def-productions* (make-hash-table :test 'equal)
@@ -107,8 +107,9 @@ store's other rules.  Returns NAME."
 is a rule body over FAMILY's claims (the parent class symbol,
 unevaluated); when it matches, a FIRING claim keyed by the premises'
 identities is derived and ACTION, a function of (EVENT MATCH) with
-EVENT :ADDED or :LOSS and MATCH a plist (:KEY :PREMISES :BINDINGS
-:FIRING), runs from the agenda in SALIENCE order (higher first).
+EVENT :ADDED or :LOST and MATCH a plist (:KEY :PREMISES :BINDINGS
+:FIRING; MATCH-ROW renders it), runs from the agenda in SALIENCE order
+(higher first).
 WRITES lists the relations the action may write; one it reads too is
 a cycle, refused.  Returns NAME."
   `(%register-def-production ,name :version ,version :family ',family
@@ -178,14 +179,18 @@ CONSTRAINT-VIOLATION, because a RULE write is refused at commit with it
   "A rule ready to run: the guarded goals and what the head derives.
 HEAD-* are the head's argument terms -- a keyword (namespace), a string
 (key or relation), NIL, or a body variable.  VARS is SELECT's variable
-list, PREMISE-VARS the ?c of every body CLAIM/7 goal, READS the
+list, BODY-VARS the variables the body text names in first-appearance
+order, none synthesised (a match's :BINDINGS, #466), PREMISE-VARS the
+?c of every body CLAIM/7 goal, READS the
 relations the body reads -- never :ANY, which COMPILE-RULE refuses
-before this struct is built -- and NEGATIVE-READS the subset of them
-read under a NOT, which orders this rule's stratum after the one
-deriving them (%STRATUM-READS, run.lisp, GH #333).  STRATUM is the
-sorted names of the rules whose head relations are mutually reachable
-with this one's (its own name always), STRATUM-RELATIONS the sorted
-relations they derive; a rule is recursive when a body CLAIM/7 goal has
+before this struct is built -- FAMILY-READS the families it reads
+wide, every relation of a literal family under a literal namespace
+(#469), and NEGATIVE-READS the subset of READS read under a NOT,
+which orders this rule's stratum after the one deriving them
+(%STRATUM-READS, run.lisp, GH #333).  STRATUM is the sorted names of
+the rules whose head relations are mutually reachable with this one's
+(its own name always), STRATUM-RELATIONS the sorted relations they
+derive; a rule is recursive when a body CLAIM/7 goal has
 an unbound ?c and a relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P,
 run.lisp, GH #333).  THRESHOLDS is one entry per comparison of NOW/1's
 instant: (GOAL DIRECTION CLAIM-VAR SOURCE OFFSET BOUND-VAR), DIRECTION
@@ -194,8 +199,8 @@ ISO duration or NIL, BOUND-VAR the variable the comparison reads
 (forward-rules design §5.2; %THRESHOLDS)."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
-  vars premise-vars goals reads negative-reads stratum stratum-relations
-  (thresholds '()))
+  vars body-vars premise-vars goals reads (family-reads '())
+  negative-reads stratum stratum-relations (thresholds '()))
 
 ;;; Reading the text
 
@@ -222,17 +227,52 @@ guard rebuilds a head into: NAME interned where S1 homed CLAIM/7
        (string= (symbol-name (first goal)) name)
        (= arity (1- (length goal)))))
 
-(defun %guard (spec graph)
-  "HEAD then BODY through the guard as one text, so a variable shared
-between them reads as one symbol: (VALUES VARS GOALS).  Rule text may
-say NOW (*GUARDING-RULE-TEXT*)."
+(defun %guard-text (spec text graph)
   (handler-case
       (let ((graph-db.query:*guarding-rule-text* t))
-        (graph-db.query:guard-query-text
-         (format nil "~A~%~A" (rule-spec-head spec) (rule-spec-body spec))
-         graph))
+        (graph-db.query:guard-query-text text graph))
     (graph-db.query:prolog-guard-error (c)
       (%refuse spec "~A" (graph-db.query:prolog-guard-error-reason c)))))
+
+(defun %guard (spec graph)
+  "HEAD then BODY through the guard as one text, so a variable shared
+between them reads as one symbol: (VALUES VARS GOALS SYNTHESISED).
+Rule text may say NOW (*GUARDING-RULE-TEXT*).  A production's head and
+key goal are not text: %GUARD-PRODUCTION builds them from fresh
+symbols, listed as SYNTHESISED, so its body may name any variable
+(#466)."
+  (if (production-spec-p spec)
+      (%guard-production spec graph)
+      (multiple-value-bind (vars goals)
+          (%guard-text spec (format nil "~A~%~A" (rule-spec-head spec)
+                                    (rule-spec-body spec))
+                       graph)
+        (values vars goals '()))))
+
+(defun %guard-production (spec graph)
+  "SPEC's body text guarded, then the FIRING head -- subject key the
+instantiation key, object the key in the clear (#471) -- and the
+INSTANTIATION-KEY goal over the premises, built on fresh symbols
+(forward-rules design §7).  A body with no top-level claim/7 goal or
+with more than eight premises is refused here, in those words."
+  (multiple-value-bind (vars goals)
+      (%guard-text spec (production-spec-text spec) graph)
+    (let ((premises (%premise-vars goals)))
+      (when (null premises)
+        (%refuse spec "a production body needs a claim/7 goal"))
+      (when (> (length premises) 8)
+        (%refuse spec "a production body has ~D premises; at most eight"
+                 (length premises)))
+      (let ((?c (make-symbol "?%C"))
+            (?key (make-symbol "?%KEY"))
+            (?clear (make-symbol "?%CLEAR")))
+        (values vars
+                (cons (list 'graph-db::claim ?c 'firing "production" ?key
+                            (rule-spec-name spec) "instantiation" ?clear)
+                      (append goals
+                              (list (list* 'graph-db::instantiation-key
+                                           ?key ?clear premises))))
+                (list ?c ?key ?clear))))))
 
 (defun %head-goal-count (spec graph)
   "How many goals the HEAD text alone is -- the guard refuses an empty
@@ -360,18 +400,54 @@ share argument positions (D2)."
   (append (remove-if-not #'%generator-goal-p goals)
           (remove-if #'%generator-goal-p goals)))
 
+(defun %family-wide-goal-p (goal)
+  "GOAL reads a family wide (#469): a CLAIM/7 or CLAIM-ABSENT/7 goal
+whose relation is a variable under a literal family and a literal
+subject namespace -- the vocabulary route, bounded by the namespace's
+keys (GH #389)."
+  (and (%claim-read-goal-p goal)
+       (%variable-p (sixth goal))
+       (symbolp (third goal)) (third goal) (not (%variable-p (third goal)))
+       (stringp (fourth goal))))
+
+(defun %goal-family (goal)
+  "GOAL's literal family as the lowercase string a RULE-SPEC's FAMILY
+holds."
+  (%family-string (third goal)))
+
 (defun %body-reads (goals)
-  "The relations the body's CLAIM/7 and CLAIM-ABSENT/7 goals read, or
-:ANY when one of them leaves the relation unbound (ruling P6)."
-  (let ((reads '()))
-    (dolist (goal goals (nreverse reads))
+  "(VALUES RELATIONS FAMILIES): the relations the body's CLAIM/7 and
+CLAIM-ABSENT/7 goals read, and the families its family-wide goals read
+(#469); :ANY when a goal leaves the relation unbound any other way
+(ruling P6)."
+  (let ((reads '())
+        (families '()))
+    (dolist (goal goals (values (nreverse reads) (nreverse families)))
       (when (%claim-read-goal-p goal)
         ;; The relation is CLAIM/7's fifth ARGUMENT, i.e. (sixth goal):
         ;; (claim ?c family sns skey rel ons okey).
         (let ((rel (sixth goal)))
-          (if (stringp rel)
-              (pushnew rel reads :test #'string=)
-              (return-from %body-reads :any)))))))
+          (cond ((stringp rel) (pushnew rel reads :test #'string=))
+                ((%family-wide-goal-p goal)
+                 (pushnew (%goal-family goal) families :test #'string=))
+                (t (return-from %body-reads :any))))))))
+
+(defun %write-relation (write)
+  "A production write's relation: WRITE is a relation string or
+(\"family\" \"relation\") (#469)."
+  (if (consp write) (second write) write))
+
+(defun %write-family (write)
+  "A production write's declared family, or NIL for a bare relation."
+  (and (consp write) (first write)))
+
+(defun %family-reads-marker-p (x)
+  (and (consp x) (eq (car x) :family)))
+
+(defun %with-family-markers (reads families)
+  "READS plus one (:FAMILY . name) marker per family read wide, the
+form %STRATA expands once every head in scope is known."
+  (append reads (mapcar (lambda (f) (cons :family f)) families)))
 
 (defun %mentions-claim-after-p (goals)
   "A CLAIM-AFTER/9 goal anywhere in GOALS, at any nesting: the reads
@@ -405,11 +481,13 @@ unbound there (GH #333)."
     (nreverse reads)))
 
 (defun %premise-vars (goals)
+  "The ?c of every top-level CLAIM/7 and CLAIM-ABSENT/7 goal, once
+each, in first-appearance order."
   (loop for goal in goals
         when (and (%claim-read-goal-p goal)
                   (%variable-p (second goal)))
           collect (second goal) into vars
-        finally (return (remove-duplicates vars))))
+        finally (return (remove-duplicates vars :from-end t))))
 
 ;;; Thresholds (forward-rules design §5.2)
 
@@ -557,13 +635,19 @@ answers NIL rather than erring in MAP-VERTICES (T4-R2)."
                          :action (production-action record)
                          :source :stored))
 
-(defun %stored-production (graph name)
-  "GRAPH's stored production NAME as a spec, or NIL."
+(defun find-production (graph name)
+  "GRAPH's stored PRODUCTION record named NAME, or NIL -- a deleted
+record is NIL (#466).  A DEF-PRODUCTION lives in the image:
+FIND-DEF-PRODUCTION."
   (let ((stored (and graph (%graph-declares-p graph 'production)
                      (first (graph-db:index-lookup
                              graph 'production '(name) name)))))
-    (and stored (not (graph-db:deleted-p stored))
-         (%production-spec-of-record stored))))
+    (and stored (not (graph-db:deleted-p stored)) stored)))
+
+(defun %stored-production (graph name)
+  "GRAPH's stored production NAME as a spec, or NIL."
+  (let ((stored (find-production graph name)))
+    (and stored (%production-spec-of-record stored))))
 
 (defun %stored-productions (graph &key view)
   "Every PRODUCTION record in GRAPH as specs, as %STORED-RULES reads
@@ -589,96 +673,93 @@ rules."
     (mapcar #'%production-spec-of-record
             (remove-if #'graph-db:deleted-p nodes))))
 
-(defun %production-rule-spec (graph spec)
-  "SPEC, a PRODUCTION-SPEC, with its HEAD and BODY synthesised for the
-rule pipeline (forward-rules design §7): the head a unary FIRING claim
-under namespace production, keyed by ?instantiation-key, relation the
-production's name; the body the author's text plus an
-INSTANTIATION-KEY goal over its premise variables.  Text the guard
-refuses is passed through for COMPILE-RULE to refuse with the guard's
-reason."
-  (let* ((premises
-           (handler-case
-               (multiple-value-bind (vars goals)
-                   (let ((graph-db.query:*guarding-rule-text* t))
-                     (graph-db.query:guard-query-text
-                      (production-spec-text spec) graph))
-                 (declare (ignore vars))
-                 (%premise-vars goals))
-             (graph-db.query:prolog-guard-error () :unguardable)))
-         (copy (copy-production-spec spec)))
-    (setf (rule-spec-head copy)
-          (format nil "(claim ?c firing \"production\" ~
-?instantiation-key ~S nil nil)" (rule-spec-name spec))
-          (rule-spec-body copy)
-          (if (or (eq premises :unguardable) (null premises)
-                  (> (length premises) 8))
-              (production-spec-text spec)
-              (format nil "~A (instantiation-key ?instantiation-key~
-~{ ~(~A~)~})"
-                      (production-spec-text spec)
-                      (mapcar #'symbol-name premises))))
-    copy))
-
 (defun rules-in-scope (graph &key view)
   "The specs a compile checks a rule against (spec §6): every enabled
 stored rule of GRAPH -- through VIEW when a commit is in flight -- plus
 every enabled DEF-RULE (ruling T3-R5: ENABLED reads the same on both),
-plus every production, stored or DEF-PRODUCTION, synthesised as a rule
-over FIRING (%PRODUCTION-RULE-SPEC).  A def-rule the store cannot run
+plus every production, stored or DEF-PRODUCTION, a rule over FIRING
+once compiled (%GUARD-PRODUCTION).  A def-rule the store cannot run
 still constrains the cycle graph; RUN-RULES is what filters by family
 (ruling P8)."
   (append (remove-if-not #'rule-spec-enabled
                          (%stored-rules graph :view view))
           (loop for spec being the hash-values of *def-rules*
                 when (rule-spec-enabled spec) collect spec)
-          (mapcar (lambda (p) (%production-rule-spec graph p))
-                  (append (%stored-productions graph :view view)
-                          (alexandria:hash-table-values
-                           *def-productions*)))))
+          (%stored-productions graph :view view)
+          (alexandria:hash-table-values *def-productions*)))
 
 (defun %edges (spec graph)
-  "SPEC's edges for the dependency graph, a list of (relation . reads)
--- the head's, plus one per write for a production -- or NIL when the
-spec's text does not guard: such a rule cannot run and constrains
-nothing.  READS is what the body reads positively AND under a NOT: a
-negated read is a dependency like any other, so a cycle another rule
-closes only through negation reaches the SCC search here exactly as
-this rule's own does (COMPILE-RULE, GH #333).  :ANY on either side
-makes the whole edge :ANY, which %STRATA reads as an isolated node.
-Only the FIRST goal is read as the head: a DEF-RULE is never validated
-at registration, so a two-goal head there contributes its second goal
-as a read, which over-constrains rather than under-."
+  "SPEC's edges for the dependency graph, a list of (relation family
+reads) -- the head's, plus one per write for a production, FAMILY the
+head's family or the write's declared one (NIL for a bare write) -- or
+NIL when the spec's text does not guard: such a rule cannot run and
+constrains nothing.  READS is what the body reads positively AND under
+a NOT: a negated read is a dependency like any other, so a cycle
+another rule closes only through negation reaches the SCC search here
+exactly as this rule's own does (COMPILE-RULE, GH #333); a family read
+wide is a (:FAMILY . name) marker %STRATA expands (#469).  :ANY on
+either side makes the whole edge :ANY, which %STRATA reads as an
+isolated node.  Only the FIRST goal is read as the head: a DEF-RULE is
+never validated at registration, so a two-goal head there contributes
+its second goal as a read, which over-constrains rather than under-."
   (handler-case
       (multiple-value-bind (vars goals) (%guard spec graph)
         (declare (ignore vars))
         (let ((head (first goals)))
           (when (%engine-goal-p head "CLAIM" 7)
-            (let* ((reads (%body-reads (rest goals)))
-                   (negative (%negative-reads (rest goals)))
-                   (all (if (or (eq reads :any) (eq negative :any))
-                            :any
-                            (union reads negative :test #'string=))))
-              ;; A production's writes are relations its inputs feed
-              ;; (forward-rules design §7): one edge per write too.
-              (cons (cons (sixth head) all)
-                    (when (production-spec-p spec)
-                      (mapcar (lambda (w) (cons w all))
-                              (production-spec-writes spec))))))))
+            (multiple-value-bind (reads families) (%body-reads (rest goals))
+              (let* ((negative (%negative-reads (rest goals)))
+                     (all (if (or (eq reads :any) (eq negative :any))
+                              :any
+                              (%with-family-markers
+                               (union reads negative :test #'string=)
+                               families))))
+                ;; A production's writes are relations its inputs feed
+                ;; (forward-rules design §7): one edge per write too.
+                (cons (list (sixth head) (rule-spec-family spec) all)
+                      (when (production-spec-p spec)
+                        (mapcar (lambda (w)
+                                  (list (%write-relation w)
+                                        (%write-family w) all))
+                                (production-spec-writes spec)))))))))
     (rule-compile-error () nil)))
 
-(defun %strata (relation reads graph others)
-  "The stratum RELATION belongs to over READS and OTHERS' edges (spec
-§2): (values RULE-NAMES RELATIONS), both sorted.  The strongly
-connected component of the relation graph, by a DFS from RELATION
-forward and one over the reversed edges; the stratum's rules are every
-rule in OTHERS deriving a component relation, plus this one."
-  (let ((edges (list (cons relation reads)))
+(defun %expand-family-markers (reads triples)
+  "READS with each (:FAMILY . f) marker replaced by the relations
+TRIPLES derive or write in family F -- a bare production write, family
+unknown, counts for every family -- so a family-wide read is ordered
+after everything that may feed it (#469)."
+  (if (or (eq reads :any) (notany #'%family-reads-marker-p reads))
+      reads
+      (remove-duplicates
+       (loop for r in reads
+             if (%family-reads-marker-p r)
+               append (loop for (rel fam) in triples
+                            when (or (null fam) (string-equal fam (cdr r)))
+                              collect rel)
+             else collect r)
+       :test #'string=)))
+
+(defun %strata (relation family reads graph others)
+  "The stratum RELATION, derived in FAMILY, belongs to over READS and
+OTHERS' edges (spec §2): (values RULE-NAMES RELATIONS EXPANDED-READS),
+the first two sorted, the third READS with its markers expanded.
+The strongly connected component of the relation graph, by a DFS from
+RELATION forward and one over the reversed edges; the stratum's rules
+are every rule in OTHERS deriving a component relation, plus this
+one.  READS may carry (:FAMILY . f) markers (%WITH-FAMILY-MARKERS),
+expanded here against every head and write in scope (#469)."
+  (let ((triples (list (list relation family reads)))
         (derivers (list (cons relation nil))))
     (dolist (o others)
       (dolist (e (%edges o graph))
-        (push e edges)
-        (push (cons (car e) (rule-spec-name o)) derivers)))
+        (push e triples)
+        (push (cons (first e) (rule-spec-name o)) derivers)))
+    (let ((edges (mapcar (lambda (tr)
+                           (cons (first tr)
+                                 (%expand-family-markers (third tr)
+                                                         triples)))
+                         triples)))
     (labels (;; An :ANY edge contributes none here: an unvalidated
              ;; other rule is an isolated node for stratification and
              ;; is refused on its own compile, not here (GH #333).
@@ -705,63 +786,64 @@ rule in OTHERS deriving a component relation, plus this one."
                                     (member rel component :test #'string=))
                             collect name)))
         (values (sort (copy-list names) #'string<)
-                (sort (copy-list component) #'string<))))))
+                (sort (copy-list component) #'string<)
+                (cdr (first edges))))))))
 
-(defun %production-relations (spec reads negative relations graph others)
+(defun %production-relations (spec reads families negative relations
+                              graph others)
   "A production's stratum relations: its firing relation's component
-plus its writes, after the §7 checks -- a body with no premise, a
-write it reads, or a cycle from a write back to a read, is refused."
-  (when (null (%premise-vars-of-text spec graph))
-    (%refuse spec "a production body needs a claim/7 goal"))
-  (let ((all-reads (union reads negative :test #'string=)))
-    (let ((bad (intersection (production-spec-writes spec) all-reads
+plus its writes, after the §7 checks -- a write it reads, a write into
+a family it reads wide or one that leaves its family unnamed beside
+such a read (#469), or a cycle from a write back to a read, is refused
+(a body with no premise was, by %GUARD-PRODUCTION)."
+  (let* ((writes (production-spec-writes spec))
+         (all-reads (union reads negative :test #'string=))
+         (marked (%with-family-markers all-reads families)))
+    (let ((bad (intersection (mapcar #'%write-relation writes) all-reads
                              :test #'string=)))
       (when bad
         (%refuse spec "the production reads what it writes: ~{~A~^, ~}"
                  bad)))
-    (dolist (w (production-spec-writes spec))
-      (multiple-value-bind (names component)
-          (%strata w all-reads graph others)
+    (dolist (w writes)
+      (let ((fam (%write-family w)))
+        (cond ((and fam (member fam families :test #'string-equal))
+               (%refuse spec "the production reads what it writes: every ~
+relation of ~A, its write ~A included" fam (%write-relation w)))
+              ((and (null fam) families)
+               (%refuse spec "the body reads ~{~A~^, ~} wide, so name the ~
+family of the write ~S as (\"family\" ~S)"
+                        families w w)))))
+    (dolist (w writes)
+      (multiple-value-bind (names component expanded)
+          (%strata (%write-relation w) (%write-family w) marked graph
+                   others)
         (declare (ignore names))
-        (let ((cycle (intersection component all-reads :test #'string=)))
+        ;; EXPANDED: the reads with a family-wide read spelled out, so
+        ;; a cycle through a rule deriving into that family is seen.
+        (let ((cycle (intersection component expanded :test #'string=)))
           (when cycle
             (%refuse spec "a cycle runs from the production's write ~A ~
-back to its read ~{~A~^, ~}" w cycle)))))
-    (sort (remove-duplicates (append (production-spec-writes spec)
+back to its read ~{~A~^, ~}" (%write-relation w) cycle)))))
+    (sort (remove-duplicates (append (mapcar #'%write-relation writes)
                                      relations)
                              :test #'string=)
           #'string<)))
 
-(defun %premise-vars-of-text (spec graph)
-  "The premise variables of SPEC's authored body, NIL when it guards to
-none."
-  (handler-case
-      (multiple-value-bind (vars goals)
-          (let ((graph-db.query:*guarding-rule-text* t))
-            (graph-db.query:guard-query-text (production-spec-text spec)
-                                             graph))
-        (declare (ignore vars))
-        (%premise-vars goals))
-    (graph-db.query:prolog-guard-error () nil)))
-
 (defun compile-production (graph production &key (others nil others-p))
   "PRODUCTION (a PRODUCTION record, a PRODUCTION-SPEC or a name)
 compiled through COMPILE-RULE as the rule over FIRING it is
-(%PRODUCTION-RULE-SPEC).  => COMPILED-RULE whose spec is a
+(%GUARD-PRODUCTION).  => COMPILED-RULE whose spec is a
 PRODUCTION-SPEC; signals RULE-COMPILE-ERROR."
-  (let* ((spec (etypecase production
-                 (production-spec production)
-                 (production (%production-spec-of-record production))
-                 (string (or (%stored-production graph production)
-                             (find-def-production production)
-                             (error "No production named ~S in ~(~S~) ~
-or the image." production (graph-db:graph-name graph))))))
-         (rule (if (production-spec-text spec)
-                   (%production-rule-spec graph spec)
-                   spec)))
+  (let ((spec (etypecase production
+                (production-spec production)
+                (production (%production-spec-of-record production))
+                (string (or (%stored-production graph production)
+                            (find-def-production production)
+                            (error "No production named ~S in ~(~S~) ~
+or the image." production (graph-db:graph-name graph)))))))
     (if others-p
-        (compile-rule graph rule :others others)
-        (compile-rule graph rule))))
+        (compile-rule graph spec :others others)
+        (compile-rule graph spec))))
 
 (defun compiled-production-p (compiled)
   "COMPILED is a production's COMPILED-RULE."
@@ -789,10 +871,10 @@ by both a stored rule and a DEF-RULE is a collision, refused."
                (find name (%stored-rules graph)
                      :key #'rule-spec-name :test #'string=))
       (%refuse spec "a stored rule of the same name exists in the store"))
-    (unless (= 1 (%head-goal-count spec graph))
+    (unless (or (production-spec-p spec)
+                (= 1 (%head-goal-count spec graph)))
       (%refuse spec "the head must be exactly one claim/7 pattern"))
-    (multiple-value-bind (vars goals) (%guard spec graph)
-      (declare (ignore vars))
+    (multiple-value-bind (vars goals synthesised) (%guard spec graph)
       (when (%mentions-claim-after-p goals)
         (%refuse spec "claim-after/9 is not a rule premise: write ~
 claim/7 and the comparison, the compiler fuses them (#451)"))
@@ -805,51 +887,73 @@ claim/7 and the comparison, the compiler fuses them (#451)"))
         (let* ((premise-vars (%premise-vars body))
                (thresholds (%thresholds spec body premise-vars))
                (parsed (%parse-head spec head body-vars premise-vars))
-               (reads (%body-reads body))
+               ;; The guard's order is first appearance; the head's
+               ;; own variables and the synthesised ones drop out.
+               (ordered-body-vars
+                 (remove-if-not (lambda (v)
+                                  (and (member v body-vars)
+                                       (not (member v synthesised))))
+                                vars))
                (head-vars (remove-if-not #'%variable-p
                                          (list (getf parsed :head-sns)
                                                (getf parsed :head-skey)
                                                (getf parsed :head-ons)
                                                (getf parsed :head-okey)))))
-          (when (eq reads :any)
-            (%refuse spec "a body claim/7 goal leaves its relation ~
+          (multiple-value-bind (reads families) (%body-reads body)
+            (when (eq reads :any)
+              (%refuse spec "a body claim/7 goal leaves its relation ~
 unbound, so the rule reads every relation, its own ~S included: bind ~
 the relation" (getf parsed :relation)))
-          (let ((negative (%negative-reads body)))
-            (when (eq negative :any)
-              (%refuse spec "a negated claim/7 goal leaves its relation ~
-unbound: bind the relation"))
-            (multiple-value-bind (stratum relations)
-                ;; A NOT's target joins the SCC search, here for this
-                ;; rule and in %EDGES for every other, so a cycle
-                ;; closed only through negation is detected wherever
-                ;; it runs (GH #333: that is what makes it
-                ;; unstratifiable, and the refusal below names it).
-                (%strata (getf parsed :relation)
-                         (union reads negative :test #'string=)
-                         graph others)
-              (let ((bad (intersection negative relations
-                                       :test #'string=)))
-                (when bad
-                  (%refuse spec "negation over the rule's own stratum ~
+            ;; A family read wide (#469): not the head's own family --
+            ;; that is reading its own relation -- and not the rules
+            ;; layer's own families.
+            (when (member (rule-spec-family spec) families
+                          :test #'string-equal)
+              (%refuse spec "the body reads every relation of ~A, the ~
+head's own family, its own ~S included: bind the relation"
+                       (rule-spec-family spec) (getf parsed :relation)))
+            (dolist (f '("firing" "derivation"))
+              (when (member f families :test #'string-equal)
+                (%refuse spec "a family-wide read of ~A is refused: ~
+bind the relation" f)))
+            (let ((negative (%negative-reads body)))
+              (when (eq negative :any)
+                (%refuse spec "a negated claim/7 goal leaves its ~
+relation unbound: bind the relation"))
+              (multiple-value-bind (stratum relations)
+                  ;; A NOT's target joins the SCC search, here for this
+                  ;; rule and in %EDGES for every other, so a cycle
+                  ;; closed only through negation is detected wherever
+                  ;; it runs (GH #333: that is what makes it
+                  ;; unstratifiable, and the refusal below names it).
+                  (%strata (getf parsed :relation) (rule-spec-family spec)
+                           (%with-family-markers
+                            (union reads negative :test #'string=)
+                            families)
+                           graph others)
+                (let ((bad (intersection negative relations
+                                         :test #'string=)))
+                  (when bad
+                    (%refuse spec "negation over the rule's own stratum ~
 ~{~A~^, ~}: a NOT may read only an earlier stratum" bad)))
-              (when (production-spec-p spec)
-                (setf relations (%production-relations spec reads negative
-                                                       relations graph
-                                                       others)))
-              (apply #'%make-compiled-rule
-                     :spec spec
-                     :vars (remove-duplicates
-                            (append head-vars premise-vars
-                                    (mapcar #'sixth thresholds)))
-                     :premise-vars premise-vars
-                     :thresholds thresholds
-                     :goals body :reads reads
-                     :negative-reads negative
-                     :stratum (sort (cons name (copy-list stratum))
-                                    #'string<)
-                     :stratum-relations relations
-                     parsed))))))))
+                (when (production-spec-p spec)
+                  (setf relations (%production-relations
+                                   spec reads families negative relations
+                                   graph others)))
+                (apply #'%make-compiled-rule
+                       :spec spec
+                       :vars (remove-duplicates
+                              (append head-vars premise-vars
+                                      (mapcar #'sixth thresholds)))
+                       :body-vars ordered-body-vars
+                       :premise-vars premise-vars
+                       :thresholds thresholds
+                       :goals body :reads reads :family-reads families
+                       :negative-reads negative
+                       :stratum (sort (cons name (copy-list stratum))
+                                      #'string<)
+                       :stratum-relations relations
+                       parsed)))))))))
 
 ;;; The write validator (ruling P3)
 

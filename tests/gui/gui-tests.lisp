@@ -1483,7 +1483,16 @@ preempt it.  REGEX-MATCH/2 is the worked example: (a+)+$ against a run ~
 of a's ran ~~2^n and blew a 30 s deadline from a payload of a few ~
 dozen characters.  A watchdog is NOT the alternative -- interrupting a ~
 worker mid-call can unwind holding the GUI rw lock or with an mmap ~
-operation in flight.~%~%~A"
+operation in flight.~%~%~
+QUESTION 3 -- what may a STANDING QUERY make of it?  A production body ~
+delivers exactly its query's rows only through goals the commit delta ~
+can see (docs/rules.md, \"Standing queries\"; #470).  Add an entry for ~
+it to GRAPH-DB.RULES:*STANDING-QUERY-FUNCTOR-CLASSES* in ~
+rules/standing.lisp -- :TEST for a check over bound values, ~
+:STORE-READ for anything that reads the store outside the claim ~
+families, the other classes as that table documents.  The rules suite ~
+(EVERY-REGISTERED-FUNCTOR-HAS-A-STANDING-QUERY-CLASS) fails until it ~
+has one.~%~%~A"
           (length added) added (%inventory-guidance)))
 
 (defun %removed-functor-message (removed)

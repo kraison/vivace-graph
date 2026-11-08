@@ -104,7 +104,8 @@ recorded on the status, never signalled into the step."
             (error (e)
               (%note-failure state
                              (rule-spec-name (compiled-rule-spec c))
-                             (format nil "scheduling: ~A" e)))))))))
+                             (format nil "scheduling: ~A" e)
+                             :tag :scheduling :condition e))))))))
 
 (setf *threshold-scheduler* '%schedule-thresholds)
 
@@ -188,7 +189,8 @@ Returns nothing."
   (values))
 
 (defun %fire-threshold (state timer)
-  "TIMER's match re-enters the step as a delta (spec §5.2)."
+  "TIMER's match re-enters the step as a delta (spec §5.2): queued,
+ON-QUEUE told, and run here unless the caller drains (#467)."
   (let ((delta (make-hash-table :test 'equal))
         (graph (forward-state-graph state)))
     (dolist (c (threshold-timer-claims timer))
@@ -196,8 +198,9 @@ Returns nothing."
         (push (cons c 1) (gethash rel delta))
         (when (eq (threshold-timer-direction timer) :loss)
           (push (cons c -1) (gethash rel delta)))))
-    (%enqueue-delta state delta)
-    (forward-step graph)))
+    (%queue-delta state delta)
+    (unless (%caller-drains-p state)
+      (forward-step graph))))
 
 (defun %timer-loop (state)
   "The timer thread: sleep until the earliest timer, fire it, repeat;
@@ -226,7 +229,8 @@ leaves when TIMER-STOP is set (DISABLE-FORWARD-RULES)."
         (when due
           (handler-case (%fire-threshold state due)
             (error (e)
-              (%note-failure state :timer (princ-to-string e)))))))))
+              (%note-failure state :timer (princ-to-string e)
+                             :tag :timer :condition e))))))))
 
 (defun %ensure-timer-thread (state)
   "Under STATE's lock: the timer thread, started if none runs."

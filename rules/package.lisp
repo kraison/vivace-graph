@@ -26,7 +26,7 @@
    ;; compiling (spec §6)
    #:compile-rule #:compiled-rule #:compiled-rule-p #:compiled-rule-spec
    #:compiled-rule-relation #:compiled-rule-reads
-   #:compiled-rule-negative-reads
+   #:compiled-rule-family-reads #:compiled-rule-negative-reads
    #:compiled-rule-stratum #:compiled-rule-stratum-relations
    #:compiled-rule-thresholds
    #:rule-compile-error #:rule-compile-error-rule
@@ -40,7 +40,7 @@
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
-   #:rule-report-path
+   #:rule-report-path #:rule-report-condition
    ;; provenance (spec §9)
    #:premises-of #:dependents-of
    ;; productions (forward-rules design §7, #456)
@@ -51,7 +51,8 @@
    #:production-spec #:production-spec-p #:production-spec-salience
    #:production-spec-writes #:production-spec-action
    #:compile-production #:compiled-production-p #:run-agenda
-   #:firing #:*production-actions*
+   #:firing #:*production-actions* #:match-row #:find-production
+   #:standing-query-problems #:*standing-query-functor-classes*
    ;; forward evaluation (forward-rules design, #456)
    #:claim-delta #:delta-touches-p
    #:enable-forward-rules #:disable-forward-rules

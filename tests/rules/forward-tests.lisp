@@ -749,9 +749,14 @@ processed."
             (claim ?p rt-claim "host" ?h "runs" "app" "web")
             (claim-current ?p))))
 
+(defun joined-keys (claims)
+  "CLAIMS' identity keys joined with |, in the order given: a match's
+:KEY for those premises in body order (#471)."
+  (format nil "~{~A~^|~}" (mapcar #'claim-identity-key claims)))
+
 (defun q2-keys (g)
   (declare (ignore g))
-  (mapcar (lambda (row) (graph-db::%joined-identity-keys row))
+  (mapcar #'joined-keys
           (select (:max-inferences 10000000) (?p ?u)
             (claim ?p rt-claim "host" ?h "runs" "app" ?a) (claim-current ?p)
             (claim ?u rt-claim "host" ?h "up" nil nil) (claim-current ?u))))
@@ -917,6 +922,1169 @@ reads cannot pin the committing thread; the step stops after
           (is (find :rounds (getf status :failures) :key #'car))
           (is (eql 0 (getf status :queue-depth)))
           (is-false (getf status :running-p)))))))
+
+;;; A match's bindings and premises, the body-ordered instantiation
+;;; key, MATCH-ROW and FIND-PRODUCTION (#466, #471)
+
+(defvar *matches* '()
+  "Full deliveries, newest first: (name event match).")
+
+(defun note-match (name)
+  (lambda (event match) (push (list name event match) *matches*)))
+
+(defun matches (name &optional event)
+  "The matches delivered to production NAME, oldest first, EVENT's only
+when given."
+  (loop for (n e m) in (reverse *matches*)
+        when (and (string= n name) (or (null event) (eq e event)))
+          collect m))
+
+(defun binding-names (match)
+  (mapcar #'car (getf match :bindings)))
+
+(defun binding (match name)
+  (cdr (assoc name (getf match :bindings) :test #'string=)))
+
+(defun relation-of (x)
+  (and x (claim-relation x)))
+
+(defun commit-host-claim (g host relation producer &optional object)
+  "One claim about HOST by PRODUCER, binary when OBJECT (an app) is
+given, in its own transaction.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (if object
+        (make-rt-claim-binary :graph g :subject-namespace :host
+                              :subject-key host :relation relation
+                              :object-namespace :app :object-key object
+                              :producer producer :standing :observed)
+        (make-rt-claim-unary :graph g :subject-namespace :host
+                             :subject-key host :relation relation
+                             :producer producer :standing :observed))))
+
+(defparameter *runs-app-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a) (claim-current ?p)")
+
+(test a-match-carries-every-body-variable-in-first-appearance-order
+  "#466 item 1: :BINDINGS is the body's variables, premises included,
+and nothing synthesised."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("row" :version "1" :family rt-claim
+                              :body *runs-app-body*
+                              :action (note-match "row"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (let ((m (first (matches "row" :added))))
+          (is (equal '("?P" "?H" "?A") (binding-names m)))
+          (is (equal (claim-identity-key (runs-web-premise g "h1"))
+                     (and (binding m "?P")
+                          (claim-identity-key (binding m "?P")))))
+          (is (equal "h1" (binding m "?H")))
+          (is (equal "web" (binding m "?A"))))))))
+
+(defparameter *runs-and-up-body*
+  "(claim ?a rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim ?b rt-claim \"host\" ?h \"up\" nil nil)")
+
+(test premises-pair-with-their-own-variables-whatever-the-key-order
+  "#466 item 2: ?a is the runs claim and ?b the up claim whichever
+producer's identity key sorts first, and :PREMISES are in body order."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("pair" :version "1" :family rt-claim
+                               :body *runs-and-up-body*
+                               :action (note-match "pair"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-host-claim g "h1" "runs" "z-scan" "web")
+        (commit-host-claim g "h1" "up" "a-scan")
+        (commit-host-claim g "h2" "runs" "a-scan" "web")
+        (commit-host-claim g "h2" "up" "z-scan")
+        (is (= 2 (length (matches "pair" :added))))
+        (dolist (m (matches "pair" :added))
+          (is (equal "runs" (relation-of (binding m "?A"))))
+          (is (equal "up" (relation-of (binding m "?B"))))
+          (is (equal '("runs" "up")
+                     (mapcar #'relation-of (getf m :premises)))))))))
+
+(defparameter *self-join-body*
+  "(claim ?a rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?a)
+   (claim ?b rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?b)")
+
+(defun self-join-rows (g)
+  (declare (ignore g))
+  (mapcar #'joined-keys
+          (select (:max-inferences 10000000) (?a ?b)
+            (claim ?a rt-claim "host" ?h "up" nil nil) (claim-current ?a)
+            (claim ?b rt-claim "host" ?h "up" nil nil) (claim-current ?b))))
+
+(defun up-claim-by (g host producer)
+  (find producer (claims-touching g 'rt-claim :host host :role :subject
+                                  :relation "up")
+        :key #'claim-producer :test #'string=))
+
+(test a-self-join-delivers-one-firing-per-row
+  "#471: the instantiation key keeps body position, so (a,b) and (b,a)
+are two instantiations; a retraction loses one firing per row; a
+premise deleted and re-written re-opens its firings; a reopened store
+keeps refraction."
+  (with-rules-graph-dir (g dir)
+    (let ((*matches* '()))
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-production "self" :version "1"
+               :family rt-claim :body *self-join-body*
+               :action (note-match "self"))
+             (graph-db.rules:enable-forward-rules g)
+             (commit-host-claim g "h1" "up" "scan-a")
+             (commit-host-claim g "h1" "up" "scan-b")
+             (is (= 4 (length (self-join-rows g))))
+             (is (= 4 (length (firings g "self"))))
+             (is (set-equal-p (self-join-rows g)
+                              (mapcar (lambda (m) (getf m :key))
+                                      (matches "self" :added))))
+             (dolist (m (matches "self" :added))
+               (is (equal (getf m :key)
+                          (joined-keys (list (binding m "?A")
+                                             (binding m "?B"))))))
+             (retract-claim (up-claim-by g "h1" "scan-b"))
+             (is (= 1 (length (self-join-rows g))))
+             (is (= 3 (length (matches "self" :lost))))
+             (is (= 1 (length (firings g "self"))))
+             (is-true (run-rules-is-quiet g))
+             (let ((all-before (claims-by-producer g 'graph-db.rules:firing
+                                                   "production/self")))
+               (is (= 4 (length all-before)))
+               (with-transaction ((graph-db::transaction-manager g))
+                 (mark-deleted (up-claim-by g "h1" "scan-b")))
+               (commit-host-claim g "h1" "up" "scan-b")
+               (is (= 4 (length (firings g "self"))))
+               (is (= 4 (length (claims-by-producer
+                                 g 'graph-db.rules:firing
+                                 "production/self"))))
+               (is (= 7 (length (matches "self" :added))))
+               (is-true (run-rules-is-quiet g)))
+             (close-graph g)
+             (let ((g2 (open-graph *graph-name* (namestring dir)))
+                   (delivered (length *matches*)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g2))
+                      (graph-db.rules:enable-forward-rules g2)
+                      (is (= 4 (length (firings g2 "self"))))
+                      (is (= delivered (length *matches*)))
+                      (is-true (run-rules-is-quiet g2)))
+                 (close-graph g2))))
+        (graph-db.rules:undef-production "self")))))
+
+(defparameter *any-variable-body*
+  "(claim ?c rt-claim \"host\" ?instantiation-key \"runs\" \"app\" \"web\")
+   (claim-current ?c)")
+
+(test a-production-body-may-name-any-variable
+  "#466 item 3: ?c and ?instantiation-key are the author's."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("anyvar" :version "1" :family rt-claim
+                                 :body *any-variable-body*
+                                 :action (note-match "anyvar"))
+        (graph-db.rules:enable-forward-rules g)
+        (commit-runs-web g "h1")
+        (is (= 1 (length (matches "anyvar" :added))))
+        (let ((m (first (matches "anyvar" :added))))
+          (is (equal '("?C" "?INSTANTIATION-KEY") (binding-names m)))
+          (is (equal "h1" (binding m "?INSTANTIATION-KEY"))))))))
+
+(defun production-refusal (g name body)
+  "The reason COMPILE-PRODUCTION refuses BODY under NAME, or NIL."
+  (unwind-protect
+       (progn
+         (graph-db.rules:def-production name :version "1" :family rt-claim
+           :body body :action (lambda (e m) (list e m)))
+         (handler-case (progn (graph-db.rules:compile-production g name)
+                              nil)
+           (graph-db.rules:rule-compile-error (c)
+             (graph-db.rules:rule-compile-error-reason c))))
+    (graph-db.rules:undef-production name)))
+
+(test production-refusals-name-the-documented-rule
+  "#466 item 4: no claim/7 goal, nine premises, and a claim read only
+under OR each refuse in the documented words, not as an unbound head
+key."
+  (with-rules-graph (g)
+    (is (search "needs a claim/7 goal"
+                (production-refusal g "none" "(= ?x 1)")))
+    (is (search "at most eight"
+                (production-refusal
+                 g "nine"
+                 (format nil "~{(claim ?p~D rt-claim \"host\" ?h \"up\" ~
+nil nil)~^ ~}" '(1 2 3 4 5 6 7 8 9)))))
+    (is (search "needs a claim/7 goal"
+                (production-refusal
+                 g "orred"
+                 "(or (claim ?a rt-claim \"host\" ?h \"a\" nil nil)
+                      (claim ?a rt-claim \"host\" ?h \"b\" nil nil))")))))
+
+(defun match-rows (name)
+  (mapcar (lambda (m) (nth-value 1 (graph-db.rules:match-row m)))
+          (matches name :added)))
+
+(test match-row-agrees-with-the-guarded-runner-cell-for-cell
+  "#466 item 6: MATCH-ROW renders a match as RUN-GUARDED-PROLOG :DATA
+renders that solution, for a single premise, a join and a self-join."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("row" :version "1" :family rt-claim
+                              :body *runs-app-body*
+                              :action (note-match "row"))
+        (with-production ("pair" :version "1" :family rt-claim
+                                 :body *runs-and-up-body*
+                                 :action (note-match "pair"))
+          (with-production ("self" :version "1" :family rt-claim
+                                   :body *self-join-body*
+                                   :action (note-match "self"))
+            (graph-db.rules:enable-forward-rules g)
+            (commit-host-claim g "h1" "runs" "z-scan" "web")
+            (commit-host-claim g "h1" "up" "a-scan")
+            (commit-host-claim g "h1" "up" "scan-b")
+            (commit-host-claim g "h2" "runs" "a-scan" "db")
+            (loop for (name body) in (list (list "row" *runs-app-body*)
+                                           (list "pair" *runs-and-up-body*)
+                                           (list "self" *self-join-body*))
+                  do (multiple-value-bind (cols rows)
+                         (graph-db.query:run-guarded-prolog body g)
+                       (is (plusp (length rows)) "~A: no rows" name)
+                       (is (equal cols
+                                  (nth-value 0 (graph-db.rules:match-row
+                                                (first (matches name
+                                                                :added)))))
+                           "~A: columns" name)
+                       (is (null (set-exclusive-or rows (match-rows name)
+                                                   :test #'equal))
+                           "~A: rows ~S vs matches ~S" name rows
+                           (match-rows name))))))))))
+
+(test find-production-answers-the-stored-record-or-nil
+  "#466 item 7."
+  (with-rules-graph (g)
+    (is (null (graph-db.rules:find-production g "stored")))
+    (setf (gethash "stored-action" graph-db.rules:*production-actions*)
+          (lambda (e m) (list e m)))
+    (unwind-protect
+         (progn
+           (with-transaction ((graph-db::transaction-manager g))
+             (graph-db.rules:make-production
+              :graph g :name "stored" :version "1" :family "rt-claim"
+              :body *runs-app-body* :salience 0 :writes '()
+              :action "stored-action"))
+           (let ((p (graph-db.rules:find-production g "stored")))
+             (is (graph-db.rules:production-p p))
+             (is (equal "stored" (and p (graph-db.rules:production-name p))))
+             (with-transaction ((graph-db::transaction-manager g))
+               (mark-deleted p)))
+           (is (null (graph-db.rules:find-production g "stored"))))
+      (remhash "stored-action" graph-db.rules:*production-actions*))))
+
+;;; A free relation under a literal family (#469)
+
+(defparameter *family-wide-body*
+  "(claim ?p rt-claim \"host\" ?k ?r ?ons ?ok) (claim-current ?p)")
+
+(defparameter *flag-from-up-head*
+  "(claim ?c rt-claim \"host\" ?k \"flag\" nil nil)")
+(defparameter *flag-from-up-body*
+  "(claim ?p rt-claim \"host\" ?k \"up\" nil nil) (claim-current ?p)")
+
+(test a-family-wide-read-fires-on-every-relation-of-the-family
+  "#469: a production over every relation of rt-claim under host
+compiles, fires :added on a claim of any relation -- a derived one in
+the same step included, so it is stratified after the rule deriving
+it -- and :lost on a retraction."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-rule "flag-from-up" :version "1"
+               :family rt-claim :head *flag-from-up-head*
+               :body *flag-from-up-body*)
+             (with-production ("wide" :version "1" :family rt-claim
+                                      :body *family-wide-body*
+                                      :action (note-match "wide"))
+               (graph-db.rules:enable-forward-rules g)
+               (commit-host-claim g "h1" "up" "scan-a")
+               (is (equal '("flag" "up")
+                          (sort (mapcar (lambda (m) (binding m "?R"))
+                                        (matches "wide" :added))
+                                #'string<)))
+               (commit-host-claim g "h2" "runs" "scan-a" "web")
+               (is (equal '("runs")
+                          (mapcar (lambda (m) (binding m "?R"))
+                                  (nthcdr 2 (matches "wide" :added)))))
+               (is (equal '("web")
+                          (mapcar (lambda (m) (binding m "?OK"))
+                                  (nthcdr 2 (matches "wide" :added)))))
+               (retract-claim (up-claim-by g "h1" "scan-a"))
+               (is (= 2 (length (matches "wide" :lost))))
+               (is (= 1 (length (firings g "wide"))))
+               (is-true (run-rules-is-quiet g))))
+        (graph-db.rules:undef-rule "flag-from-up")))))
+
+(test a-claim-of-another-family-does-not-touch-a-family-wide-read
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("wide" :version "1" :family rt-claim
+                               :body *family-wide-body*
+                               :action (note-match "wide"))
+        (graph-db.rules:enable-forward-rules g)
+        (with-transaction ((graph-db::transaction-manager g))
+          (make-rtt-claim-binary :graph g :subject-namespace :host
+                                 :subject-key "h1" :relation "runs"
+                                 :object-namespace :app :object-key "web"
+                                 :producer "deploy" :standing :observed
+                                 :extent (interval (ts 2026 2 1)
+                                                   (ts 2026 6 30))))
+        (is (null (matches "wide")))
+        (is (null (firings g "wide")))
+        (is-true (run-rules-is-quiet g))))))
+
+(test a-free-relation-stays-refused-without-a-literal-family-and-namespace
+  "#469: the family unbound, or the namespace unbound, is still the
+every-relation refusal."
+  (with-rules-graph (g)
+    (is (search "bind the relation"
+                (production-refusal
+                 g "nofam" "(claim ?p ?f \"host\" ?k ?r nil nil)")))
+    (is (search "bind the relation"
+                (production-refusal
+                 g "nons" "(claim ?p rt-claim ?ns ?k ?r nil nil)")))))
+
+(test a-family-wide-read-is-checked-against-a-writes-family
+  "#469: a write names its family as (\"family\" \"relation\"); one in
+another family compiles beside the read, one in the read family is
+\"reads what it writes\", a bare relation is asked for its family."
+  (with-rules-graph (g)
+    (flet ((refusal (name writes)
+             (unwind-protect
+                  (progn
+                    (graph-db.rules:def-production name :version "1"
+                      :family rt-claim :body *family-wide-body*
+                      :writes writes :action (lambda (e m) (list e m)))
+                    (handler-case
+                        (progn (graph-db.rules:compile-production g name)
+                               nil)
+                      (graph-db.rules:rule-compile-error (c)
+                        (graph-db.rules:rule-compile-error-reason c))))
+               (graph-db.rules:undef-production name))))
+      (is (null (refusal "other" '(("rtt-claim" "flag")))))
+      (is (search "reads what it writes"
+                  (refusal "own" '(("rt-claim" "flag")))))
+      (is (search "family" (refusal "bare" '("flag")))))))
+
+(test a-write-of-the-declared-relation-into-another-family-is-reported
+  "#469: the run-time check reads a pair-shaped write as family and
+relation, so the declared relation written into a family other than
+the declared one is outside the writes."
+  (with-rules-graph (g)
+    (with-production ("wide-writer" :version "1" :family rt-claim
+                                    :body *family-wide-body*
+                                    :writes '(("rtt-claim" "flag"))
+                                    :action
+                                    (lambda (event match)
+                                      (declare (ignore match))
+                                      (when (eq event :added)
+                                        (with-transaction
+                                            ((graph-db::transaction-manager
+                                              g))
+                                          (make-rtu-claim-unary
+                                           :graph g :subject-namespace :host
+                                           :subject-key "h1"
+                                           :relation "flag"
+                                           :producer "wide-writer"
+                                           :standing :inferred)))))
+      (graph-db.rules:enable-forward-rules g)
+      (commit-host-claim g "h1" "up" "scan-a")
+      (let ((failure (find "wide-writer"
+                           (getf (graph-db.rules:forward-rules-status g)
+                                 :failures)
+                           :key #'car :test #'equal)))
+        (is (not (null failure)))
+        (when failure
+          (is (search "outside its writes" (cdr failure))))))))
+
+(defparameter *seen-head*
+  "(claim ?c rtu-claim \"host\" ?k \"seen\" nil nil)")
+
+(test a-def-rule-reads-a-family-wide-under-the-same-rules
+  "#469: a plain rule whose head is in another family reads rt-claim
+wide and derives from a claim of any relation; one whose head is in the
+read family is refused."
+  (with-rules-graph (g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-rule "seen" :version "1" :family rtu-claim
+             :head *seen-head* :body *family-wide-body*)
+           (graph-db.rules:enable-forward-rules g)
+           (commit-host-claim g "h1" "up" "scan-a")
+           (commit-host-claim g "h2" "runs" "scan-a" "web")
+           (is (equal '("h1" "h2")
+                      (sort (mapcar #'claim-subject-key
+                                    (derived g 'rtu-claim "seen"))
+                            #'string<)))
+           (is-true (run-rules-is-quiet g)))
+      (graph-db.rules:undef-rule "seen"))
+    (signals graph-db.rules:rule-compile-error
+      (graph-db.rules:compile-rule
+       g (spec :name "own-family" :version "1" :family "rt-claim"
+               :head *flag-from-up-head* :body *family-wide-body*)))))
+
+;;; Standing queries: which bodies deliver exactly their rows (#470)
+
+(defparameter *admitted-bodies*
+  (list *runs-app-body* *runs-and-up-body* *self-join-body*
+        *family-wide-body*
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+         (not (claim ?d rt-claim \"host\" ?h \"down\" nil nil))"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+         (> ?h \"k10\")"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-standing ?u \"observed\")"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-producer ?u ?who) (claim-relation ?u ?r)"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-absent ?a rt-claim \"host\" ?h \"down\" nil nil)")
+  "Bodies STANDING-QUERY-PROBLEMS admits: a production over each
+delivers exactly the query's rows.")
+
+(defparameter *refused-bodies*
+  '(("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-producer ?x \"p\")"
+     "claim-producer")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-standing ?p ?s)"
+     "claim-standing")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (or (claim ?q rt-claim \"host\" ?h \"a\" nil nil)
+          (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"
+     "or")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (once (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"
+     "once")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (retract ?p)" "retract")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (write ?h)" "write")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (read ?x)" "read")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (trigger \"x\")"
+     "trigger")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (repeat)" "repeat")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (is-a ?p rt-claim)"
+     "is-a")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (node-slot-value ?p \"standing\" ?s)" "node-slot-value")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claimed ?p ?a ?b ?c)"
+     "claimed")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (claim-valid-from ?p ?from)" "claim-valid-from")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (now ?t) (claim-recorded-at ?p ?r) (instant< ?r ?t)" "now")
+    ("(= ?x 1)" "claim/7")
+    ("(claim ?p rt-claim \"host\" ?h ?r nil nil)
+      (claim ?q ?f \"host\" ?h \"up\" nil nil)" "relation"))
+  "Bodies STANDING-QUERY-PROBLEMS refuses, each with a word its reason
+must carry: the issue's table (#470) and the admitted list's edges.")
+
+(test standing-query-problems-admits-and-refuses-as-documented
+  (with-rules-graph (g)
+    (dolist (body *admitted-bodies*)
+      (is (null (graph-db.rules:standing-query-problems body g))
+          "admitted body refused: ~A~%~S" body
+          (graph-db.rules:standing-query-problems body g)))
+    (loop for (body word) in *refused-bodies*
+          do (let ((problems (graph-db.rules:standing-query-problems body g)))
+               (is (and problems
+                        (some (lambda (p) (search word p)) problems))
+                   "~A: expected a reason naming ~A, got ~S"
+                   body word problems)))))
+
+(defun guarded-rows (body g)
+  (nth-value 1 (graph-db.query:run-guarded-prolog
+                body g :max-inferences 10000000)))
+
+(test a-refused-body-misses-rows-a-production-cannot-deliver
+  "#470: three of the table's rows shown missing -- a generator over
+the producer index, a mutable slot read into the row, a claim read
+under OR -- each as a query whose rows change with no action call."
+  (with-rules-graph (g)
+    (let ((*matches* '())
+          (producer-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (claim-producer ?x \"p\")")
+          (standing-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (claim-standing ?p ?s)")
+          (or-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (or (claim ?q rt-claim \"host\" ?h \"a\" nil nil)
+                 (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"))
+      (with-production ("gen" :version "1" :family rt-claim
+                              :body producer-body :action (note-match "gen"))
+        (with-production ("mut" :version "1" :family rt-claim
+                                :body standing-body
+                                :action (note-match "mut"))
+          (with-production ("orred" :version "1" :family rt-claim
+                                    :body or-body
+                                    :action (note-match "orred"))
+            (graph-db.rules:enable-forward-rules g)
+            (commit-host-claim g "h1" "up" "scan-t")
+            (commit-host-claim g "h1" "noise" "p")
+            ;; The up commit found no claim by p yet, and p's commits
+            ;; touch nothing the body reads: rows 1, then 2, calls 0.
+            (is (= 1 (length (guarded-rows producer-body g))))
+            (is (null (matches "gen")))
+            (commit-host-claim g "h2" "other" "p")
+            (is (= 2 (length (guarded-rows producer-body g))))
+            (is (null (matches "gen")))
+            (let ((before (guarded-rows standing-body g)))
+              (with-transaction ((graph-db::transaction-manager g))
+                (let ((copy (graph-db::copy (up-claim-by g "h1" "scan-t"))))
+                  (setf (claim-standing copy) :inferred)
+                  (graph-db::save copy)))
+              (is (not (equal before (guarded-rows standing-body g))))
+              (is (= 1 (length (matches "mut")))))
+            (is (null (guarded-rows or-body g)))
+            (commit-host-claim g "h1" "b" "scan-t")
+            (is (= 1 (length (guarded-rows or-body g))))
+            (is (null (matches "orred")))))))))
+
+(defvar *rows* (make-hash-table :test 'equal)
+  "Firing object key -> the row delivered with its :ADDED.")
+
+(defvar *row-deliveries* '()
+  "Row deliveries, newest first: (query event cells).")
+
+(defun deliver-row (query)
+  "An action remembering each :ADDED row by (query . instantiation),
+since productions over the same premises share the instantiation."
+  (lambda (event match)
+    (let ((key (cons query (claim-object-key (getf match :firing)))))
+      (ecase event
+        (:added (let ((cells (nth-value 1 (graph-db.rules:match-row match))))
+                  (setf (gethash key *rows*) cells)
+                  (push (list query :added cells) *row-deliveries*)))
+        (:lost (push (list query :lost (gethash key *rows* :unknown))
+                     *row-deliveries*))))))
+
+(defun delivered-rows (query event)
+  (loop for (q e cells) in *row-deliveries*
+        when (and (string= q query) (eq e event)) collect cells))
+
+(defun rows-equal-p (a b)
+  (and (= (length a) (length (remove-duplicates a :test #'equal)))
+       (null (set-exclusive-or a b :test #'equal))))
+
+(defparameter *row-queries*
+  '(("join" . "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+                (claim-current ?p)
+                (claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+                (claim-current ?u)")
+    ("not" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+               (not (claim ?d rt-claim \"host\" ?h \"down\" nil nil))")
+    ("cmp" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+               (> ?h \"k10\")")
+    ("standing" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+                    (claim-current ?u) (claim-standing ?u \"observed\")")
+    ("wide" . "(claim ?p rt-claim \"host\" ?k ?r ?ons ?ok) (claim-current ?p)"))
+  "Design §8's equivalence test, over rows (#470): a join, a NOT, a
+comparison, a standing filter and a family-wide read.")
+
+(defun row-query-step (g i)
+  "Commit I of the script: hosts k00, k08, ... live a full life -- up,
+runs web, a second up by another producer, down, the first up
+retracted, the second up's standing changed, the second up deleted --
+and every eighth commit is noise under host."
+  (flet ((host (n) (format nil "k~2,'0d" (max 0 n))))
+    (ecase (mod i 8)
+      (0 (commit-host-claim g (host i) "up" "scan-t"))
+      (1 (commit-host-claim g (host (- i 1)) "runs" "scan-t" "web"))
+      (2 (with-transaction ((graph-db::transaction-manager g))
+           (make-rt-claim-unary :graph g :subject-namespace :host
+                                :subject-key (host (- i 2)) :relation "up"
+                                :producer "other" :standing :inferred)))
+      (3 (commit-host-claim g (host (- i 3)) "down" "scan-t"))
+      (4 (retract-claim (up-claim-by g (host (- i 4)) "scan-t")))
+      (5 (with-transaction ((graph-db::transaction-manager g))
+           (let ((copy (graph-db::copy (up-claim-by g (host (- i 5))
+                                                    "other"))))
+             (setf (claim-standing copy) :observed)
+             (graph-db::save copy))))
+      (6 (with-transaction ((graph-db::transaction-manager g))
+           (mark-deleted (up-claim-by g (host (- i 6)) "other"))))
+      (7 (commit-host-claim g (host i) "noise" "scan-t")))))
+
+(test standing-queries-deliver-exactly-the-row-differences-of-full-reevaluation
+  "Design §8 over rows, not keys (#470): after each commit the rows
+delivered as :ADDED and :LOST equal the set differences of the query's
+rows before and after, cell for cell, with no duplicate; retractions,
+deletions and a slot update included."
+  (with-rules-graph (g)
+    (let ((*rows* (make-hash-table :test 'equal))
+          (*row-deliveries* '())
+          (mismatches '())
+          (total 0))
+      (unwind-protect
+           (progn
+             (loop for (name . body) in *row-queries*
+                   do (graph-db.rules:def-production name :version "1"
+                        :family rt-claim :body body
+                        :action (deliver-row name)))
+             (graph-db.rules:enable-forward-rules g)
+             (let ((prev (loop for (nil . body) in *row-queries*
+                               collect (guarded-rows body g))))
+               (dotimes (i 40)
+                 (setf *row-deliveries* '())
+                 (row-query-step g i)
+                 (incf total (length *row-deliveries*))
+                 (let ((now (loop for (nil . body) in *row-queries*
+                                  collect (guarded-rows body g))))
+                   (loop for (name . nil) in *row-queries*
+                         for before in prev
+                         for after in now
+                         do (let ((added (set-difference after before
+                                                         :test #'equal))
+                                  (removed (set-difference before after
+                                                           :test #'equal)))
+                              (unless (and (rows-equal-p
+                                            (delivered-rows name :added)
+                                            added)
+                                           (rows-equal-p
+                                            (delivered-rows name :lost)
+                                            removed))
+                                (push (list i name :added added
+                                            (delivered-rows name :added)
+                                            :removed removed
+                                            (delivered-rows name :lost))
+                                      mismatches))))
+                   (setf prev now)))))
+        (loop for (name . nil) in *row-queries*
+              do (graph-db.rules:undef-production name)))
+      (is (null mismatches) "mismatches: ~S" mismatches)
+      (is (< 40 total))
+      (is-true (run-rules-is-quiet g)))))
+
+(defun registered-functors ()
+  "Every registered Prolog functor, as the GUI inventory spells them:
+lowercase name/arity, interned keys only."
+  (let ((names '()))
+    (flet ((collect (table)
+             (maphash (lambda (key value)
+                        (declare (ignore value))
+                        (when (and (symbolp key) (symbol-package key))
+                          (pushnew (string-downcase (symbol-name key))
+                                   names :test #'string=)))
+                      table)))
+      (collect graph-db::*prolog-global-functors*)
+      (collect graph-db::*user-functors*))
+    (sort names #'string<)))
+
+(test every-registered-functor-has-a-standing-query-class
+  "#470: the classification lives with the functor inventory, so a new
+functor chooses whether a standing query may say it.  This suite's own
+test functors are the only exceptions."
+  (let* ((classified
+           (mapcar #'car graph-db.rules:*standing-query-functor-classes*))
+         (unclassified
+           (set-difference
+            (set-difference (registered-functors) classified
+                            :test #'string=)
+            '("slow-true/1" "refuse-loudly/1")
+            :test #'string=)))
+    (is (null unclassified)
+        "functors with no entry in *STANDING-QUERY-FUNCTOR-CLASSES*: ~S"
+        unclassified)))
+
+;;; The rounds guard counts the step's own drains only (#472)
+
+(defun commit-up-paced (g prefix n pause)
+  "N \"up\" claims keyed PREFIX0.., each in its own transaction, PAUSE
+seconds apart, on the calling thread.  Returns nothing."
+  (let ((graph-db:*graph* g))
+    (dotimes (i n)
+      (with-transaction ((graph-db::transaction-manager g))
+        (make-rt-claim-unary :graph g :subject-namespace :host
+                             :subject-key (format nil "~A~D" prefix i)
+                             :relation "up" :producer "scan-t"
+                             :standing :observed))
+      (sleep pause))))
+
+(defun status (g)
+  (graph-db.rules:forward-rules-status g))
+
+(defun paced-writers-lose-nothing (g &rest enable-args)
+  "#472's measurement: two threads commit faster than a 30 ms action
+serves them, so the running step's queue is never empty between
+drains; those drains are foreign commits, not an action feeding its
+own read, so nothing is dropped at any bound.  ENABLE-ARGS go to
+ENABLE-FORWARD-RULES; under :DRAIN :CALLER a drainer thread calls
+FORWARD-STEP until the writers are done and the queue is empty."
+  (let ((calls 0)
+        (lock (bt:make-lock "paced"))
+        (rounds graph-db.rules:*rules-max-rounds*)
+        (caller-p (eq :caller (getf enable-args :drain))))
+    ;; Set, not bound: the steps run on the writer threads.  Three
+    ;; drains of a growing queue take about a dozen deltas; the
+    ;; writers supply eighty, so the stream outlasts the bound.
+    (setf graph-db.rules:*rules-max-rounds* 3)
+    (unwind-protect
+         (with-production ("paced" :version "1" :family rt-claim
+                                   :body *q3-body*
+                                   :action (lambda (event match)
+                                             (declare (ignore match))
+                                             (when (eq event :added)
+                                               (bt:with-lock-held (lock)
+                                                 (incf calls)))
+                                             (sleep 0.03)))
+           (apply #'graph-db.rules:enable-forward-rules g enable-args)
+           (let* ((done nil)
+                  (drainer
+                    (and caller-p
+                         (bt:make-thread
+                          (lambda ()
+                            (let ((graph-db:*graph* g))
+                              (loop
+                                (graph-db.rules:forward-step g)
+                                (when (and done
+                                           (zerop (getf (status g)
+                                                        :queue-depth)))
+                                  (return))
+                                (sleep 0.005))))
+                          :name "paced drainer")))
+                  (a (bt:make-thread
+                      (lambda () (commit-up-paced g "a" 40 0.01))
+                      :name "paced a"))
+                  (b (bt:make-thread
+                      (lambda () (commit-up-paced g "b" 40 0.01))
+                      :name "paced b")))
+             (bt:join-thread a)
+             (bt:join-thread b)
+             (setf done t)
+             (when drainer (bt:join-thread drainer)))
+           (let ((status (graph-db.rules:forward-rules-status g)))
+             (is (eql 0 (getf status :queue-depth)))
+             (is (null (find :rounds (getf status :failures) :key #'car)))
+             (is (= 80 calls))
+             (is (= 80 (length (firings g "paced"))))))
+      (setf graph-db.rules:*rules-max-rounds* rounds))))
+
+(test foreign-commits-never-trip-the-rounds-guard
+  (with-rules-graph (g)
+    (paced-writers-lose-nothing g)))
+
+(test foreign-commits-never-trip-the-rounds-guard-under-drain-caller
+  "#472 under #467's mode: the same stream, drained by the caller."
+  (with-rules-graph (g)
+    (paced-writers-lose-nothing g :drain :caller)))
+
+(defparameter *pong-body*
+  "(claim ?p rt-claim \"host\" ?h \"pong\" nil nil) (claim-current ?p)")
+
+(defun commit-pong-elsewhere (g)
+  "One \"pong\" claim committed on a helper thread and joined: a foreign
+delta queued on whatever step is running.  Returns nothing."
+  (bt:join-thread
+   (bt:make-thread
+    (lambda ()
+      (let ((graph-db:*graph* g))
+        (with-transaction ((graph-db::transaction-manager g))
+          (make-rt-claim-unary :graph g :subject-namespace :host
+                               :subject-key "p1" :relation "pong"
+                               :producer "scan-t" :standing :observed))))
+    :name "pong committer")))
+
+(test the-rounds-guard-drops-only-the-deltas-the-action-fed
+  "#472: when the echo production is stopped at the bound, a foreign
+commit queued in the same drain still gets its step, and its production
+fires."
+  (with-rules-graph (g)
+    (let ((*fired* '())
+          (graph-db.rules:*rules-max-rounds* 5))
+      ;; Bound, not set: this step runs on the test thread.
+      (with-production ("pong" :version "1" :family rt-claim
+                               :body *pong-body*
+                               :action (note-firing "pong"))
+        (with-production
+            ("echo" :version "1" :family rt-claim :body *echo-body*
+                    :writes '()
+                    :action (lambda (event match)
+                              (when (eq event :added)
+                                (push (list "echo" event (getf match :key))
+                                      *fired*)
+                                (when (= 5 (count "echo" *fired*
+                                                  :key #'first
+                                                  :test #'string=))
+                                  (commit-pong-elsewhere g))
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (make-rt-claim-unary
+                                   :graph g :subject-namespace :host
+                                   :subject-key (format nil "h~D"
+                                                        (length *fired*))
+                                   :relation "ping" :producer "echo"
+                                   :standing :inferred)))))
+          (graph-db.rules:enable-forward-rules g)
+          (finishes
+            (with-transaction ((graph-db::transaction-manager g))
+              (make-rt-claim-unary :graph g :subject-namespace :host
+                                   :subject-key "h0" :relation "ping"
+                                   :producer "scan-t" :standing :observed)))
+          (let ((status (graph-db.rules:forward-rules-status g)))
+            (is (find :rounds (getf status :failures) :key #'car))
+            (is (<= (count "echo" *fired* :key #'first :test #'string=) 7))
+            (is (equal '(("pong" :added))
+                       (loop for (name event) in (fired)
+                             when (string= name "pong")
+                               collect (list name event))))
+            (is (eql 0 (getf status :queue-depth)))
+            (is-false (getf status :running-p))))))))
+
+;;; :drain :caller -- the hook queues, the caller drains (#467)
+
+(defun caller-drains (g)
+  "FORWARD-STEP on a helper thread, joined: the application's drainer."
+  (bt:join-thread
+   (bt:make-thread (lambda ()
+                     (let ((graph-db:*graph* g))
+                       (graph-db.rules:forward-step g)))
+                   :name "drainer")))
+
+(test under-drain-caller-a-commit-runs-nothing-and-the-caller-delivers-in-order
+  "#467: with a slow production, three commits return at once with no
+body and no action run; FORWARD-STEP from another thread delivers the
+three matches in commit order."
+  (with-rules-graph (g)
+    (let ((got '())
+          (lock (bt:make-lock "got")))
+      (with-production ("slow" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (sleep 0.2)
+                                         (bt:with-lock-held (lock)
+                                           (push (list event match) got))))
+        (graph-db.rules:enable-forward-rules g :drain :caller)
+        (is (eq :caller (getf (status g) :drain)))
+        (let ((start (get-internal-real-time)))
+          (dolist (h '("h1" "h2" "h3"))
+            (commit-host-claim g h "up" "scan-t"))
+          (is (< (/ (- (get-internal-real-time) start)
+                    internal-time-units-per-second)
+                 0.3)))
+        (is (null got))
+        (is (eql 3 (getf (status g) :queue-depth)))
+        (caller-drains g)
+        (is (equal '("h1" "h2" "h3")
+                   (loop for (event match) in (reverse got)
+                         when (eq event :added) collect (binding match "?H"))))
+        (is (eql 0 (getf (status g) :queue-depth)))
+        (is-true (run-rules-is-quiet g))))))
+
+(test under-drain-caller-the-outermost-commit-drains-nothing
+  "#467: %DRAIN-QUEUES skips the graph, a nested commit included."
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g :drain :caller)
+    (with-transaction ((graph-db::transaction-manager g))
+      (commit-runs-web g "h2")          ; nested: its own transaction
+      (make-rt-claim-binary :graph g :subject-namespace :host
+                            :subject-key "h1" :relation "runs"
+                            :object-namespace :app :object-key "web"
+                            :producer "scan-t" :standing :observed))
+    (is (null (derived g 'rt-claim "web-hosts")))
+    (is (eql 2 (getf (status g) :queue-depth)))
+    (caller-drains g)
+    (is (equal '("h1" "h2")
+               (sort (mapcar #'claim-object-key
+                             (derived g 'rt-claim "web-hosts"))
+                     #'string<)))
+    (is-true (run-rules-is-quiet g))))
+
+(test on-queue-is-called-outside-every-lock-for-each-queued-delta
+  "#467: a commit's delta and a threshold timer's delta each call
+ON-QUEUE with the graph, outside the state's lock, and only queue."
+  (with-rules-graph (g)
+    (write-rule g :name "settled" :version "1" :family "rtt-claim"
+                  :head *settled-head* :body *settled-body*)
+    (let ((calls '())
+          (lock (bt:make-lock "on-queue")))
+      (graph-db.rules:enable-forward-rules
+       g :drain :caller
+       :on-queue (lambda (graph)
+                   (let ((state (graph-db.rules::%forward-state graph)))
+                     (bt:with-lock-held (lock)
+                       (push (list graph
+                                   (and state
+                                        (lock-free-within-p
+                                         (graph-db.rules::forward-state-lock
+                                          state)
+                                         1)))
+                             calls)))))
+      (commit-runs-web g "h1")
+      (is (equal (list (list g t)) calls))
+      (is (eql 1 (getf (status g) :queue-depth)))
+      (caller-drains g)
+      (is (eql 1 (getf (status g) :timers)))
+      (is-true (wait-until (lambda () (bt:with-lock-held (lock)
+                                        (= 2 (length calls))))
+                           3))
+      (is (equal (list g t) (first calls)))
+      (is (null (settled-hosts g)))
+      (is (eql 1 (getf (status g) :queue-depth)))
+      (caller-drains g)
+      (is (equal '("h1") (settled-hosts g)))
+      (is-true (run-rules-is-quiet g)))))
+
+(test under-drain-caller-the-opt-in-hold-queues-and-tells-the-caller
+  "#467: a commit during the opt-in's RUN-RULES queues, ON-QUEUE hears
+of it, and the opt-in drains nothing at its end."
+  (with-rules-graph (g)
+    (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                  :head *web-hosts-head* :body *slow-web-hosts-body*)
+    (commit-runs-web g "h1")
+    (setf *slow-seconds* 0.6)
+    (let ((calls 0)
+          (lock (bt:make-lock "hold")))
+      (unwind-protect
+           (let ((thread
+                   (bt:make-thread
+                    (lambda ()
+                      (let ((graph-db:*graph* g))
+                        (graph-db.rules:enable-forward-rules
+                         g :drain :caller
+                         :on-queue (lambda (graph)
+                                     (declare (ignore graph))
+                                     (bt:with-lock-held (lock)
+                                       (incf calls)))))))))
+             (is-true (wait-until (lambda () (getf (status g) :running-p))
+                                  3))
+             (commit-runs-web g "h2")
+             (bt:join-thread thread)
+             (is (equal '("h1")
+                        (mapcar #'claim-object-key
+                                (derived g 'rt-claim "web-hosts"))))
+             (is (eql 1 (getf (status g) :queue-depth)))
+             (is (= 1 calls))
+             (setf *slow-seconds* 0)
+             (caller-drains g)
+             (is (equal '("h1" "h2")
+                        (sort (mapcar #'claim-object-key
+                                      (derived g 'rt-claim "web-hosts"))
+                              #'string<))))
+        (setf *slow-seconds* 0)))))
+
+;;; :on-failure and rule-report-condition (#468)
+
+(defvar *heard* '()
+  "What an :ON-FAILURE function heard, newest first:
+(name tag text condition-type in-transaction-p).")
+
+(defun hear-failure (name tag text condition)
+  (push (list name tag text (type-of condition)
+              (and graph-db::*transaction* t))
+        *heard*))
+
+(defun heard (&optional tag)
+  (loop for h in (reverse *heard*)
+        when (or (null tag) (eq tag (second h))) collect h))
+
+(defparameter *unbounded-up-body*
+  "(claim ?p rt-claim ?ns ?k \"up\" nil nil) (claim-current ?p)"
+  "A body whose claim/7 goal walks the family: refused at run as
+cost-unbounded, which is a :BUDGET report with its own condition.")
+
+(test on-failure-hears-a-compile-refusal-and-a-bodys-refusal
+  "#468: a production that stops compiling and a rule body that refuses
+each reach FN once, with the report's tag and the caught condition,
+outside any transaction."
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+      ;; Both after the opt-in, so each refuses once, at the commit.
+      (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                    :head *web-hosts-head* :body *refusing-web-hosts-body*)
+      (with-production ("loop" :version "1" :family rt-claim
+                               :body *self-feeding-body*
+                               :writes '("hosted-on")
+                               :action (note-firing "loop"))
+        (commit-runs-web g "h1")
+        (let ((compile (heard :rule)))
+          (is (find "loop" compile :key #'first :test #'equal))
+          (is (find "web-hosts" compile :key #'first :test #'equal))
+          (is (equal '(graph-db.rules:rule-compile-error)
+                     (mapcar #'fourth
+                             (remove "loop" compile :key #'first
+                                                    :test-not #'equal))))
+          (is (equal '(graph-db.rules::rule-run-refusal)
+                     (mapcar #'fourth
+                             (remove "web-hosts" compile :key #'first
+                                                         :test-not #'equal))))
+          (is (every #'null (mapcar #'fifth *heard*)))
+          (is (= (length *heard*)
+                 (length (getf (status g) :failures)))))))))
+
+(test on-failure-hears-an-actions-error-and-the-rounds-guard
+  (with-rules-graph (g)
+    (let ((*heard* '())
+          (*fired* '())
+          (graph-db.rules:*rules-max-rounds* 3))
+      (with-production ("boom" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (declare (ignore event match))
+                                         (error "boom")))
+        (with-production
+            ("echo" :version "1" :family rt-claim :body *echo-body*
+                    :writes '()
+                    :action (lambda (event match)
+                              (when (eq event :added)
+                                (push (list "echo" event (getf match :key))
+                                      *fired*)
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (make-rt-claim-unary
+                                   :graph g :subject-namespace :host
+                                   :subject-key (format nil "h~D"
+                                                        (length *fired*))
+                                   :relation "ping" :producer "echo"
+                                   :standing :inferred)))))
+          (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+          (commit-host-claim g "h1" "up" "scan-t")
+          (is (equal '(("boom" :action simple-error))
+                     (mapcar (lambda (h) (list (first h) (second h)
+                                               (fourth h)))
+                             (heard :action))))
+          (commit-host-claim g "h0" "ping" "scan-t")
+          (is (= 1 (length (heard :rounds))))
+          (is (eq 'null (fourth (first (heard :rounds)))))
+          (is (every #'null (mapcar #'fifth *heard*)))
+          (is (= (length *heard*)
+                 (length (getf (status g) :failures)))))))))
+
+(test on-failure-hears-an-escape-from-the-step
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (with-production ("web-watch" :version "1" :family rt-claim
+                                    :body *web-watch-body*
+                                    :action (note-firing "web-watch"))
+        (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+        (let ((original (fdefinition 'graph-db.rules:run-forward-strata)))
+          (unwind-protect
+               (progn
+                 (setf (fdefinition 'graph-db.rules:run-forward-strata)
+                       (lambda (&rest args)
+                         (declare (ignore args))
+                         (error "escaped")))
+                 (commit-runs-web g "h1")
+                 (is (equal '((:step :step simple-error nil))
+                            (mapcar (lambda (h) (list (first h) (second h)
+                                                      (fourth h) (fifth h)))
+                                    (heard :step))))
+                 (is (search "escaped" (third (first (heard :step))))))
+            (setf (fdefinition 'graph-db.rules:run-forward-strata)
+                  original)))))))
+
+(test on-failure-hears-the-opt-ins-own-refusals
+  "#468: a production over budget at the opt-in lands on :FAILURES and
+reaches FN, and a cost-unbounded goal is told from a budget overrun by
+its condition."
+  (with-rules-graph (g)
+    (let ((*heard* '()))
+      (commit-host-claim g "h1" "up" "scan-t")
+      (with-production ("unbounded" :version "1" :family rt-claim
+                                    :body *unbounded-up-body*
+                                    :action (note-firing "unbounded"))
+        (graph-db.rules:enable-forward-rules g :on-failure #'hear-failure)
+        (is (equal '(("unbounded" :budget
+                      graph-db::prolog-cost-unbounded-error nil))
+                   (mapcar (lambda (h) (list (first h) (second h)
+                                             (fourth h) (fifth h)))
+                           (heard))))
+        (is (equal '("unbounded")
+                   (mapcar #'car (getf (status g) :failures))))))))
+
+(test a-signal-from-on-failure-is-logged-and-the-step-goes-on
+  (with-rules-graph (g)
+    (let ((*fired* '()))
+      (with-production ("boom" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (declare (ignore event match))
+                                         (error "boom")))
+        (with-production ("web-watch" :version "1" :family rt-claim
+                                      :body *web-watch-body*
+                                      :action (note-firing "web-watch"))
+          (graph-db.rules:enable-forward-rules
+           g :on-failure (lambda (&rest args)
+                           (declare (ignore args))
+                           (error "the listener broke")))
+          (finishes (commit-host-claim g "h1" "up" "scan-t"))
+          (finishes (commit-runs-web g "h1"))
+          (is (equal '(:added) (mapcar #'second (fired))))
+          (is (find "boom" (getf (status g) :failures)
+                    :key #'car :test #'equal))
+          (is (eql 0 (getf (status g) :queue-depth))))))))
+
+(test deleting-a-stored-production-from-on-failure-stops-it-firing
+  "#468: FN runs outside the step's transactions, so it may delete the
+record whose action failed; the production fires no more and the step
+stays sound."
+  (with-rules-graph (g)
+    (let ((calls 0))
+      (setf (gethash "fragile-action" graph-db.rules:*production-actions*)
+            (lambda (event match)
+              (declare (ignore event match))
+              (incf calls)
+              (error "fragile")))
+      (unwind-protect
+           (progn
+             (with-transaction ((graph-db::transaction-manager g))
+               (graph-db.rules:make-production
+                :graph g :name "fragile" :version "1" :family "rt-claim"
+                :body *q3-body* :salience 0 :writes '()
+                :action "fragile-action"))
+             (graph-db.rules:enable-forward-rules
+              g :on-failure (lambda (name tag text condition)
+                              (declare (ignore tag text condition))
+                              (when (equal name "fragile")
+                                (with-transaction
+                                    ((graph-db::transaction-manager g))
+                                  (mark-deleted
+                                   (graph-db.rules:find-production
+                                    g "fragile"))))))
+             (commit-host-claim g "h1" "up" "scan-t")
+             (is (= 1 calls))
+             (is (null (graph-db.rules:find-production g "fragile")))
+             (commit-host-claim g "h2" "up" "scan-t")
+             (is (= 1 calls))
+             (is (eql 0 (getf (status g) :queue-depth)))
+             (is-true (run-rules-is-quiet g)))
+        (remhash "fragile-action" graph-db.rules:*production-actions*)))))
+
+(test rule-report-condition-carries-the-caught-condition
+  "#468: RUN-RULE's report keeps the condition behind its refusal, so a
+consumer seeding one production with RUN-RULE reads a refusal the same
+way FN does."
+  (with-rules-graph (g)
+    (commit-runs-web g "h1")
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "loud" :version "1" :family "rt-claim"
+                      :head *web-hosts-head*
+                      :body *refusing-web-hosts-body*))))
+      (is (eq :refused (graph-db.rules:rule-report-outcome r)))
+      (is (typep (graph-db.rules:rule-report-condition r)
+                 'graph-db.rules::rule-run-refusal)))
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "unbounded" :version "1" :family "rt-claim"
+                      :head *flag-from-up-head* :body *unbounded-up-body*))))
+      (is (equal '(:budget) (mapcar #'car (graph-db.rules:rule-report-refusals
+                                           r))))
+      (is (typep (graph-db.rules:rule-report-condition r)
+                 'graph-db::prolog-cost-unbounded-error)))
+    (let ((r (graph-db.rules:run-rule
+              g (spec :name "ok" :version "1" :family "rt-claim"
+                      :head *web-hosts-head* :body *web-hosts-body*))))
+      (is (null (graph-db.rules:rule-report-condition r))))))
 
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)
