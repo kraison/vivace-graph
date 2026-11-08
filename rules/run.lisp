@@ -1894,7 +1894,7 @@ RULE-REPORT with PATH :TARGETED."
           (refuse :budget (princ-to-string c) c))
         (graph-db.spacetime:missing-claim-identity-component (c)
           (refuse (graph-db.spacetime:claim-family-parent family)
-                  (princ-to-string c)))
+                  (princ-to-string c) c))
         (graph-db:constraint-violation (c)
           (refuse (%violation-family c) (princ-to-string c) c))
         (graph-db:query-precondition-error (c)

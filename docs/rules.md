@@ -1278,10 +1278,11 @@ in memory, per enabled graph, on one thread named "forward timer";
 **Productions (spec §7).** A production is a body and an action: when
 the body matches, the action runs. It is the OPS5 idea on top of the
 Datalog layer, and it shares the layer's machinery: a production is
-compiled as a rule whose head is a unary claim of the `firing` family
+compiled as a rule whose head is a binary claim of the `firing` family
 (subject namespace `production`, subject key the instantiation's key,
-relation the production's name, producer `production/NAME`, rule
-version the production's), so forward evaluation derives, retracts
+relation the production's name, object namespace `instantiation`,
+object key the premises' identity keys in the clear, producer
+`production/NAME`, rule version the production's), so forward evaluation derives, retracts
 and re-opens firings exactly as it does derived claims, provenance
 names each firing's premises, and `run-rules` repairs them.
 
