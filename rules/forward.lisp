@@ -222,14 +222,23 @@ made itself (*FORWARD-HOOK-SUPPRESSED*) is ignored."
 
 (defun %check-production-writes (state compiled delta)
   "An action's commit wrote DELTA: a relation outside the production's
-declared writes is recorded on FAILURES (spec §7); the write stands."
+declared writes is recorded on FAILURES (spec §7); the write stands.  A
+write declared as (\"family\" \"relation\") covers that relation in
+that family only (#469)."
   (let* ((spec (compiled-rule-spec compiled))
          (writes (production-spec-writes spec)))
-    (loop for rel being the hash-keys of delta
-          unless (member rel writes :test #'string=)
-            do (%note-failure state (rule-spec-name spec)
-                              (format nil "wrote ~A outside its writes ~
-~S" rel writes)))))
+    (flet ((covered-p (claim rel)
+             (some (lambda (w)
+                     (and (string= (%write-relation w) rel)
+                          (or (null (%write-family w))
+                              (string-equal (%write-family w)
+                                            (%claim-family-name claim)))))
+                   writes)))
+      (loop for rel being the hash-keys of delta using (hash-value entries)
+            unless (every (lambda (e) (covered-p (car e) rel)) entries)
+              do (%note-failure state (rule-spec-name spec)
+                                (format nil "wrote ~A outside its writes ~
+~S" rel writes))))))
 
 (defun enable-forward-rules (graph)
   "Derive at commit on GRAPH from now on (spec §5.3): installs the

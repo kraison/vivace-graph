@@ -500,9 +500,29 @@ components and a rule's component is its **stratum** (see "Recursive
 rules"). Two things are still refused, naming the rule: a `not` whose
 goal reads a relation of the rule's own stratum, and a body `claim/7`
 that leaves its relation unbound -- it would read *every* relation,
-its own included, so that refusal says to bind the relation. The graph
-is the rule's own store's, plus the image's `def-rule`s -- a `:scope`
-does not widen it (see "Cross-store scope").
+its own included, so that refusal says to bind the relation -- unless
+it is a family-wide read, below. The graph is the rule's own store's,
+plus the image's `def-rule`s -- a `:scope` does not widen it (see
+"Cross-store scope").
+
+**A family-wide read (#469).** `(claim ?p fam "ns" ?k ?r ?ons ?ok)`,
+the relation free under a *literal* family and a *literal* subject
+namespace, reads every relation of `fam` under `ns` -- the vocabulary
+route (GH #389), bounded by the namespace's keys -- and compiles.
+`compiled-rule-family-reads` lists such families. For stratification
+it is a read of every relation a rule in scope derives in that family
+and every relation a production declares it writes there (a write
+declared without its family counts for every family), so the rule runs
+after all of them. A rule whose head is in that family is refused as
+reading its own relation; a family-wide read of `firing` or
+`derivation` is refused. A production with such a read names each
+write's family, `:writes '(("rt-claim" "flag"))`: a write into the
+read family is "reads what it writes", a bare relation is refused
+asking for its family. With the family or the namespace unbound the
+goal is still refused as reading every relation. In forward mode a
+delta entry touches the rule when its claim is of that family, whatever
+its relation, and the forward path's `rule-delta/2` variant answers
+only that family's claims; the targeted path is unchanged.
 
 **A name belongs to one source.** A stored `rule` and a `def-rule` of
 the same name is a collision, refused whichever arrives second.
@@ -1254,7 +1274,9 @@ redefined at the REPL is the one that runs (#464).
 each written relation to its reads, so a rule reading what a
 production writes runs in a later stratum, and a production that
 reads what it writes, or closes a cycle through its writes, is a
-`rule-compile-error`.
+`rule-compile-error`. A write is a relation string, or `("family"
+"relation")` when the body reads a family wide (#469); the run-time
+check then holds the action to that family too.
 
 **The agenda.** After a step's strata have run, the firings the step
 changed become agenda entries, `:added` for a derived or re-opened

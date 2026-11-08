@@ -1183,6 +1183,158 @@ renders that solution, for a single premise, a join and a self-join."
            (is (null (graph-db.rules:find-production g "stored"))))
       (remhash "stored-action" graph-db.rules:*production-actions*))))
 
+;;; A free relation under a literal family (#469)
+
+(defparameter *family-wide-body*
+  "(claim ?p rt-claim \"host\" ?k ?r ?ons ?ok) (claim-current ?p)")
+
+(defparameter *flag-from-up-head*
+  "(claim ?c rt-claim \"host\" ?k \"flag\" nil nil)")
+(defparameter *flag-from-up-body*
+  "(claim ?p rt-claim \"host\" ?k \"up\" nil nil) (claim-current ?p)")
+
+(test a-family-wide-read-fires-on-every-relation-of-the-family
+  "#469: a production over every relation of rt-claim under host
+compiles, fires :added on a claim of any relation -- a derived one in
+the same step included, so it is stratified after the rule deriving
+it -- and :lost on a retraction."
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (unwind-protect
+           (progn
+             (graph-db.rules:def-rule "flag-from-up" :version "1"
+               :family rt-claim :head *flag-from-up-head*
+               :body *flag-from-up-body*)
+             (with-production ("wide" :version "1" :family rt-claim
+                                      :body *family-wide-body*
+                                      :action (note-match "wide"))
+               (graph-db.rules:enable-forward-rules g)
+               (commit-host-claim g "h1" "up" "scan-a")
+               (is (equal '("flag" "up")
+                          (sort (mapcar (lambda (m) (binding m "?R"))
+                                        (matches "wide" :added))
+                                #'string<)))
+               (commit-host-claim g "h2" "runs" "scan-a" "web")
+               (is (equal '("runs")
+                          (mapcar (lambda (m) (binding m "?R"))
+                                  (nthcdr 2 (matches "wide" :added)))))
+               (is (equal '("web")
+                          (mapcar (lambda (m) (binding m "?OK"))
+                                  (nthcdr 2 (matches "wide" :added)))))
+               (retract-claim (up-claim-by g "h1" "scan-a"))
+               (is (= 2 (length (matches "wide" :lost))))
+               (is (= 1 (length (firings g "wide"))))
+               (is-true (run-rules-is-quiet g))))
+        (graph-db.rules:undef-rule "flag-from-up")))))
+
+(test a-claim-of-another-family-does-not-touch-a-family-wide-read
+  (with-rules-graph (g)
+    (let ((*matches* '()))
+      (with-production ("wide" :version "1" :family rt-claim
+                               :body *family-wide-body*
+                               :action (note-match "wide"))
+        (graph-db.rules:enable-forward-rules g)
+        (with-transaction ((graph-db::transaction-manager g))
+          (make-rtt-claim-binary :graph g :subject-namespace :host
+                                 :subject-key "h1" :relation "runs"
+                                 :object-namespace :app :object-key "web"
+                                 :producer "deploy" :standing :observed
+                                 :extent (interval (ts 2026 2 1)
+                                                   (ts 2026 6 30))))
+        (is (null (matches "wide")))
+        (is (null (firings g "wide")))
+        (is-true (run-rules-is-quiet g))))))
+
+(test a-free-relation-stays-refused-without-a-literal-family-and-namespace
+  "#469: the family unbound, or the namespace unbound, is still the
+every-relation refusal."
+  (with-rules-graph (g)
+    (is (search "bind the relation"
+                (production-refusal
+                 g "nofam" "(claim ?p ?f \"host\" ?k ?r nil nil)")))
+    (is (search "bind the relation"
+                (production-refusal
+                 g "nons" "(claim ?p rt-claim ?ns ?k ?r nil nil)")))))
+
+(test a-family-wide-read-is-checked-against-a-writes-family
+  "#469: a write names its family as (\"family\" \"relation\"); one in
+another family compiles beside the read, one in the read family is
+\"reads what it writes\", a bare relation is asked for its family."
+  (with-rules-graph (g)
+    (flet ((refusal (name writes)
+             (unwind-protect
+                  (progn
+                    (graph-db.rules:def-production name :version "1"
+                      :family rt-claim :body *family-wide-body*
+                      :writes writes :action (lambda (e m) (list e m)))
+                    (handler-case
+                        (progn (graph-db.rules:compile-production g name)
+                               nil)
+                      (graph-db.rules:rule-compile-error (c)
+                        (graph-db.rules:rule-compile-error-reason c))))
+               (graph-db.rules:undef-production name))))
+      (is (null (refusal "other" '(("rtt-claim" "flag")))))
+      (is (search "reads what it writes"
+                  (refusal "own" '(("rt-claim" "flag")))))
+      (is (search "family" (refusal "bare" '("flag")))))))
+
+(test a-write-of-the-declared-relation-into-another-family-is-reported
+  "#469: the run-time check reads a pair-shaped write as family and
+relation, so the declared relation written into a family other than
+the declared one is outside the writes."
+  (with-rules-graph (g)
+    (with-production ("wide-writer" :version "1" :family rt-claim
+                                    :body *family-wide-body*
+                                    :writes '(("rtt-claim" "flag"))
+                                    :action
+                                    (lambda (event match)
+                                      (declare (ignore match))
+                                      (when (eq event :added)
+                                        (with-transaction
+                                            ((graph-db::transaction-manager
+                                              g))
+                                          (make-rtu-claim-unary
+                                           :graph g :subject-namespace :host
+                                           :subject-key "h1"
+                                           :relation "flag"
+                                           :producer "wide-writer"
+                                           :standing :inferred)))))
+      (graph-db.rules:enable-forward-rules g)
+      (commit-host-claim g "h1" "up" "scan-a")
+      (let ((failure (find "wide-writer"
+                           (getf (graph-db.rules:forward-rules-status g)
+                                 :failures)
+                           :key #'car :test #'equal)))
+        (is (not (null failure)))
+        (when failure
+          (is (search "outside its writes" (cdr failure))))))))
+
+(defparameter *seen-head*
+  "(claim ?c rtu-claim \"host\" ?k \"seen\" nil nil)")
+
+(test a-def-rule-reads-a-family-wide-under-the-same-rules
+  "#469: a plain rule whose head is in another family reads rt-claim
+wide and derives from a claim of any relation; one whose head is in the
+read family is refused."
+  (with-rules-graph (g)
+    (unwind-protect
+         (progn
+           (graph-db.rules:def-rule "seen" :version "1" :family rtu-claim
+             :head *seen-head* :body *family-wide-body*)
+           (graph-db.rules:enable-forward-rules g)
+           (commit-host-claim g "h1" "up" "scan-a")
+           (commit-host-claim g "h2" "runs" "scan-a" "web")
+           (is (equal '("h1" "h2")
+                      (sort (mapcar #'claim-subject-key
+                                    (derived g 'rtu-claim "seen"))
+                            #'string<)))
+           (is-true (run-rules-is-quiet g)))
+      (graph-db.rules:undef-rule "seen"))
+    (signals graph-db.rules:rule-compile-error
+      (graph-db.rules:compile-rule
+       g (spec :name "own-family" :version "1" :family "rt-claim"
+               :head *flag-from-up-head* :body *family-wide-body*)))))
+
 ;;; The rounds guard counts the step's own drains only (#472)
 
 (defun commit-up-paced (g prefix n pause)

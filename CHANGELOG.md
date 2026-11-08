@@ -14,6 +14,14 @@ between releases; cutting a release renames it to the new version and dates it.
 This section carries a **MAJOR** change: the spatial contract and two
 storage formats (#60).
 
+### Added
+
+- **A rule or production body may read a family wide** (#469):
+  `(claim ?p fam "ns" ?k ?r ?ons ?ok)`, the relation free under a
+  literal family and namespace, compiles and is touched by a claim of
+  any relation of that family. Production `writes` may name a write's
+  family as `("family" "relation")`, and must beside such a read.
+
 ### Fixed
 
 - **A forward step's rounds guard counts only the deltas an action fed**

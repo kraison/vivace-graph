@@ -784,7 +784,10 @@ recursive goal."
           for i from 0
           when (if all-goals
                    (and (%claim-read-goal-p goal)
-                        (stringp (sixth goal))
+                        (or (stringp (sixth goal))
+                            ;; A family read wide: RULE-DELTA/2 binds
+                            ;; the relation alongside (#469).
+                            (%family-wide-goal-p goal))
                         (%variable-p (second goal)))
                    (%recursive-goal-p goal own))
             do (push (list* (list 'graph-db::rule-delta
@@ -1702,11 +1705,21 @@ a -1 is promoted to :FULL by the caller."
         (producers (%stratum-producers stratum)))
     (dolist (c stratum mode)
       (let ((reads (compiled-rule-reads c))
+            (families (compiled-rule-family-reads c))
             (negative (compiled-rule-negative-reads c)))
         (loop for rel being the hash-keys of delta
                 using (hash-value entries)
               do (let ((positive (or (eq reads :any)
-                                     (member rel reads :test #'string=)))
+                                     (member rel reads :test #'string=)
+                                     ;; A family read wide (#469).
+                                     (and families
+                                          (some (lambda (e)
+                                                  (member
+                                                   (%claim-family-name
+                                                    (car e))
+                                                   families
+                                                   :test #'string-equal))
+                                                entries))))
                        (negated (or (eq negative :any)
                                     (member rel negative
                                             :test #'string=))))
@@ -1728,33 +1741,58 @@ a -1 is promoted to :FULL by the caller."
   (mapcar (lambda (c) (rule-producer (compiled-rule-spec c)))
           stratum))
 
-(defun %stratum-positive-reads (stratum)
-  "The relations STRATUM's rules read positively; none is :ANY on the
-forward path."
-  (remove-duplicates (loop for c in stratum
-                           for reads = (compiled-rule-reads c)
-                           when (listp reads) append reads)
-                     :test #'string=))
+(defun %claim-family-name (claim)
+  "The lowercase name of CLAIM's family's parent class -- what a
+RULE-SPEC's FAMILY and a family-wide read hold (#469) -- or NIL for a
+node of no registered family."
+  (loop for parent being the hash-keys
+          of graph-db.spacetime::*claim-families*
+        when (typep claim parent)
+          return (%family-string parent)))
 
-(defun %positive-delta (delta relations)
-  "DELTA's +1 claims under RELATIONS as the relation -> claims table
-RULE-DELTA/2 reads."
+(defun %stratum-positive-reads (stratum)
+  "(VALUES RELATIONS FAMILIES): the relations STRATUM's rules read
+positively -- none is :ANY on the forward path -- and the families
+they read wide (#469)."
+  (values (remove-duplicates (loop for c in stratum
+                                   for reads = (compiled-rule-reads c)
+                                   when (listp reads) append reads)
+                             :test #'string=)
+          (remove-duplicates (loop for c in stratum
+                                   append (compiled-rule-family-reads c))
+                             :test #'string=)))
+
+(defun %in-reads-p (claim rel relations families)
+  "CLAIM, of relation REL, is read by RELATIONS or by a family in
+FAMILIES read wide."
+  (or (member rel relations :test #'string=)
+      (and families
+           (member (%claim-family-name claim) families
+                   :test #'string-equal))))
+
+(defun %positive-delta (delta relations &optional families)
+  "DELTA's +1 claims under RELATIONS, or of a family in FAMILIES, as
+the relation -> claims table RULE-DELTA/2 reads."
   (let ((table (make-hash-table :test 'equal)))
     (maphash (lambda (rel entries)
-               (when (member rel relations :test #'string=)
-                 (let ((claims (loop for (claim . w) in entries
-                                     when (plusp w) collect claim)))
-                   (when claims (setf (gethash rel table) claims)))))
+               (let ((claims (loop for (claim . w) in entries
+                                   when (and (plusp w)
+                                             (%in-reads-p claim rel
+                                                          relations
+                                                          families))
+                                     collect claim)))
+                 (when claims (setf (gethash rel table) claims))))
              delta)
     table))
 
-(defun %negative-claims (delta relations producers)
-  "DELTA's -1 claims under RELATIONS, plus those one of PRODUCERS
-derived whatever their relation."
+(defun %negative-claims (delta relations producers &optional families)
+  "DELTA's -1 claims under RELATIONS or of a family in FAMILIES, plus
+those one of PRODUCERS derived whatever their relation."
   (loop for rel being the hash-keys of delta using (hash-value entries)
         append (loop for (claim . w) in entries
                      when (and (minusp w)
-                               (or (member rel relations :test #'string=)
+                               (or (%in-reads-p claim rel relations
+                                                families)
                                    (member (graph-db.spacetime:claim-producer
                                             claim)
                                            producers :test #'string=)))
@@ -1919,55 +1957,62 @@ post-commit hook.  => the RULE-REPORTs, in the order run."
                            (funcall *agenda-runner* graph compiled-rules
                                     (nreverse all-changes))))
                        (nreverse reports)))
-      (let* ((mode (%delta-touch stratum pending))
-             (reads (%stratum-positive-reads stratum))
-             (lost (and (eq mode :forward)
-                        (%negative-claims pending reads
-                                          (%stratum-producers stratum)))))
-        ;; §4.2 case (b): a recursive stratum that lost a premise
-        ;; re-runs in full; provenance cannot bound a closure's loss.
-        (when (and lost (some #'%compiled-recursive-p stratum))
-          (setf mode :full))
-        (when mode
-          (let* ((*forward-changes* '())
-                 (rs (flet ((unit (fn)
-                              ;; Each retried unit under its own list.
-                              (multiple-value-bind (v changes)
-                                  (%call-collecting-changes fn)
-                                (%note-changes changes)
-                                v)))
-                       (ecase mode
-                         (:forward
-                          (let ((positive (%positive-delta pending reads)))
-                            (append
-                             (%targeted-reports graph stratum lost)
-                             (when (plusp (hash-table-count positive))
-                               (mapc (lambda (r)
-                                       (setf (rule-report-path r) :forward))
-                                     (unit (lambda ()
-                                             (%run-stratum
-                                              graph stratum scope
-                                              :forward-delta positive))))))))
-                         (:full
-                          (mapc (lambda (r) (setf (rule-report-path r) :full))
-                                (if (some #'%compiled-recursive-p stratum)
-                                    (unit (lambda ()
-                                            (%run-stratum graph stratum
-                                                          scope)))
-                                    (mapcar (lambda (c)
-                                              (unit
-                                               (lambda ()
-                                                 (%run-compiled-rule
-                                                  graph c))))
-                                            stratum))))))))
-            (dolist (r rs) (push r reports))
-            (unless (some (lambda (r)
-                            (eq (rule-report-outcome r) :refused))
-                          rs)
-              (setf pending (%merge-delta pending *forward-changes*))
-              (setf all-changes
-                    (append (reverse *forward-changes*) all-changes)))
-            (%schedule graph stratum (%positive-delta pending reads))))))))
+      (multiple-value-bind (reads families)
+          (%stratum-positive-reads stratum)
+        (let* ((mode (%delta-touch stratum pending))
+               (lost (and (eq mode :forward)
+                          (%negative-claims pending reads
+                                            (%stratum-producers stratum)
+                                            families))))
+          ;; §4.2 case (b): a recursive stratum that lost a premise
+          ;; re-runs in full; provenance cannot bound a closure's loss.
+          (when (and lost (some #'%compiled-recursive-p stratum))
+            (setf mode :full))
+          (when mode
+            (let* ((*forward-changes* '())
+                   (rs (flet ((unit (fn)
+                                ;; Each retried unit under its own list.
+                                (multiple-value-bind (v changes)
+                                    (%call-collecting-changes fn)
+                                  (%note-changes changes)
+                                  v)))
+                         (ecase mode
+                           (:forward
+                            (let ((positive (%positive-delta pending reads
+                                                             families)))
+                              (append
+                               (%targeted-reports graph stratum lost)
+                               (when (plusp (hash-table-count positive))
+                                 (mapc (lambda (r)
+                                         (setf (rule-report-path r)
+                                               :forward))
+                                       (unit (lambda ()
+                                               (%run-stratum
+                                                graph stratum scope
+                                                :forward-delta
+                                                positive))))))))
+                           (:full
+                            (mapc (lambda (r)
+                                    (setf (rule-report-path r) :full))
+                                  (if (some #'%compiled-recursive-p stratum)
+                                      (unit (lambda ()
+                                              (%run-stratum graph stratum
+                                                            scope)))
+                                      (mapcar (lambda (c)
+                                                (unit
+                                                 (lambda ()
+                                                   (%run-compiled-rule
+                                                    graph c))))
+                                              stratum))))))))
+              (dolist (r rs) (push r reports))
+              (unless (some (lambda (r)
+                              (eq (rule-report-outcome r) :refused))
+                            rs)
+                (setf pending (%merge-delta pending *forward-changes*))
+                (setf all-changes
+                      (append (reverse *forward-changes*) all-changes)))
+              (%schedule graph stratum
+                         (%positive-delta pending reads families)))))))))
 
 ;;; Provenance reads (spec §9)
 

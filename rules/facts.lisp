@@ -934,14 +934,27 @@ docs/rules.md)."
 
 (def-global-prolog-functor rule-delta/2 (?c ?rel cont)
   "?C over *RULE-DELTA*'s claims of relation ?REL (a string); a bound
-?C succeeds only when it is one of them.  Nothing without a delta
+?C succeeds only when it is one of them; with ?REL free, every delta
+claim with ?REL bound to its relation (#469).  Nothing without a delta
 bound.  Withheld from free text (*PROLOG-EXCLUDED-PREDICATES*): a rule
 body cannot name it, the fixpoint loop injects it (GH #333)."
   (let ((c (%claim-arg ?c))
         (unbound (%unbound-p ?c))
         (rel (%prolog-index-bound ?rel)))
-    (when (and *rule-delta* (stringp rel))
-      (let ((claims (gethash rel *rule-delta*)))
-        (cond (c (when (member c claims) (funcall cont)))
-              (unbound (dolist (claim claims)
-                         (%yield (?c claim) (funcall cont)))))))))
+    (when *rule-delta*
+      (cond ((stringp rel)
+             (let ((claims (gethash rel *rule-delta*)))
+               (cond (c (when (member c claims) (funcall cont)))
+                     (unbound (dolist (claim claims)
+                                (%yield (?c claim) (funcall cont)))))))
+            ;; ?REL free: a family-wide read's variant (#469); every
+            ;; delta claim, its relation bound alongside.
+            ((%unbound-p ?rel)
+             (maphash (lambda (r claims)
+                        (cond (c (when (member c claims)
+                                   (%yield (?rel r) (funcall cont))))
+                              (unbound
+                               (dolist (claim claims)
+                                 (%yield (?rel r)
+                                   (%yield (?c claim) (funcall cont)))))))
+                      *rule-delta*))))))
