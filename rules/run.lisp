@@ -111,10 +111,12 @@ recursive stratum ran (1 otherwise), STRATUM the names it ran with
 step :FORWARD, :TARGETED or :FULL (forward-rules design §4.2).
 CONDITION is the condition caught behind a :REFUSED outcome, or NIL --
 a PROLOG-COST-UNBOUNDED-ERROR tells a cost-unbounded goal from a
-budget overrun, both tagged :BUDGET (#468)."
+budget overrun, both tagged :BUDGET (#468).  RECORDS is the
+DERIVED-FROM records RETIRE-RULE retracted behind its :RETIRED outcome,
+SWEPT then the claims (#477); 0 on every other path."
   rule-name version (outcome :derived) (derived 0) (kept 0) (swept 0)
   (disjoint-premises 0) (refusals '()) (inferences 0) (elapsed 0)
-  (rounds 1) (stratum '()) (path nil) (condition nil))
+  (rounds 1) (stratum '()) (path nil) (condition nil) (records 0))
 
 (defun rule-producer (rule)
   "The producer string RULE writes as: rule/NAME for a rule, given as
@@ -124,6 +126,14 @@ rules design §7)."
          (format nil "production/~A" (rule-spec-name rule)))
         ((rule-spec-p rule) (format nil "rule/~A" (rule-spec-name rule)))
         (t (format nil "rule/~A" rule))))
+
+(defun %stored-rule (graph name)
+  "GRAPH's stored RULE record named NAME, or NIL -- a deleted record is
+NIL, as FIND-PRODUCTION answers for productions."
+  (let ((stored (and (%graph-declares-p graph 'rule)
+                     (first (graph-db:index-lookup
+                             graph 'rule '(name) name)))))
+    (and stored (not (graph-db:deleted-p stored)) stored)))
 
 (defun %resolve-rule (graph rule)
   "RULE as a RULE-SPEC: a record or spec passes through; a name finds the
@@ -136,11 +146,8 @@ some store has run DEF-RULES-SCHEMA."
        (and class (typep rule class)))
      (%production-spec-of-record rule))
     ((stringp rule)
-     (let ((stored (and (%graph-declares-p graph 'rule)
-                        (first (graph-db:index-lookup
-                                graph 'rule '(name) rule)))))
-       (cond ((and stored (not (graph-db:deleted-p stored)))
-              (rule-spec-of stored))
+     (let ((stored (%stored-rule graph rule)))
+       (cond (stored (rule-spec-of stored))
              ((find-def-rule rule))
              ((or (%stored-production graph rule)
                   (find-def-production rule)))
@@ -1703,6 +1710,69 @@ detected (S3-P5)."
     ;; Forward mode's timers follow every full run (spec §5.2).
     (%schedule graph compiled nil)
     (nreverse reports)))
+
+;;; Retiring a rule (#477)
+
+(defun %family-named (name)
+  "The claim family whose parent class is named NAME, a string compared
+as a RULE record's FAMILY is, or NIL."
+  (loop for f being the hash-values of graph-db.spacetime::*claim-families*
+        when (string-equal name (symbol-name
+                                 (graph-db.spacetime:claim-family-parent f)))
+          return f))
+
+(defun %retract-producer-claims (graph family producer)
+  "Every current claim PRODUCER wrote into FAMILY (a parent class name)
+retracted, inside the open transaction; how many."
+  (let ((n 0))
+    (dolist (c (graph-db.spacetime:claims-by-producer graph family producer)
+               n)
+      (when (graph-db.spacetime:claim-current-p c)
+        (graph-db.spacetime:retract-claim c)
+        (incf n)))))
+
+(defun retire-rule (graph name)
+  "Withdraw what the stored rule or stored production NAME concluded
+(#477): in one transaction the record leaves scope -- a RULE is
+disabled, a PRODUCTION record deleted, having no ENABLED -- and every
+current claim its producer derived is retracted with that producer's
+DERIVED-FROM records.  Retraction, never deletion: PREMISES-OF,
+DEPENDENTS-OF and an :AS-OF read still see them.  A forward store
+cascades from the commit as from any lost premise; the retired
+production's own action hears no :LOST (docs/rules.md, Retiring a
+rule).  A name with no stored rule or production signals.  => a
+RULE-REPORT with :OUTCOME :RETIRED, SWEPT the claims and RECORDS the
+provenance records retracted."
+  (check-type name string)
+  (let* ((rule (%stored-rule graph name))
+         (production (and (null rule) (find-production graph name)))
+         (record (or rule production)))
+    (unless record
+      (error "No stored rule or production named ~S in ~(~S~)."
+             name (graph-db:graph-name graph)))
+    (let ((family (if rule
+                      (let ((f (%family-named (rule-family rule))))
+                        (unless f
+                          (error "Rule ~S's family ~S is not a claim ~
+family in this image." name (rule-family rule)))
+                        (graph-db.spacetime:claim-family-parent f))
+                      'firing))
+          (producer (if rule
+                        (rule-producer name)
+                        (format nil "production/~A" name)))
+          (version (if rule (rule-version rule) (production-version record))))
+      (graph-db:with-transaction (:graph graph)
+        (if rule
+            (let ((r (graph-db:copy rule)))
+              (setf (rule-enabled r) nil)
+              (graph-db:save r))
+            (graph-db:mark-deleted record))
+        (let ((claims (%retract-producer-claims graph family producer))
+              (records (%retract-producer-claims graph 'derivation
+                                                 producer)))
+          (%make-rule-report :rule-name name :version version
+                             :outcome :retired :swept claims
+                             :records records))))))
 
 ;;; Forward evaluation (forward-rules design §4; rules/forward.lisp)
 

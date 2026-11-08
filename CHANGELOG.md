@@ -16,6 +16,14 @@ storage formats (#60).
 
 ### Added
 
+- **`retire-rule`** (#477) withdraws what a stored rule or stored
+  production concluded. In one transaction the record leaves scope, a
+  rule disabled and a production deleted, and every current claim and
+  `derived-from` record of its producer is retracted, never deleted; a
+  forward store cascades from the commit as from any lost premise, the
+  retired production's own action hears no `:lost`, and `run-rules` is
+  quiet after. The report's outcome is `:retired`, `swept` the claims
+  and the new `rule-report-records` the records.
 - **A rule or production body may read a family wide** (#469):
   `(claim ?p fam "ns" ?k ?r ?ons ?ok)`, the relation free under a
   literal family and namespace, compiles and is touched by a claim of

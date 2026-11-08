@@ -682,8 +682,8 @@ resolved.
 | field | meaning |
 |---|---|
 | `rule-name`, `version` | the rule as run |
-| `outcome` | `:derived` or `:refused` |
-| `derived`, `kept`, `swept` | the reconcile's three counts |
+| `outcome` | `:derived`, `:refused`, or `:retired` from `retire-rule` (#477) |
+| `derived`, `kept`, `swept` | the reconcile's three counts; behind `:retired`, `swept` is the claims retracted |
 | `disjoint-premises` | solutions dropped: premises never held at once |
 | `refusals` | a list of `(tag . text)` |
 | `inferences` | the count at the last solution |
@@ -691,6 +691,7 @@ resolved.
 | `rounds` | the fixpoint rounds run, 1 outside a recursive stratum |
 | `stratum` | its stratum's rules, its own name alone for a rule with none |
 | `condition` | the condition caught behind a `:refused` outcome, else NIL (#468) |
+| `records` | the `derived-from` records `retire-rule` retracted, 0 on every other path (#477) |
 
 Every count is a total over the run: `disjoint-premises` included,
 across each variant and round of a recursive stratum.
@@ -1057,7 +1058,9 @@ cycle that runs through another store's rules is not detected.
   stays disabled (ruling T3-R5). The one place `enabled` buys no
   exemption is the *write*: `%validate-rule-writes` compiles every
   `rule` record it commits, disabled or not, so a disabled rule is
-  still a rule that could run.
+  still a rule that could run. Disabling leaves what the rule derived
+  current; `retire-rule` is how a rule leaves scope with its
+  conclusions withdrawn ("Retiring a rule", #477).
 - **A `def-rule` runs only where the store carries its family (ruling
   P8).** `*def-rules*` is image-wide; a rule whose family this store
   never declared is skipped silently, because it is not this store's
@@ -1078,6 +1081,56 @@ cycle that runs through another store's rules is not detected.
   not compile**, where `run-rules` reports that member and runs the
   rest. The fixpoint needs every rule of the stratum: one missing is
   an incomplete answer, not a smaller one.
+
+## Retiring a rule (#477)
+
+A rule that is disabled or deleted stops running, but what it derived
+stays current, keeps feeding the rules downstream, and `run-rules`
+leaves it there: a disabled rule is out of scope, so nothing
+reconciles its producer's claims. A store whose rules can turn out to
+be wrong -- rules an operator added, or a model proposed and a review
+refuted -- needs a way to say "withdraw what this rule concluded".
+
+`graph-db.rules:retire-rule (graph name) => rule-report` does that for
+a stored rule or a stored production, in **one transaction**:
+
+- the record leaves scope: a `rule` record is **disabled** (`enabled`
+  nil; it stays readable and can be enabled again), a `production`
+  record is **deleted**, since it has no `enabled` and
+  `find-production` already answers NIL for a deleted one (#466);
+- every current claim the producer `rule/<name>` or
+  `production/<name>` derived is **retracted**, and so is every
+  current `derived-from` record of that producer.
+
+Retraction, never deletion: the claims and records stay on record, so
+`premises-of` and `dependents-of` still answer through them,
+`claims-by-producer` still returns them, and a read `:as-of` an
+instant before the retirement sees them current. The report's
+`outcome` is `:retired`, `swept` counts the claims and `records` the
+provenance records retracted. A name with no stored rule or production
+signals; a `def-rule` has no record to retire (`undef-rule` it, and
+`run-rules` leaves its derivations as it does a disabled rule's).
+
+Leaving scope and retracting go together in one transaction for a
+reason: retracting a current rule's claims by hand is undone by D4,
+which re-opens a derivation the rule still supports, as it should.
+
+On a forward store the commit cascades as any lost premise does: the
+retracted claims are −1 entries, the rules reading them re-derive
+their dependents on the targeted path, a dependent with another
+standing premise is kept and only its record of the retired premise
+retracted, and a production watching a retracted claim hears `:lost`.
+The retired production's **own** action hears nothing: its firings
+are retracted, but the production has left scope before the step
+runs, so no agenda entry names it. Under `:drain :caller` the cascade
+waits for the application's `forward-step`, like any other delta.
+After the step `run-rules` reports nothing to do.
+
+Writing the rule again -- enabling the record, or a new record under
+the name -- derives nothing by itself: a premise committed earlier is
+not a delta. `run-rule` or `run-rules` then re-opens the same claims
+and reports them `kept`, and a forward store cascades from the
+re-opened claims as from any +1.
 
 ## Forward evaluation
 
@@ -1148,7 +1201,10 @@ handled by one of three cases, the spec's §4.2 table:
 A lost claim a stratum itself derived -- a derived claim somebody
 retracted by hand -- is re-checked on the targeted path too, and
 re-opened when its premises still stand (D4: the derivation is
-supported, so it is believed). A retracted premise loses its
+supported, so it is believed). To withdraw a rule's conclusions for
+good, `retire-rule` takes the rule out of scope and retracts them in
+one transaction ("Retiring a rule", #477); the step then cascades
+from them. A retracted premise loses its
 dependents only if their bodies notice: **currency is the body's
 business**. A rule meant to track retraction says `claim-current` on
 each premise it tracks, exactly as it must under `run-rules`; a body
@@ -1287,7 +1343,9 @@ relation the production's name, object namespace `instantiation`,
 object key the premises' identity keys in the clear, producer
 `production/NAME`, rule version the production's), so forward evaluation derives, retracts
 and re-opens firings exactly as it does derived claims, provenance
-names each firing's premises, and `run-rules` repairs them.
+names each firing's premises, and `run-rules` repairs them. A stored
+production retired with `retire-rule` has its firings retracted
+without its own action hearing `:lost` (#477).
 
 ```lisp
 (graph-db.rules:def-production "web-watch"
