@@ -1610,43 +1610,73 @@ seconds apart, on the calling thread.  Returns nothing."
                              :standing :observed))
       (sleep pause))))
 
+(defun status (g)
+  (graph-db.rules:forward-rules-status g))
+
+(defun paced-writers-lose-nothing (g &rest enable-args)
+  "#472's measurement: two threads commit faster than a 30 ms action
+serves them, so the running step's queue is never empty between
+drains; those drains are foreign commits, not an action feeding its
+own read, so nothing is dropped at any bound.  ENABLE-ARGS go to
+ENABLE-FORWARD-RULES; under :DRAIN :CALLER a drainer thread calls
+FORWARD-STEP until the writers are done and the queue is empty."
+  (let ((calls 0)
+        (lock (bt:make-lock "paced"))
+        (rounds graph-db.rules:*rules-max-rounds*)
+        (caller-p (eq :caller (getf enable-args :drain))))
+    ;; Set, not bound: the steps run on the writer threads.  Three
+    ;; drains of a growing queue take about a dozen deltas; the
+    ;; writers supply eighty, so the stream outlasts the bound.
+    (setf graph-db.rules:*rules-max-rounds* 3)
+    (unwind-protect
+         (with-production ("paced" :version "1" :family rt-claim
+                                   :body *q3-body*
+                                   :action (lambda (event match)
+                                             (declare (ignore match))
+                                             (when (eq event :added)
+                                               (bt:with-lock-held (lock)
+                                                 (incf calls)))
+                                             (sleep 0.03)))
+           (apply #'graph-db.rules:enable-forward-rules g enable-args)
+           (let* ((done nil)
+                  (drainer
+                    (and caller-p
+                         (bt:make-thread
+                          (lambda ()
+                            (let ((graph-db:*graph* g))
+                              (loop
+                                (graph-db.rules:forward-step g)
+                                (when (and done
+                                           (zerop (getf (status g)
+                                                        :queue-depth)))
+                                  (return))
+                                (sleep 0.005))))
+                          :name "paced drainer")))
+                  (a (bt:make-thread
+                      (lambda () (commit-up-paced g "a" 40 0.01))
+                      :name "paced a"))
+                  (b (bt:make-thread
+                      (lambda () (commit-up-paced g "b" 40 0.01))
+                      :name "paced b")))
+             (bt:join-thread a)
+             (bt:join-thread b)
+             (setf done t)
+             (when drainer (bt:join-thread drainer)))
+           (let ((status (graph-db.rules:forward-rules-status g)))
+             (is (eql 0 (getf status :queue-depth)))
+             (is (null (find :rounds (getf status :failures) :key #'car)))
+             (is (= 80 calls))
+             (is (= 80 (length (firings g "paced"))))))
+      (setf graph-db.rules:*rules-max-rounds* rounds))))
+
 (test foreign-commits-never-trip-the-rounds-guard
-  "#472: two threads commit faster than a 30 ms action serves them, so
-the running step's queue is never empty between drains.  Those drains
-are foreign commits, not an action feeding its own read: nothing is
-dropped at any bound."
   (with-rules-graph (g)
-    (let ((calls 0)
-          (lock (bt:make-lock "paced"))
-          (rounds graph-db.rules:*rules-max-rounds*))
-      ;; Set, not bound: the steps run on the writer threads.  Three
-      ;; drains of a growing queue take about a dozen deltas; the
-      ;; writers supply eighty, so the stream outlasts the bound.
-      (setf graph-db.rules:*rules-max-rounds* 3)
-      (unwind-protect
-           (with-production ("paced" :version "1" :family rt-claim
-                                     :body *q3-body*
-                                     :action (lambda (event match)
-                                               (declare (ignore match))
-                                               (when (eq event :added)
-                                                 (bt:with-lock-held (lock)
-                                                   (incf calls)))
-                                               (sleep 0.03)))
-             (graph-db.rules:enable-forward-rules g)
-             (let ((a (bt:make-thread
-                       (lambda () (commit-up-paced g "a" 40 0.01))
-                       :name "paced a"))
-                   (b (bt:make-thread
-                       (lambda () (commit-up-paced g "b" 40 0.01))
-                       :name "paced b")))
-               (bt:join-thread a)
-               (bt:join-thread b))
-             (let ((status (graph-db.rules:forward-rules-status g)))
-               (is (eql 0 (getf status :queue-depth)))
-               (is (null (find :rounds (getf status :failures) :key #'car)))
-               (is (= 80 calls))
-               (is (= 80 (length (firings g "paced"))))))
-        (setf graph-db.rules:*rules-max-rounds* rounds)))))
+    (paced-writers-lose-nothing g)))
+
+(test foreign-commits-never-trip-the-rounds-guard-under-drain-caller
+  "#472 under #467's mode: the same stream, drained by the caller."
+  (with-rules-graph (g)
+    (paced-writers-lose-nothing g :drain :caller)))
 
 (defparameter *pong-body*
   "(claim ?p rt-claim \"host\" ?h \"pong\" nil nil) (claim-current ?p)")
@@ -1709,6 +1739,139 @@ fires."
                                collect (list name event))))
             (is (eql 0 (getf status :queue-depth)))
             (is-false (getf status :running-p))))))))
+
+;;; :drain :caller -- the hook queues, the caller drains (#467)
+
+(defun caller-drains (g)
+  "FORWARD-STEP on a helper thread, joined: the application's drainer."
+  (bt:join-thread
+   (bt:make-thread (lambda ()
+                     (let ((graph-db:*graph* g))
+                       (graph-db.rules:forward-step g)))
+                   :name "drainer")))
+
+(test under-drain-caller-a-commit-runs-nothing-and-the-caller-delivers-in-order
+  "#467: with a slow production, three commits return at once with no
+body and no action run; FORWARD-STEP from another thread delivers the
+three matches in commit order."
+  (with-rules-graph (g)
+    (let ((got '())
+          (lock (bt:make-lock "got")))
+      (with-production ("slow" :version "1" :family rt-claim
+                               :body *q3-body*
+                               :action (lambda (event match)
+                                         (sleep 0.2)
+                                         (bt:with-lock-held (lock)
+                                           (push (list event match) got))))
+        (graph-db.rules:enable-forward-rules g :drain :caller)
+        (is (eq :caller (getf (status g) :drain)))
+        (let ((start (get-internal-real-time)))
+          (dolist (h '("h1" "h2" "h3"))
+            (commit-host-claim g h "up" "scan-t"))
+          (is (< (/ (- (get-internal-real-time) start)
+                    internal-time-units-per-second)
+                 0.3)))
+        (is (null got))
+        (is (eql 3 (getf (status g) :queue-depth)))
+        (caller-drains g)
+        (is (equal '("h1" "h2" "h3")
+                   (loop for (event match) in (reverse got)
+                         when (eq event :added) collect (binding match "?H"))))
+        (is (eql 0 (getf (status g) :queue-depth)))
+        (is-true (run-rules-is-quiet g))))))
+
+(test under-drain-caller-the-outermost-commit-drains-nothing
+  "#467: %DRAIN-QUEUES skips the graph, a nested commit included."
+  (with-rules-graph (g)
+    (write-web-hosts g)
+    (graph-db.rules:enable-forward-rules g :drain :caller)
+    (with-transaction ((graph-db::transaction-manager g))
+      (commit-runs-web g "h2")          ; nested: its own transaction
+      (make-rt-claim-binary :graph g :subject-namespace :host
+                            :subject-key "h1" :relation "runs"
+                            :object-namespace :app :object-key "web"
+                            :producer "scan-t" :standing :observed))
+    (is (null (derived g 'rt-claim "web-hosts")))
+    (is (eql 2 (getf (status g) :queue-depth)))
+    (caller-drains g)
+    (is (equal '("h1" "h2")
+               (sort (mapcar #'claim-object-key
+                             (derived g 'rt-claim "web-hosts"))
+                     #'string<)))
+    (is-true (run-rules-is-quiet g))))
+
+(test on-queue-is-called-outside-every-lock-for-each-queued-delta
+  "#467: a commit's delta and a threshold timer's delta each call
+ON-QUEUE with the graph, outside the state's lock, and only queue."
+  (with-rules-graph (g)
+    (write-rule g :name "settled" :version "1" :family "rtt-claim"
+                  :head *settled-head* :body *settled-body*)
+    (let ((calls '())
+          (lock (bt:make-lock "on-queue")))
+      (graph-db.rules:enable-forward-rules
+       g :drain :caller
+       :on-queue (lambda (graph)
+                   (let ((state (graph-db.rules::%forward-state graph)))
+                     (bt:with-lock-held (lock)
+                       (push (list graph
+                                   (and state
+                                        (lock-free-within-p
+                                         (graph-db.rules::forward-state-lock
+                                          state)
+                                         1)))
+                             calls)))))
+      (commit-runs-web g "h1")
+      (is (equal (list (list g t)) calls))
+      (is (eql 1 (getf (status g) :queue-depth)))
+      (caller-drains g)
+      (is (eql 1 (getf (status g) :timers)))
+      (is-true (wait-until (lambda () (bt:with-lock-held (lock)
+                                        (= 2 (length calls))))
+                           3))
+      (is (equal (list g t) (first calls)))
+      (is (null (settled-hosts g)))
+      (is (eql 1 (getf (status g) :queue-depth)))
+      (caller-drains g)
+      (is (equal '("h1") (settled-hosts g)))
+      (is-true (run-rules-is-quiet g)))))
+
+(test under-drain-caller-the-opt-in-hold-queues-and-tells-the-caller
+  "#467: a commit during the opt-in's RUN-RULES queues, ON-QUEUE hears
+of it, and the opt-in drains nothing at its end."
+  (with-rules-graph (g)
+    (write-rule g :name "web-hosts" :version "1" :family "rt-claim"
+                  :head *web-hosts-head* :body *slow-web-hosts-body*)
+    (commit-runs-web g "h1")
+    (setf *slow-seconds* 0.6)
+    (let ((calls 0)
+          (lock (bt:make-lock "hold")))
+      (unwind-protect
+           (let ((thread
+                   (bt:make-thread
+                    (lambda ()
+                      (let ((graph-db:*graph* g))
+                        (graph-db.rules:enable-forward-rules
+                         g :drain :caller
+                         :on-queue (lambda (graph)
+                                     (declare (ignore graph))
+                                     (bt:with-lock-held (lock)
+                                       (incf calls)))))))))
+             (is-true (wait-until (lambda () (getf (status g) :running-p))
+                                  3))
+             (commit-runs-web g "h2")
+             (bt:join-thread thread)
+             (is (equal '("h1")
+                        (mapcar #'claim-object-key
+                                (derived g 'rt-claim "web-hosts"))))
+             (is (eql 1 (getf (status g) :queue-depth)))
+             (is (= 1 calls))
+             (setf *slow-seconds* 0)
+             (caller-drains g)
+             (is (equal '("h1" "h2")
+                        (sort (mapcar #'claim-object-key
+                                      (derived g 'rt-claim "web-hosts"))
+                              #'string<))))
+        (setf *slow-seconds* 0)))))
 
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)

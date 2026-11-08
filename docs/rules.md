@@ -1090,6 +1090,8 @@ follow-on transaction, not part of the committing one). Nothing calls
 (graph-db.rules:enable-forward-rules graph)    ; runs run-rules once
 (graph-db.rules:forward-rules-enabled-p graph) ; => T
 (graph-db.rules:disable-forward-rules graph)   ; drops the queue
+(graph-db.rules:enable-forward-rules graph     ; #467: the hook queues,
+  :drain :caller :on-queue #'wake-my-drainer)  ; the application drains
 ```
 
 `enable-forward-rules` registers the store and runs `run-rules` once,
@@ -1097,7 +1099,8 @@ so a store with premises committed before the opt-in starts at its
 fixpoint. The opt-in is per open graph object and lives in the image:
 reopen the store, opt in again. Disable and close do not wait for a
 step running on another user thread, even though status then says disabled.
-Stop the caller's committers before disabling or closing the graph.
+Stop the caller's committers -- and under `:drain :caller` its
+drainer -- before disabling or closing the graph.
 
 **The delta.** `claim-delta` renders a committed transaction's writes
 (every node of a registered claim family) as a table, relation →
@@ -1177,6 +1180,25 @@ drains that took a delta an action committed: those deltas are
 dropped with a `:rounds` failure on the status, and the deltas other
 threads queued meanwhile are kept and run. A foreign commit never
 counts toward the bound, however steady the stream (#472).
+
+**`:drain :caller` (#467).** `(enable-forward-rules graph :drain
+:caller :on-queue fn)` keeps the committing thread out of it: the hook
+queues the delta and returns, so a commit runs no body and no action,
+holds no lock a body would wait on, and an action may take the
+application's own locks. The outermost commit's drain skips such a
+graph, nested commits included, and a threshold timer's delta only
+queues too. The application calls `forward-step` on a thread of its
+choosing; it drains in commit order under the same D5 contract, and
+returns at once when another thread's step is already running or the
+graph is disabled. `fn`, a function of the graph, is called outside
+every lock whenever a delta is queued -- by a commit, a timer, or a
+commit during the opt-in's hold -- so a drainer can wake on it without
+a signal of its own; a signal from `fn` is logged and recorded under
+`:on-queue`. `forward-rules-status` reports `:drain`. Before
+`disable-forward-rules` or `close-graph`, stop the committers and the
+drainer: neither waits for a `forward-step` in flight on another
+thread, and a `forward-step` that starts after the disable returns
+having done nothing. The default, `:commit`, is unchanged.
 
 **Failure (spec §4.4).** A rule that refuses in a step -- the rails,
 a constraint, a bad instant, a functor's own refusal -- is reported

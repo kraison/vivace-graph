@@ -188,7 +188,8 @@ Returns nothing."
   (values))
 
 (defun %fire-threshold (state timer)
-  "TIMER's match re-enters the step as a delta (spec §5.2)."
+  "TIMER's match re-enters the step as a delta (spec §5.2): queued,
+ON-QUEUE told, and run here unless the caller drains (#467)."
   (let ((delta (make-hash-table :test 'equal))
         (graph (forward-state-graph state)))
     (dolist (c (threshold-timer-claims timer))
@@ -196,8 +197,9 @@ Returns nothing."
         (push (cons c 1) (gethash rel delta))
         (when (eq (threshold-timer-direction timer) :loss)
           (push (cons c -1) (gethash rel delta)))))
-    (%enqueue-delta state delta)
-    (forward-step graph)))
+    (%queue-delta state delta)
+    (unless (%caller-drains-p state)
+      (forward-step graph))))
 
 (defun %timer-loop (state)
   "The timer thread: sleep until the earliest timer, fire it, repeat;

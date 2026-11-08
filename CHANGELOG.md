@@ -21,6 +21,11 @@ storage formats (#60).
   literal family and namespace, compiles and is touched by a claim of
   any relation of that family. Production `writes` may name a write's
   family as `("family" "relation")`, and must beside such a read.
+- **`enable-forward-rules graph :drain :caller :on-queue fn`** (#467):
+  the commit hook only queues and the application calls `forward-step`
+  on a thread of its own, told by `fn` outside every lock whenever a
+  delta is queued; `forward-rules-status` reports `:drain`. The default
+  `:commit` is unchanged.
 - **`standing-query-problems`** (#470) says whether a production over a
   body delivers exactly its query's rows, commit by commit, or why not,
   goal by goal; `*standing-query-functor-classes*` classifies every
