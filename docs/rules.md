@@ -1310,6 +1310,33 @@ but no `:added` delivery; consumers read the firing claims for the initial
 set. A firing's history is readable through version history only: re-opening
 a kept derivation overwrites its transaction extent with an open-from-now one.
 
+**Standing queries (#470).** "A standing query is a production whose
+body is the query" (design §8) holds for the bodies
+`(standing-query-problems text graph)` admits: it answers NIL when a
+production over `text` delivers, commit by commit, exactly the rows a
+full re-evaluation of `text` would add and lose, else a list of
+reasons, each naming its goal. Admitted: top-level `claim/7` and
+`claim-absent/7` with a variable `?c` and a literal relation, or a
+family-wide read (#469); `not` over those; tests over bound values
+(`=`, `<`, `instant<`, `instant-offset`, ...); `claim-current`; a
+premise's slot read as a filter with a literal, `(claim-standing ?p
+"observed")`, or a slot no update changes (`claim-relation`,
+`claim-producer` of a premise, `claim-recorded-at`,
+`claim-rule-version`). Refused: every other store read (`is-a`,
+`related`, `claimed`, `find-*`, views, edges, `node-slot-value`, a
+`claim-producer` generator); a claim read nested under `or`, `once`,
+`if` or `forall`; a slot an update can change read into a variable
+(the row changes, the instantiation does not, so nothing is
+delivered); an effect or `repeat`; `now`; no premise; more than eight.
+The classification is `*standing-query-functor-classes*`
+(`rules/standing.lisp`), one entry per registered functor; the rules
+suite insists every functor has one, so a new functor chooses.
+`compile-rule` does *not* refuse the rest: `run-rules` runs every
+body correctly, forward mode's repair is `run-rules`, and a
+`claim-producer` generator is the fixpoint's own idiom (ruling P5).
+The check is the consumer's, at the moment it decides a body is a
+standing query.
+
 **Repair.** `run-rules` is the forward mode's repair: it computes the
 same fixpoint from scratch and reconciles fully, so after any step it
 reports nothing derived and nothing swept. If it does not, that is a

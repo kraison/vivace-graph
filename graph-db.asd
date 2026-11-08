@@ -237,7 +237,7 @@ docs/rules.md; GH #304."
   :components ((:file "package") (:file "facts") (:file "schema")
                (:file "compile") (:file "run") (:file "delta")
                (:file "forward") (:file "thresholds")
-               (:file "productions"))
+               (:file "productions") (:file "standing"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test

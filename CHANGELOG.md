@@ -21,6 +21,14 @@ storage formats (#60).
   literal family and namespace, compiles and is touched by a claim of
   any relation of that family. Production `writes` may name a write's
   family as `("family" "relation")`, and must beside such a read.
+- **`standing-query-problems`** (#470) says whether a production over a
+  body delivers exactly its query's rows, commit by commit, or why not,
+  goal by goal; `*standing-query-functor-classes*` classifies every
+  registered functor, and the rules suite requires an entry for each.
+  The design's standing-query equivalence test now compares rows, not
+  instantiation keys, over a join, a `not`, a comparison, a standing
+  filter and a family-wide read, through retractions, deletions and a
+  slot update.
 
 ### Fixed
 

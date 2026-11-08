@@ -1335,6 +1335,267 @@ read family is refused."
        g (spec :name "own-family" :version "1" :family "rt-claim"
                :head *flag-from-up-head* :body *family-wide-body*)))))
 
+;;; Standing queries: which bodies deliver exactly their rows (#470)
+
+(defparameter *admitted-bodies*
+  (list *runs-app-body* *runs-and-up-body* *self-join-body*
+        *family-wide-body*
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+         (not (claim ?d rt-claim \"host\" ?h \"down\" nil nil))"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+         (> ?h \"k10\")"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-standing ?u \"observed\")"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-producer ?u ?who) (claim-relation ?u ?r)"
+        "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+         (claim-absent ?a rt-claim \"host\" ?h \"down\" nil nil)")
+  "Bodies STANDING-QUERY-PROBLEMS admits: a production over each
+delivers exactly the query's rows.")
+
+(defparameter *refused-bodies*
+  '(("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-producer ?x \"p\")"
+     "claim-producer")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claim-standing ?p ?s)"
+     "claim-standing")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (or (claim ?q rt-claim \"host\" ?h \"a\" nil nil)
+          (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"
+     "or")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (once (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"
+     "once")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (retract ?p)" "retract")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (write ?h)" "write")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (read ?x)" "read")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (trigger \"x\")"
+     "trigger")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (repeat)" "repeat")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (is-a ?p rt-claim)"
+     "is-a")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (node-slot-value ?p \"standing\" ?s)" "node-slot-value")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil) (claimed ?p ?a ?b ?c)"
+     "claimed")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (claim-valid-from ?p ?from)" "claim-valid-from")
+    ("(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+      (now ?t) (claim-recorded-at ?p ?r) (instant< ?r ?t)" "now")
+    ("(= ?x 1)" "claim/7")
+    ("(claim ?p rt-claim \"host\" ?h ?r nil nil)
+      (claim ?q ?f \"host\" ?h \"up\" nil nil)" "relation"))
+  "Bodies STANDING-QUERY-PROBLEMS refuses, each with a word its reason
+must carry: the issue's table (#470) and the admitted list's edges.")
+
+(test standing-query-problems-admits-and-refuses-as-documented
+  (with-rules-graph (g)
+    (dolist (body *admitted-bodies*)
+      (is (null (graph-db.rules:standing-query-problems body g))
+          "admitted body refused: ~A~%~S" body
+          (graph-db.rules:standing-query-problems body g)))
+    (loop for (body word) in *refused-bodies*
+          do (let ((problems (graph-db.rules:standing-query-problems body g)))
+               (is (and problems
+                        (some (lambda (p) (search word p)) problems))
+                   "~A: expected a reason naming ~A, got ~S"
+                   body word problems)))))
+
+(defun guarded-rows (body g)
+  (nth-value 1 (graph-db.query:run-guarded-prolog
+                body g :max-inferences 10000000)))
+
+(test a-refused-body-misses-rows-a-production-cannot-deliver
+  "#470: three of the table's rows shown missing -- a generator over
+the producer index, a mutable slot read into the row, a claim read
+under OR -- each as a query whose rows change with no action call."
+  (with-rules-graph (g)
+    (let ((*matches* '())
+          (producer-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (claim-producer ?x \"p\")")
+          (standing-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (claim-standing ?p ?s)")
+          (or-body
+            "(claim ?p rt-claim \"host\" ?h \"up\" nil nil)
+             (or (claim ?q rt-claim \"host\" ?h \"a\" nil nil)
+                 (claim ?q rt-claim \"host\" ?h \"b\" nil nil))"))
+      (with-production ("gen" :version "1" :family rt-claim
+                              :body producer-body :action (note-match "gen"))
+        (with-production ("mut" :version "1" :family rt-claim
+                                :body standing-body
+                                :action (note-match "mut"))
+          (with-production ("orred" :version "1" :family rt-claim
+                                    :body or-body
+                                    :action (note-match "orred"))
+            (graph-db.rules:enable-forward-rules g)
+            (commit-host-claim g "h1" "up" "scan-t")
+            (commit-host-claim g "h1" "noise" "p")
+            ;; The up commit found no claim by p yet, and p's commits
+            ;; touch nothing the body reads: rows 1, then 2, calls 0.
+            (is (= 1 (length (guarded-rows producer-body g))))
+            (is (null (matches "gen")))
+            (commit-host-claim g "h2" "other" "p")
+            (is (= 2 (length (guarded-rows producer-body g))))
+            (is (null (matches "gen")))
+            (let ((before (guarded-rows standing-body g)))
+              (with-transaction ((graph-db::transaction-manager g))
+                (let ((copy (graph-db::copy (up-claim-by g "h1" "scan-t"))))
+                  (setf (claim-standing copy) :inferred)
+                  (graph-db::save copy)))
+              (is (not (equal before (guarded-rows standing-body g))))
+              (is (= 1 (length (matches "mut")))))
+            (is (null (guarded-rows or-body g)))
+            (commit-host-claim g "h1" "b" "scan-t")
+            (is (= 1 (length (guarded-rows or-body g))))
+            (is (null (matches "orred")))))))))
+
+(defvar *rows* (make-hash-table :test 'equal)
+  "Firing object key -> the row delivered with its :ADDED.")
+
+(defvar *row-deliveries* '()
+  "Row deliveries, newest first: (query event cells).")
+
+(defun deliver-row (query)
+  "An action remembering each :ADDED row by (query . instantiation),
+since productions over the same premises share the instantiation."
+  (lambda (event match)
+    (let ((key (cons query (claim-object-key (getf match :firing)))))
+      (ecase event
+        (:added (let ((cells (nth-value 1 (graph-db.rules:match-row match))))
+                  (setf (gethash key *rows*) cells)
+                  (push (list query :added cells) *row-deliveries*)))
+        (:lost (push (list query :lost (gethash key *rows* :unknown))
+                     *row-deliveries*))))))
+
+(defun delivered-rows (query event)
+  (loop for (q e cells) in *row-deliveries*
+        when (and (string= q query) (eq e event)) collect cells))
+
+(defun rows-equal-p (a b)
+  (and (= (length a) (length (remove-duplicates a :test #'equal)))
+       (null (set-exclusive-or a b :test #'equal))))
+
+(defparameter *row-queries*
+  '(("join" . "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+                (claim-current ?p)
+                (claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+                (claim-current ?u)")
+    ("not" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+               (not (claim ?d rt-claim \"host\" ?h \"down\" nil nil))")
+    ("cmp" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil) (claim-current ?u)
+               (> ?h \"k10\")")
+    ("standing" . "(claim ?u rt-claim \"host\" ?h \"up\" nil nil)
+                    (claim-current ?u) (claim-standing ?u \"observed\")")
+    ("wide" . "(claim ?p rt-claim \"host\" ?k ?r ?ons ?ok) (claim-current ?p)"))
+  "Design §8's equivalence test, over rows (#470): a join, a NOT, a
+comparison, a standing filter and a family-wide read.")
+
+(defun row-query-step (g i)
+  "Commit I of the script: hosts k00, k08, ... live a full life -- up,
+runs web, a second up by another producer, down, the first up
+retracted, the second up's standing changed, the second up deleted --
+and every eighth commit is noise under host."
+  (flet ((host (n) (format nil "k~2,'0d" (max 0 n))))
+    (ecase (mod i 8)
+      (0 (commit-host-claim g (host i) "up" "scan-t"))
+      (1 (commit-host-claim g (host (- i 1)) "runs" "scan-t" "web"))
+      (2 (with-transaction ((graph-db::transaction-manager g))
+           (make-rt-claim-unary :graph g :subject-namespace :host
+                                :subject-key (host (- i 2)) :relation "up"
+                                :producer "other" :standing :inferred)))
+      (3 (commit-host-claim g (host (- i 3)) "down" "scan-t"))
+      (4 (retract-claim (up-claim-by g (host (- i 4)) "scan-t")))
+      (5 (with-transaction ((graph-db::transaction-manager g))
+           (let ((copy (graph-db::copy (up-claim-by g (host (- i 5))
+                                                    "other"))))
+             (setf (claim-standing copy) :observed)
+             (graph-db::save copy))))
+      (6 (with-transaction ((graph-db::transaction-manager g))
+           (mark-deleted (up-claim-by g (host (- i 6)) "other"))))
+      (7 (commit-host-claim g (host i) "noise" "scan-t")))))
+
+(test standing-queries-deliver-exactly-the-row-differences-of-full-reevaluation
+  "Design §8 over rows, not keys (#470): after each commit the rows
+delivered as :ADDED and :LOST equal the set differences of the query's
+rows before and after, cell for cell, with no duplicate; retractions,
+deletions and a slot update included."
+  (with-rules-graph (g)
+    (let ((*rows* (make-hash-table :test 'equal))
+          (*row-deliveries* '())
+          (mismatches '())
+          (total 0))
+      (unwind-protect
+           (progn
+             (loop for (name . body) in *row-queries*
+                   do (graph-db.rules:def-production name :version "1"
+                        :family rt-claim :body body
+                        :action (deliver-row name)))
+             (graph-db.rules:enable-forward-rules g)
+             (let ((prev (loop for (nil . body) in *row-queries*
+                               collect (guarded-rows body g))))
+               (dotimes (i 40)
+                 (setf *row-deliveries* '())
+                 (row-query-step g i)
+                 (incf total (length *row-deliveries*))
+                 (let ((now (loop for (nil . body) in *row-queries*
+                                  collect (guarded-rows body g))))
+                   (loop for (name . nil) in *row-queries*
+                         for before in prev
+                         for after in now
+                         do (let ((added (set-difference after before
+                                                         :test #'equal))
+                                  (removed (set-difference before after
+                                                           :test #'equal)))
+                              (unless (and (rows-equal-p
+                                            (delivered-rows name :added)
+                                            added)
+                                           (rows-equal-p
+                                            (delivered-rows name :lost)
+                                            removed))
+                                (push (list i name :added added
+                                            (delivered-rows name :added)
+                                            :removed removed
+                                            (delivered-rows name :lost))
+                                      mismatches))))
+                   (setf prev now)))))
+        (loop for (name . nil) in *row-queries*
+              do (graph-db.rules:undef-production name)))
+      (is (null mismatches) "mismatches: ~S" mismatches)
+      (is (< 40 total))
+      (is-true (run-rules-is-quiet g)))))
+
+(defun registered-functors ()
+  "Every registered Prolog functor, as the GUI inventory spells them:
+lowercase name/arity, interned keys only."
+  (let ((names '()))
+    (flet ((collect (table)
+             (maphash (lambda (key value)
+                        (declare (ignore value))
+                        (when (and (symbolp key) (symbol-package key))
+                          (pushnew (string-downcase (symbol-name key))
+                                   names :test #'string=)))
+                      table)))
+      (collect graph-db::*prolog-global-functors*)
+      (collect graph-db::*user-functors*))
+    (sort names #'string<)))
+
+(test every-registered-functor-has-a-standing-query-class
+  "#470: the classification lives with the functor inventory, so a new
+functor chooses whether a standing query may say it.  This suite's own
+test functors are the only exceptions."
+  (let* ((classified
+           (mapcar #'car graph-db.rules:*standing-query-functor-classes*))
+         (unclassified
+           (set-difference
+            (set-difference (registered-functors) classified
+                            :test #'string=)
+            '("slow-true/1" "refuse-loudly/1")
+            :test #'string=)))
+    (is (null unclassified)
+        "functors with no entry in *STANDING-QUERY-FUNCTOR-CLASSES*: ~S"
+        unclassified)))
+
 ;;; The rounds guard counts the step's own drains only (#472)
 
 (defun commit-up-paced (g prefix n pause)

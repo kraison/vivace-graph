@@ -52,6 +52,7 @@
    #:production-spec-writes #:production-spec-action
    #:compile-production #:compiled-production-p #:run-agenda
    #:firing #:*production-actions* #:match-row #:find-production
+   #:standing-query-problems #:*standing-query-functor-classes*
    ;; forward evaluation (forward-rules design, #456)
    #:claim-delta #:delta-touches-p
    #:enable-forward-rules #:disable-forward-rules
