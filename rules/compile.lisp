@@ -688,7 +688,30 @@ still constrains the cycle graph; RUN-RULES is what filters by family
           (%stored-productions graph :view view)
           (alexandria:hash-table-values *def-productions*)))
 
+(defvar *edges-cache* nil
+  "NIL, or an EQ hash spec -> %EDGES result for the length of one
+recompile (%FORWARD-COMPILED, RUN-RULES, the write validators): every
+rule in scope is compiled against the same spec objects, so each text
+is guarded once for its edges rather than once per other rule (#474).
+Bound per call, so nothing outlives *DEF-RULES-STAMP*.")
+
+(defmacro with-edges-cache (() &body body)
+  "BODY with a fresh *EDGES-CACHE*, unless one is already bound."
+  `(let ((*edges-cache* (or *edges-cache* (make-hash-table :test 'eq))))
+     ,@body))
+
 (defun %edges (spec graph)
+  "SPEC's edges, memoised in *EDGES-CACHE* when one is bound (#474);
+%COMPUTE-EDGES does the work."
+  (if *edges-cache*
+      (multiple-value-bind (edges found) (gethash spec *edges-cache*)
+        (if found
+            edges
+            (setf (gethash spec *edges-cache*)
+                  (%compute-edges spec graph))))
+      (%compute-edges spec graph)))
+
+(defun %compute-edges (spec graph)
   "SPEC's edges for the dependency graph, a list of (relation family
 reads) -- the head's, plus one per write for a production, FAMILY the
 head's family or the write's declared one (NIL for a bare write) -- or
@@ -974,8 +997,9 @@ RULE class, and this validator is image-wide."
           (let ((scope (rules-in-scope
                         graph
                         :view (graph-db:make-commit-view graph tx))))
-            (dolist (r written)
-              (compile-rule graph r :others scope))))))))
+            (with-edges-cache ()
+              (dolist (r written)
+                (compile-rule graph r :others scope)))))))))
 
 (pushnew '%validate-rule-writes graph-db:*commit-validators*)
 
@@ -994,12 +1018,13 @@ the store as it will be after the commit (forward-rules design §7)."
           (let ((scope (rules-in-scope
                         graph
                         :view (graph-db:make-commit-view graph tx))))
-            (dolist (p written)
-              (unless (gethash (production-action p) *production-actions*)
-                (error 'rule-compile-error
-                       :rule (production-name p)
-                       :reason (format nil "action ~S is not registered"
-                                       (production-action p))))
-              (compile-production graph p :others scope))))))))
+            (with-edges-cache ()
+              (dolist (p written)
+                (unless (gethash (production-action p) *production-actions*)
+                  (error 'rule-compile-error
+                         :rule (production-name p)
+                         :reason (format nil "action ~S is not registered"
+                                         (production-action p))))
+                (compile-production graph p :others scope)))))))))
 
 (pushnew '%validate-production-writes graph-db:*commit-validators*)

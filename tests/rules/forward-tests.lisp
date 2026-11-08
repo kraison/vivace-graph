@@ -2221,6 +2221,41 @@ way FN does."
                       :head *web-hosts-head* :body *web-hosts-body*))))
       (is (null (graph-db.rules:rule-report-condition r))))))
 
+;;; One recompile parses each rule's text once (#474)
+
+(test one-recompile-parses-each-rules-text-once
+  "#474: twenty productions recompiled after the cache stamp is cleared
+guard each text a bounded number of times -- once for the rule and once
+for its edges -- not once per other rule."
+  (with-rules-graph (g)
+    (let ((names (loop for i below 20 collect (format nil "p~2,'0d" i))))
+      (unwind-protect
+           (progn
+             (dolist (n names)
+               (graph-db.rules:def-production n :version "1"
+                 :family rt-claim
+                 :body (format nil "(claim ?p rt-claim \"host\" ?h ~S nil nil)"
+                               n)
+                 :action (lambda (e m) (list e m))))
+             (graph-db.rules:enable-forward-rules g)
+             (let ((state (graph-db.rules::%forward-state g))
+                   (calls 0)
+                   (original (fdefinition 'graph-db.query:guard-query-text)))
+               (setf (graph-db.rules::forward-state-cache-stamp state) nil)
+               (unwind-protect
+                    (progn
+                      (setf (fdefinition 'graph-db.query:guard-query-text)
+                            (lambda (&rest args)
+                              (incf calls)
+                              (apply original args)))
+                      (graph-db.rules::%forward-compiled g state))
+                 (setf (fdefinition 'graph-db.query:guard-query-text)
+                       original))
+               (is (= 20 (length (graph-db.rules::forward-state-compiled
+                                  state))))
+               (is (<= calls 60) "~D guard calls for 20 rules" calls)))
+        (dolist (n names) (graph-db.rules:undef-production n))))))
+
 ;;; The per-identity resolver (#457, spec
 ;;; docs/superpowers/specs/2026-11-05-forward-step-reads-design.md §2)
 

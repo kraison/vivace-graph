@@ -43,6 +43,11 @@ storage formats (#60).
 
 ### Fixed
 
+- **One recompile parses each rule's text once** (#474). Compiling every
+  rule in scope guarded every other rule's text per rule compiled, so a
+  forward store's recompile after a `production` write was quadratic in
+  the rules; the dependency edges are now memoised for the length of one
+  recompile, and a test counts the guard calls.
 - **A forward step's rounds guard counts only the deltas an action fed**
   (#472). A steady stream of commits from other threads used to trip it
   and drop the whole queue, losing those commits' derivations and

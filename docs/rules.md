@@ -503,7 +503,10 @@ that leaves its relation unbound -- it would read *every* relation,
 its own included, so that refusal says to bind the relation -- unless
 it is a family-wide read, below. The graph is the rule's own store's,
 plus the image's `def-rule`s -- a `:scope` does not widen it (see
-"Cross-store scope").
+"Cross-store scope"). A recompile of every rule in scope -- a forward
+store's after a `rule` or `production` write, `run-rules`' at its
+start -- guards each rule's text once for its own compile and once for
+its edges, not once per other rule (#474).
 
 **A family-wide read (#469).** `(claim ?p fam "ns" ?k ?r ?ons ?ok)`,
 the relation free under a *literal* family and a *literal* subject
