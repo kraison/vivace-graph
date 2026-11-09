@@ -89,23 +89,25 @@ edges.  With CHORDS, also an edge from every tenth node I to node
   "Breadth-first search in Lisp over OUTGOING-EDGES from vertex START to
 vertex GOAL.  Returns the hop count, or NIL when GOAL is unreachable.
 The loop shortest_path/4 will wrap (GH #45)."
-  (let ((seen (make-hash-table :test 'equal))
+  ;; TO is the target's id, a byte vector: EQUALP keys, LOOKUP-VERTEX
+  ;; for the next frontier.
+  (let ((seen (make-hash-table :test 'equalp))
         (goal-id (id goal))
         (frontier (list start))
         (hops 0))
     (setf (gethash (id start) seen) t)
     (loop
-      (when (some (lambda (v) (equal (id v) goal-id)) frontier)
+      (when (some (lambda (v) (equalp (id v) goal-id)) frontier)
         (return hops))
       (when (null frontier)
         (return nil))
       (let ((next nil))
         (dolist (v frontier)
           (dolist (e (outgoing-edges v :edge-type 'p-knows))
-            (let* ((to (graph-db:to e)) (key (id to)))
+            (let ((key (graph-db:to e)))
               (unless (gethash key seen)
                 (setf (gethash key seen) t)
-                (push to next)))))
+                (push (lookup-vertex key) next)))))
         (setf frontier next)
         (incf hops)))))
 
@@ -127,9 +129,12 @@ The loop shortest_path/4 will wrap (GH #45)."
 
 (defun pbp-ring-closure ()
   "The recursive case from *PBP-START* over the ring (GH #122).  Before
-tabling the ring loops to the inference bound: the case records :BOUND
-and no solutions.  After tabling it records :COMPLETE and the solution
-count.  A bound signal is caught here so the next bench runs."
+tabling the ring recurses until the inference bound (:BOUND) or, first
+on SBCL's default stack, until the control stack is gone
+\(:STACK-EXHAUSTED, the deferred trampoline question of #45); either is
+caught here so the run goes on.  After tabling it records :COMPLETE and
+the solution count.  Runs last in RUN-PROLOG-BENCH: an overflow is
+unwound, but what it was inside is not the next case's business."
   (let ((outcome :complete) (solutions 0))
     (timed-seconds ("recursive-ring-closure")
       (handler-case
@@ -138,7 +143,9 @@ count.  A bound signal is caught here so the next bench runs."
                           (lisp ?a *pbp-start*)
                           (pbp-path ?a ?x))))
         (graph-db:prolog-resource-error ()
-          (setf outcome :bound))))
+          (setf outcome :bound))
+        (storage-condition ()
+          (setf outcome :stack-exhausted))))
     (record "recursive-ring-outcome" :outcome outcome
             :solutions (if (eq outcome :bound) 0 solutions))))
 
@@ -148,7 +155,7 @@ The lookup key comes through a (lisp ...) goal, so one compiled query
 serves every key and the timed loop holds no compile.  Before #121 the
 assert cost grows with the clause count (a full recompile per assert)
 and the lookup is a linear scan."
-  (let ((n (scale 500)) (k (scale 200)))
+  (let ((n (scale 500)) (k (scale 5000)))
     (with-perf-prolog-graph (g)
       (timed-ops ("clause-assert" n)
         (dotimes (i n)
@@ -232,7 +239,8 @@ will wrap).  Starts and pairs are looked up before the timers start."
                               (output (report-pathname tag))
                               (only nil))
   "Run the five Prolog cases at SCALE and write a report to OUTPUT.  ONLY
-names one bench function to run alone, or NIL for all five in order.
+names one bench function to run alone, or NIL for all five, the
+recursive case last.
 Binds what RUN-PERF binds (benchmarks.lisp).  Returns T."
   (let* ((*perf-scale* scale)
          (system-dir (make-temp-directory))
@@ -250,9 +258,10 @@ Binds what RUN-PERF binds (benchmarks.lisp).  Returns T."
                (progn
                  (bench-clause-assert)
                  (bench-guarded-shape-repeat)
-                 (bench-recursive-ring)
                  (bench-change-feed-cursor)
-                 (bench-graph-predicates)))
+                 (bench-graph-predicates)
+                 ;; last: see PBP-RING-CLOSURE
+                 (bench-recursive-ring)))
            (write-perf-report output :tag tag))
       (graph-db-test-scratch:cleanup-scratch-run)))
   t)

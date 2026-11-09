@@ -1021,9 +1021,9 @@ Measurement-only; always returns T."
            ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
            (bench-clause-assert)
            (bench-guarded-shape-repeat)
-           (bench-recursive-ring)
            (bench-change-feed-cursor)
            (bench-graph-predicates)
+           (bench-recursive-ring)        ; last: see PBP-RING-CLOSURE
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).
