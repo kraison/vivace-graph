@@ -534,9 +534,10 @@ head is a non-variable symbol.  A bare variable (meta-call) is not static."
 (%commit BARRIER OUTER) compiles the remaining body under OUTER's cut scope (so
 a cut in a Then/Else or tail goal cuts the enclosing clause), then returns from
 BARRIER, committing the preceding goal to its first solution."
-  (destructuring-bind (barrier outer) (args goal)
+  (destructuring-bind (barrier outer outer-flag) (args goal)
     `(progn
-       ,(let ((*functor* outer)) (compile-body body cont bindings))
+       ,(let ((*functor* outer) (*clause-cut-flag* outer-flag))
+          (compile-body body cont bindings))
        (return-from ,barrier nil))))
 
 (def-prolog-compiler-macro not (goal body cont bindings)
@@ -555,7 +556,7 @@ rest of the body does not depend on G's bindings)."
                ;; rest compiled under the clause's *FUNCTOR* (cut after a not
                ;; cuts the clause); G compiled under the barrier (opaque).
                (rest-code (compile-body body cont bindings))
-               (g-code (let ((*functor* barrier))
+               (g-code (let ((*functor* barrier) (*clause-cut-flag* nil))
                          (compile-body (list (first args))
                                        `(lambda ()
                                           (setf ,found t)
@@ -574,11 +575,13 @@ body (which sees G's bindings).  G is an opaque cut barrier."
     (if (or (/= 1 (length args)) (not (static-goal-p (first args))))
         :pass
         (let ((barrier (prolog-gensym "ONCE"))
-              (outer *functor*))
+              (outer *functor*)
+              (outer-flag *clause-cut-flag*))
           `(block ,barrier
-             ,(let ((*functor* barrier))
+             ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                 (compile-body (list* (first args)
-                                     (list '%commit barrier outer)
+                                     (list '%commit barrier outer
+                                           outer-flag)
                                      body)
                               cont bindings)))))))
 
@@ -594,24 +597,28 @@ barrier; a cut in Then or Else cuts the enclosing clause."
         (destructuring-bind (test then &optional else) args
           (let ((barrier (prolog-gensym "IF"))
                 (trail (prolog-gensym "TRAIL"))
-                (outer *functor*))
+                (outer *functor*)
+                (outer-flag *clause-cut-flag*))
             ;; The Test->commit->Then->tail path is one walk so Test's bindings
             ;; thread into Then.  %commit returns from BARRIER after the first
             ;; Test solution; if Test never succeeds the block falls through.
             (if (= n 2)
                 `(block ,barrier
-                   ,(let ((*functor* barrier))
+                   ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                       (compile-body
-                       (list* test (list '%commit barrier outer) then body)
+                       (list* test (list '%commit barrier outer outer-flag)
+                              then body)
                        cont bindings)))
                 `(let ((,trail (fill-pointer *trail*)))
                    ;; BLOCK yields NIL when Test succeeded (return-from in
                    ;; %commit), or :TEST-FAILED when it fell through -- the
                    ;; latter is the only case in which Else runs.
                    (if (block ,barrier
-                         ,(let ((*functor* barrier))
+                         ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                             (compile-body
-                             (list* test (list '%commit barrier outer) then body)
+                             (list* test
+                                    (list '%commit barrier outer outer-flag)
+                                    then body)
                              cont bindings))
                          :test-failed)
                        (progn
@@ -669,17 +676,21 @@ Subsystems register (rules/facts.lisp, #451); core registers none.")
   (reduce (lambda (goals f) (funcall f goals))
           *clause-body-rewriters* :initial-value goals))
 
-(defun compile-clause (parms clause cont)
-  "Transform away the head, and compile the resulting body."
+(defun compile-clause (parms clause cont &key cut-flag)
+  "Transform away the head, and compile the resulting body.  CUT-FLAG,
+when given, is the symbol a cut in this clause sets before it returns
+from the clause block (design D3, GH #121); the top-level query
+builders pass none."
   (let ((body
          (bind-unbound-vars
           parms
-          (compile-body
-           (nconc
-            (mapcar #'make-= parms (args (clause-head clause)))
-            (%rewrite-clause-body (clause-body clause)))
-           cont
-           (mapcar #'self-cons parms)))))
+          (let ((*clause-cut-flag* cut-flag))
+            (compile-body
+             (nconc
+              (mapcar #'make-= parms (args (clause-head clause)))
+              (%rewrite-clause-body (clause-body clause)))
+             cont
+             (mapcar #'self-cons parms))))))
     (when *prolog-trace*
       (format t "TRACE: ~A BODY:~% ~A~%" (clause-head clause) body))
     body))
@@ -772,9 +783,8 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
     ((or (eq (first body) '!) (eq (first body) 'cut)
          (equalp (first body) "cut"))
      `(progn ,(compile-body (rest body) cont bindings)
-             ,(if *functor*
-                  `(return-from ,*functor* nil)
-                  `(return-from :prolog-select nil))))
+             ,@(when *clause-cut-flag* `((setf ,*clause-cut-flag* t)))
+             (return-from ,(or *functor* :prolog-select) nil)))
     (t
      (when *prolog-trace*
        (format t "TRACE: GOAL: ~A~%" (first body)))

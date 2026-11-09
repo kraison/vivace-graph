@@ -414,6 +414,11 @@ strictly-safe pre-durability abort.")
 (defvar *trail* (make-array 200 :fill-pointer 0 :adjustable t))
 (defvar *var-counter* 0 "Counter for generating variable names.")
 (defvar *functor* nil "The Prolog functor currently being compiled.")
+(defvar *clause-cut-flag* nil
+  "While a clause body compiles into its own closure: the symbol of
+that closure's CUT variable, set by a cut before it returns from the
+clause block.  NIL at top level and under a barrier (clause indexing
+design D3, GH #121).")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 
