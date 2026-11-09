@@ -75,14 +75,17 @@ written inline, not by a worker.
 ### Unit 3: tracer and `explain` (#124)
 
 Before tabling, because the issue is right that tabling is opaque
-without it. **Calls:** the 4-port trace is compiled into a predicate
-only when it is traced (`trace-prolog` takes names and recompiles
-them), so untraced code pays nothing; `explain` takes the guard's
-`(vars goals)` and reports, per goal, the functor and the access path
-it would take for that binding pattern, read from a registry the
-index-backed routes (#102, spacetime's `claim/7` routes) declare
-themselves in. Acceptance per the issue: a readable 4-port trace of a
-recursive query, and `explain` confirming index use. Inline.
+without it. **Calls (revised 2026-11-09 with the design):** the 4-port
+trace is a runtime hook checked where every goal call already checks
+`*prolog-trace*`, so an untraced call costs what it costs today and
+nothing is recompiled; `explain` takes the guard's `(vars goals)` and
+reports, per goal, the functor and the access path it would take for
+that binding pattern, read from a registry the index-backed routes
+(#102, spacetime's `claim/7` routes) declare themselves in, and for an
+asserted functor how many clauses unit 2's index leaves. Acceptance per
+the issue: a readable 4-port trace of a recursive query, and `explain`
+confirming index use. Inline. Design:
+`2026-11-09-tracer-explain-design.md`.
 
 ### Unit 4: tabling for `select` (#122, Unit 2)
 
@@ -131,8 +134,10 @@ and spacetime layer, not engine core: local-agent with a design note.
 
 ## Order and why
 
-1 banks the small items and unblocks consumers. 2 and 3 are
-independent of everything and make 4 cheaper to build and to debug. 4
+1 banks the small items and unblocks consumers. 2 and 3 make 4 cheaper
+to build and to debug; 3 reads unit 2's dispatcher for its clause events
+and candidate counts, so it branches from `experiment` once unit 2 has
+landed (PR #483). 4
 before 5 because 5's reachability is a tabled predicate. 6 and 7 are
 performance work with their own benches and slip without taking
 anything with them.
