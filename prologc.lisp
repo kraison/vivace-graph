@@ -1010,7 +1010,8 @@ goal recurses runs in constant stack as the old single function did
                         (let ((hook *prolog-port-hook*))
                         (when hook
                           (funcall hook :clause (functor-name functor)
-                                   (list pos n) *prolog-port-depth*)))
+                                   (list pos (length fns))
+                                   *prolog-port-depth*)))
                         (funcall (svref fns pos) nil ,@parameters cont)))
                      (t
                       (let ((cell (list nil)))
@@ -1020,7 +1021,8 @@ goal recurses runs in constant stack as the old single function did
                             (let ((hook *prolog-port-hook*))
                             (when hook
                               (funcall hook :clause (functor-name functor)
-                                       (list pos n) *prolog-port-depth*)))
+                                       (list pos (length fns))
+                                   *prolog-port-depth*)))
                             (funcall (svref fns pos) cell ,@parameters cont))
                           (when (car cell)
                             (return-from dispatch nil)))
@@ -1029,7 +1031,8 @@ goal recurses runs in constant stack as the old single function did
                           (let ((hook *prolog-port-hook*))
                           (when hook
                             (funcall hook :clause (functor-name functor)
-                                     (list pos n) *prolog-port-depth*)))
+                                     (list pos (length fns))
+                                   *prolog-port-depth*)))
                           (funcall (svref fns pos) nil
                                    ,@parameters cont)))))))))))))
      functor)))

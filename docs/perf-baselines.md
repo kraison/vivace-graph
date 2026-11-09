@@ -156,3 +156,13 @@ GH #255.)
   runs inside edge-generator frames, not a tail call); it does so in
   0.065 s against 0.09 s before, a smaller frame per level, not a
   change of outcome. The other rows are unchanged within noise.
+- **Unit 3, tracer and explain, after** (#124):
+  `results/prolog-after-u3-odm-d1b81b7.report`, same host, SBCL and
+  generation, 2026-11-09, third of three runs. The untraced call path
+  is unchanged within noise against the unit 2 report: `k-hop-3-select`
+  2,273/s (was 2,041/s; runs 1 and 2: 2,041, 2,128), bound lookups
+  277,762/s (was 263,144/s), `guarded-shape-repeat` 1,475/s (was
+  1,256/s). The new `traced-k-hop-3-select` row runs the same query
+  under `trace-prolog` to a null stream: 1,099/s (runs 1 and 2: 1,266,
+  1,408), so tracing roughly halves this query's throughput when it is
+  on and costs nothing when it is off.

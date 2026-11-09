@@ -91,7 +91,9 @@ arguments, `(port functor args depth)`. `port` is `:call`, `:exit`,
 `args` a fresh list of the goal's arguments as passed (dereferenced by
 the hook if it wants values); `depth` the number of goal calls open
 above this one. For `:clause`, `args` is `(position count)`: the
-candidate the dispatcher is about to try and how many it has.
+clause the dispatcher is about to try, 0-based among the functor's
+`count` clauses in source order (so a trace shows which clause, and
+how many clause events a call fired shows how many the index left).
 
 `compile-call` emits
 
@@ -146,7 +148,8 @@ line per port to `*trace-output*`:
 Arguments are printed dereferenced (`deref-exp`), nodes as their
 printed form, with `*print-length*` and `*print-level*` bound to 8 and
 3 so a long list cannot flood the stream. `:clause` prints as
-`  [2]   CLAUSE ancestor/2 2/2`. `untrace-prolog` sets the hook to nil.
+`  [2]   CLAUSE ancestor/2 2/2`, the clause's 1-based position over the
+functor's clause count. `untrace-prolog` sets the hook to nil.
 `call-with-prolog-ports (hook thunk)` and `with-prolog-ports ((port
 functor args depth) &body)` bind the hook dynamically for one extent,
 which is what `profile-goals` and tests use.
@@ -182,8 +185,8 @@ argument bound by an earlier goal, not a literal) is reported as
 decided at run time: "first-argument index: by value at run time, N
 clauses" for an asserted functor, "ordered index: class and slot by
 value at run time" for `find-by-slot`, and so on; the registry
-function receives the literal where there is one and `:bound` where
-there is not.
+function sees the argument as written and `bound` says whether an
+earlier goal bound it.
 
 **A path a budget may refuse** says so in its string whatever the
 budget, since the walk cannot know it: `claim/7`'s family walk reads
@@ -191,8 +194,12 @@ budget, since the walk cannot know it: `claim/7`'s family walk reads
 cost-unbounded carries ", cost-unbounded".
 
 **Access paths** come from a registry: `(register-access-path
-functor-symbol function)`, the function of `(bound-list args graph)`
-returning the path string. Core registers:
+functor-symbol function)`, the function of `(bound args graph)`
+returning the path string: `bound` one boolean per argument, `args`
+the goal's arguments as written (a variable keeps its symbol, so the
+path can name it), `graph` the graph explained against. (Revised in
+Task 3 from a `:bound` placeholder: the printed path needs the
+variable's name.) Core registers:
 
 | functor | bound | path |
 |---|---|---|

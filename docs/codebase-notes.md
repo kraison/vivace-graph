@@ -74,6 +74,12 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   summing a parent and its subtypes counts them twice. Pass
   `:include-subclasses-p nil` to every non-leaf type when the counts must
   add up (GH #219).
+- **Ask `graph-db:explain-goals` before guessing a goal's cost.** It
+  names, per goal, the access path the engine will take for that
+  binding pattern (type index, adjacency index, ordered index, a
+  `claim/7` route, or a scan) without running anything;
+  `graph-db:profile-goals` runs the query and counts each functor's
+  ports (GH #124, manual Chapter 6).
 - **Bind the first argument of an asserted predicate when you can.** A
   call to a `<-`-defined functor with a bound first argument tries only
   the clauses whose first head argument can unify with it; unbound, it

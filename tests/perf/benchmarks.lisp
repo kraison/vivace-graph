@@ -1024,6 +1024,7 @@ Measurement-only; always returns T."
            (bench-guarded-shape-repeat)
            (bench-change-feed-cursor)
            (bench-graph-predicates)
+           (bench-traced-k-hop)
            (bench-recursive-ring)        ; last: see PBP-RING-CLOSURE
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
