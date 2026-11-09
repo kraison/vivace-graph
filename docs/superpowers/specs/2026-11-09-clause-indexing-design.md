@@ -2,7 +2,9 @@
 
 **Issue:** GH #121, unit 2 of the Prolog Engine 5.0 scope
 (`2026-11-09-prolog-engine-5.0-scope.md`). **Status:** proposed
-2026-11-09; the calls are the author's, Kevin's review pending.
+2026-11-09, revised the same day after a builder check (its seven
+questions are settled in D1 to D6 below); the calls are the author's,
+Kevin's review pending.
 
 ## Intent
 
@@ -18,8 +20,9 @@ the functor registry behaving as they do now.
 
 ## Goals
 
-- `<-` compiles the new clause and nothing else: assert cost is
-  independent of the clause count.
+- `<-` compiles the new clause and nothing else: the compile cost of
+  an assert is independent of the clause count. The bookkeeping is one
+  vector copy per assert (D5), microseconds at ten thousand clauses.
 - A call whose first argument is bound tries only the clauses whose
   first head argument can unify with it; an unbound first argument
   tries every clause, in source order, as today.
@@ -47,21 +50,28 @@ the functor registry behaving as they do now.
 
 - `add-clause` (prologc.lisp:687) finds or makes the `functor` struct
   (functor.lisp: `name fn clauses lock`) and `add-functor-clause`
-  appends the clause under the functor's recursive lock and calls
-  `prolog-compile`, which is `compile-functor`: one `(lambda (args...
+  appends the clause under the functor's recursive lock and calls the
+  `prolog-compile` method (prologc.lisp:178): `prolog-compile-null`
+  for no clauses, else `prolog-compile-help`, whose per-arity loop
+  reaches `compile-functor` (prologc.lisp:749): one `(lambda (args...
   cont) (block NAME clause1 (undo-bindings) clause2 ...))`, `eval`ed,
   stored with `set-functor-fn`. The functor's name is `NAME/ARITY`, so
-  every clause of a functor has one arity and `prolog-compile-help`'s
-  per-arity loop is vestigial.
+  every clause of a functor has one arity and the per-arity loop is
+  vestigial. The function's value is the last clause's and no caller
+  reads it: `compile-call` discards it and `%solve`'s callers discard
+  `%solve`'s.
 - `compile-clause` (prologc.lisp:672) turns the head into `=` goals on
   the parameters and compiles the body through `compile-body`, where a
-  cut is `(return-from ,*functor* nil)`; `*functor*` is the block name,
-  rebound to a barrier gensym by the `not`, `once` and `if` compiler
-  macros, and restored by `%commit` for the goals after a committed
-  one.
-- `compile-call` (prologc.lisp:245) fetches `(get-functor-fn 'NAME/N)`
-  at each call and funcalls it with the arguments and the continuation;
-  `%solve` does the same for a dynamic meta-call.
+  cut is `(return-from ,*functor* nil)` when `*functor*` is bound, else
+  `(return-from :prolog-select nil)`, the block `select` and its
+  shorthands open (prologc.lisp:774-777, 1136); `*functor*` is the
+  block name, rebound to a barrier gensym by the `not`, `once` and `if`
+  compiler macros, and restored by `%commit` for the goals after a
+  committed one.
+- `compile-call` (prologc.lisp:245) fetches `(get-functor-fn 'NAME/N)`,
+  falling back to `*prolog-global-functors*`, at each call and funcalls
+  it with the arguments and the continuation; `%solve` does the same
+  for a dynamic meta-call.
 - `unify` succeeds on `prolog-equal`: numbers by `=`, strings by
   `string=`, a string and a keyword by `string-equal`, characters by
   `char=`, arrays by `equalp`, nodes by id, else `equal`. It is a
@@ -82,10 +92,14 @@ A clause compiles once, when it is added, into its own function of
     cut))
 ```
 
-`eval`ed as today (one small lambda, not the whole functor). The
-closure returns true when its body executed a cut, nil otherwise. The
-`functor` struct gains `arity` and `clause-fns`, a simple vector of
-these closures parallel to `functor-clauses`.
+`eval`ed as today (one small lambda, not the whole functor), with
+`*functor*` bound to `CLAUSE-BLOCK` while the body compiles, so the
+cut's `return-from` names it. The closure returns true when its body
+executed a cut, nil otherwise. The `functor` struct gains `arity`, set
+from the first clause's head (the name's `/N` suffix is not parsed; a
+later clause of another arity is a `prolog-error`), `dispatcher` (D2)
+and `clause-set` (D5): the compiled closures, the index and the
+variable positions, published together.
 
 ### D2. The dispatcher
 
@@ -101,12 +115,18 @@ arity-specific dispatcher as the functor's `fn`:
 ```
 
 Built by `eval` of a template over the arity when the functor gets its
-first clause (or at `make-functor :clauses`), closing over the struct.
-A later assert does not touch `fn`: the dispatcher reads `clause-fns`
-and the index at call time. The clause-less functor keeps today's
-`(lambda (&rest args) nil)`. `set-functor-fn` still replaces `fn`
-wholesale, for the top-level query functors and tests that swap a
-functor's function.
+first clause (or at `make-functor :clauses`), closing over the struct,
+and kept in the `dispatcher` slot. A later assert reinstalls it as `fn`
+only when `fn` is not `eq` to it, which is today's behaviour for a
+functor whose function was set by `set-functor-fn` and then given a
+clause: the assert wins. Otherwise the dispatcher reads the current
+`clause-set` at call time and `fn` is untouched. The clause-less
+functor keeps today's `(lambda (&rest args) nil)`; `set-functor-fn`
+still replaces `fn` wholesale, for the top-level query builders. The
+dispatcher's value is nil, which no caller reads (above). One Lisp
+frame per Prolog call level is added (dispatcher, then clause closure);
+untabled deep recursion exhausts the stack a little sooner, which unit
+4 is what answers.
 
 ### D3. The cut
 
@@ -115,7 +135,7 @@ functor's function.
 ```lisp
 (progn ,rest
        ,@(when *clause-cut-flag* `((setf ,*clause-cut-flag* t)))
-       (return-from ,*functor* nil))
+       (return-from ,(or *functor* :prolog-select) nil))
 ```
 
 with a new special `*clause-cut-flag*` (globals.lisp, beside
@@ -150,7 +170,9 @@ does not cover. The key of a value `x`, after dereferencing:
 | number | `(:number . <rational of x>)` |
 | character | the character |
 | cons | `:cons` |
-| anything else (node, timestamp, array, object) | `:opaque` |
+| non-string array | no key: every clause (`equalp` can equal a string) |
+| a float `rational` refuses (infinity, NaN) | no key: every clause |
+| anything else (node, timestamp, object) | `:opaque` |
 
 The keys are supersets of `prolog-equal`: `1` and `1.0` share a key
 through `rational`; a string and a keyword share one case-insensitively
@@ -158,7 +180,8 @@ through `rational`; a string and a keyword share one case-insensitively
 unification tells them apart, which is allowed: a bucket may hold
 clauses that fail, never miss one that matches). A clause whose first
 head argument is a literal with a key goes under that key; a variable
-head, or a literal keyed `:opaque`, goes to `var-positions`. A call
+head, or a literal keyed `:opaque` or an array, goes to
+`var-positions`. A call
 with key `k` tries the merge, by position, of `index[k]` and
 `var-positions`; a call with key `:opaque` tries `var-positions` only
 (no clause head can hold a node). Arity 0 has no index: every clause.
@@ -170,16 +193,17 @@ that walk.
 ### D5. Concurrency
 
 Writers (`add-functor-clause`, `reset-functor`) hold the functor's
-recursive lock, as today. Readers take no lock on SBCL, CCL and
-LispWorks: `clause-fns`, each bucket vector and `var-positions` are
-replaced by fresh vectors (copy on write, one `replace`), never
-mutated in place, so a reader sees a consistent old or new vector; the
-index table is created `:synchronized t` on SBCL and its equivalent
-where one exists. On ECL, which has no thread-safe hash tables, the
-dispatcher reads the index under the functor's lock, the same rule
-`with-user-functors-lock` applies to the registry. Position vectors are
-of fixnums; `clause-fns` grows by copy, so an assert is O(clauses) in
-copying and O(1) in compilation, which is the point.
+recursive lock, as today. The closures, the index and the variable
+positions live in one immutable `clause-set` struct; an assert builds a
+new one (fresh vectors by `replace`, a fresh index table) and stores it
+in the functor's slot in one write, so a reader that fetched the slot
+sees the three consistent with each other and never a position past
+its vector. Readers take no lock on SBCL, CCL and LispWorks and read
+the set's table concurrently with nobody writing it. On ECL, which has
+no thread-safe hash tables, the dispatcher fetches the set under the
+functor's lock, the rule `with-user-functors-lock` applies to the
+registry. Position vectors are of fixnums; the copy is O(clauses) per
+assert and the compile O(1), which is the point.
 
 ### D6. Compatibility
 
@@ -191,9 +215,9 @@ copying and O(1) in compilation, which is the point.
   `var-positions`, and installs the null function; `delete-functor` is
   unchanged.
 - `prolog-compile-help` and `clauses-with-arity` go: a functor has one
-  arity, from its name's `/N` suffix, checked against each clause's
-  head (a mismatch is a `prolog-error`, where today it is compiled into
-  a separate function the name can never reach).
+  arity, the first clause's, checked against each later clause's head
+  (a mismatch is a `prolog-error`, where today it is compiled into a
+  separate function the name can never reach).
 - The `*clause-indexing*` switch (globals.lisp, default `t`): when
   nil, the dispatcher tries every clause in order and ignores the
   index. It exists for a `prolog-equal` specialisation that widens
@@ -238,7 +262,8 @@ unchanged and green:
 
 ## Measurement
 
-Before, from unit 1b on odm (SBCL 2.6.6, experiment 4a5422e):
+Before, from unit 1b on odm (SBCL 2.6.6, bench commit 55240fd,
+`tests/perf/results/prolog-before-odm-55240fd.report`):
 `clause-assert` 16/s, `clause-bound-first-arg` 49,998/s over 500
 clauses. After: the same bench, third run, on #121; plus one run of a
 10,000-fact table (the issue's "realistic clause count"), assert
