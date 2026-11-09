@@ -139,6 +139,8 @@
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; explain-goals: the static account of a goal list (GH #124)
+               (:file "prolog-explain" :depends-on ("index"))
                ;; Counting index (GH #361): its own registry and graph
                ;; slot, parallel to DEF-INDEX's.
                (:file "count-index" :depends-on ("index"))

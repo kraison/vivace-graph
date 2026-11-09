@@ -178,3 +178,95 @@ whatever package the functor symbol lives in (review focus 4)."
   (graph-db:trace-prolog)
   (graph-db:untrace-prolog)
   (is (null graph-db:*prolog-port-hook*)))
+
+;;; explain-goals (design D3).
+
+(def-vertex te-item ()
+  ((code :type string :index t)
+   (label))
+  :graph-db-integration-test)
+
+(defun te-paths (vars goals)
+  (mapcar (lambda (row) (getf row :path))
+          (graph-db:explain-goals vars goals)))
+
+(test te-explain-type-slot-and-edge-paths
+  (with-test-graph (g)
+    (declare (ignore g))
+    (is (equal '("type index: G-PERSON" "slot read" "ve-out index of ?P")
+               (te-paths '(?n) '((is-a ?p g-person)
+                                 (node-slot-value ?p name ?n)
+                                 (g-knows ?p ?q)))))
+    (is (equal "type check"
+               (second (te-paths '(?t) '((is-a ?p g-person) (is-a ?p ?t))))))
+    (is (search "every vertex" (first (te-paths '(?p ?t) '((is-a ?p ?t))))))
+    (is (search "not a type"
+                (first (te-paths '(?p) '((is-a ?p te-no-such-type))))))
+    (is (equal "vev index: one lookup"
+               (third (te-paths '(?a) '((is-a ?a g-person) (is-a ?b g-person)
+                                        (g-knows ?a ?b))))))
+    (is (equal "ve-in index of ?B"
+               (second (te-paths '(?b) '((is-a ?b g-person) (g-knows ?a ?b))))))
+    (is (equal "every G-KNOWS edge"
+               (first (te-paths '(?a) '((g-knows ?a ?b))))))
+    (is (equal "every vertex of every type"
+               (first (te-paths '(?n) '((node-slot-value ?p name ?n))))))))
+
+(test te-explain-asserted-functor-candidates
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((te-k 2))
+      (<- (te-k a 1)) (<- (te-k b 2)) (<- (te-k ?v 3))
+      (let ((rows (graph-db:explain-goals '(?r) '((te-k a ?r)))))
+        (is (eq :user (getf (first rows) :kind)))
+        (is (equal '(2 . 3) (getf (first rows) :candidates)))
+        (is (equal "first-argument index: 2 of 3 clauses"
+                   (getf (first rows) :path))))
+      (is (equal "every clause: 3"
+                 (first (te-paths '(?k ?r) '((te-k ?k ?r))))))
+      (is (search "by value at run time, 3 clauses"
+                  (second (te-paths '(?r) '((= ?k a) (te-k ?k ?r)))))))))
+
+(test te-explain-unknown-functor-and-binding-through-not
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((rows (graph-db:explain-goals '(?x) '((te-no-such-pred ?x)
+                                                 (is-a ?x g-person)))))
+      (is (eq :unknown (getf (first rows) :kind)))
+      (is (= 2 (length rows))))
+    ;; ?Q is bound inside the not and unbound after it.
+    (is (equal "ve-out index of ?P"
+               (third (te-paths '(?p) '((is-a ?p g-person)
+                                        (not (g-knows ?p ?q))
+                                        (g-knows ?p ?q))))))
+    (is (search "meta-call" (first (te-paths '(?g) '((call ?g))))))))
+
+(test te-explain-index-paths
+  (with-test-graph (g)
+    (declare (ignore g))
+    (is (search "ordered index on TE-ITEM.CODE"
+                (first (te-paths '(?n)
+                                 '((find-by-slot ?n te-item code "x"))))))
+    (is (search "the call signals"
+                (first (te-paths '(?n)
+                                 '((find-by-slot ?n te-item label "x"))))))
+    (is (search "the call signals"
+                (first (te-paths '(?n)
+                                 '((find-by-unique ?n te-item code "x"))))))
+    (is (search "by value at run time"
+                (second (te-paths '(?n)
+                                  '((= ?s code)
+                                    (find-by-slot ?n te-item ?s "x"))))))))
+
+(test te-explain-prints-a-table-and-flags-cost-unbounded
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let* ((rows nil)
+           (text (with-output-to-string (s)
+                   (setf rows (graph-db:explain-goals
+                               '(?p) '((is-a ?p g-person)
+                                       (regex-match "a+" "aaa"))
+                               :stream s)))))
+      (is (= 2 (length rows)))
+      (is (search "IS-A/2" text))
+      (is (search "cost-unbounded" (getf (second rows) :path))))))

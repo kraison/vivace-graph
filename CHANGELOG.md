@@ -16,6 +16,14 @@ storage formats (#60).
 
 ### Added
 
+- **`explain-goals`** (#124): one row per goal of a query, without
+  running it, naming the functor it resolves to, which arguments are
+  bound there, and the access path it takes, from a registry
+  (`register-access-path`) the type, slot, edge, ordered-index, unique
+  and spatial predicates fill; an asserted functor reports how many of
+  its clauses the first-argument index leaves; a path decided by a
+  value only known at run time says so; a cost-unbounded functor is
+  flagged.
 - **A 4-port trace hook** (#124). `*prolog-port-hook*`, when bound,
   is called at the call, exit, redo and fail of every goal call and
   every dynamic meta-call, and at a clause event when a dispatcher

@@ -317,6 +317,24 @@ its parts the same way, so every path spells the identical symbol
                   :reason (format nil "unknown Prolog functor ~A" ',functor)
                   :ball (existence-error-ball :procedure ',functor))))))
 
+(defvar *access-paths*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "NAME/ARITY functor symbol -> a function of (BOUND ARGS GRAPH) naming
+the access path the functor takes for a call whose arguments are bound
+as BOUND says (explain design D3, GH #124).")
+
+(defun register-access-path (functor-symbol function)
+  "FUNCTION, of (BOUND ARGS GRAPH) returning a string, describes
+FUNCTOR-SYMBOL's access path to EXPLAIN-GOALS: BOUND a list of
+booleans, one per argument; ARGS the goal's arguments as written, a
+variable's symbol where the walk has no value (GH #124)."
+  (setf (gethash functor-symbol *access-paths*) function))
+
 (defun %ported-call (hook functor func args cont)
   "FUNC applied to ARGS and a continuation, with HOOK's ports (tracer
 design D1, GH #124): :CALL at the entry depth D, the callee's own goals
