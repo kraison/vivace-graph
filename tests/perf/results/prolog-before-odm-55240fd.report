@@ -1,0 +1,23 @@
+;;;; graph-db perf report
+;;;; tag=prolog impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; clause-assert                          OPS 500  SECONDS 31.317  OPS/S 16  
+;; clause-bound-first-arg                 OPS 5000  SECONDS 0.1  OPS/S 49998  
+;; guarded-shape-repeat                   OPS 500  SECONDS 0.414  OPS/S 1208  
+;; change-feed-cursor                     SECONDS 6.9  
+;; change-feed-cursor-rows                ROWS 1000  
+;; k-hop-3-select                         OPS 100  SECONDS 0.049  OPS/S 2041  
+;; shortest-path-lisp-bfs                 OPS 100  SECONDS 0.152  OPS/S 658  
+;; recursive-ring-closure                 SECONDS 0.09  
+;; recursive-ring-outcome                 OUTCOME STACK-EXHAUSTED  SOLUTIONS 0  
+
+(:PERF-REPORT :TAG "prolog" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 5
+ :HOST "odm" :ENTRIES
+ (("clause-assert" :OPS 500 :SECONDS 31.317 :OPS/S 16)
+  ("clause-bound-first-arg" :OPS 5000 :SECONDS 0.1 :OPS/S 49998)
+  ("guarded-shape-repeat" :OPS 500 :SECONDS 0.414 :OPS/S 1208)
+  ("change-feed-cursor" :SECONDS 6.9) ("change-feed-cursor-rows" :ROWS 1000)
+  ("k-hop-3-select" :OPS 100 :SECONDS 0.049 :OPS/S 2041)
+  ("shortest-path-lisp-bfs" :OPS 100 :SECONDS 0.152 :OPS/S 658)
+  ("recursive-ring-closure" :SECONDS 0.09)
+  ("recursive-ring-outcome" :OUTCOME :STACK-EXHAUSTED :SOLUTIONS 0)))

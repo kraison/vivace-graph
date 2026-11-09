@@ -74,6 +74,11 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   summing a parent and its subtypes counts them twice. Pass
   `:include-subclasses-p nil` to every non-leaf type when the counts must
   add up (GH #219).
+- **Bind the first argument of an asserted predicate when you can.** A
+  call to a `<-`-defined functor with a bound first argument tries only
+  the clauses whose first head argument can unify with it; unbound, it
+  tries them all in order (first-argument indexing, GH #121, manual
+  Chapter 6). Asserting a clause compiles that clause only.
 - **Pass `:collect-p t` only when you use the list,** since it builds one
   cons per edge.
 - **Key a hash table by an id, with `:test 'equalp`.** An id is a 16-byte

@@ -165,26 +165,40 @@ present, so an error from the continuation after Goal succeeds is not caught.")
 (defmethod clause-head ((list list))
   (first list))
 
-(defun prolog-compile-help (functor clauses)
-  ;; Base case: stop once every clause has been compiled.  Without this guard,
-  ;; (first nil) -> nil, relation-arity -> 0, and the function recurses forever
-  ;; on the empty clause set, repeatedly compiling a degenerate arity-0 functor
-  ;; -- which hangs the Lisp compiler.  This made every <- rule definition hang.
-  (unless (null clauses)
-    (let ((arity (relation-arity (clause-head (first clauses)))))
-      (compile-functor functor arity (clauses-with-arity clauses #'= arity))
-      (prolog-compile-help functor (clauses-with-arity clauses #'/= arity)))))
+(defun %clause-arity (functor clause)
+  "CLAUSE's head arity, checked against FUNCTOR's; the first clause
+sets it (design D6, GH #121)."
+  (let ((n (relation-arity (clause-head clause)))
+        (arity (functor-arity functor)))
+    (cond ((null arity) (setf (functor-arity functor) n))
+          ((/= n arity)
+           (error 'prolog-error
+                  :reason (format nil "clause ~S has arity ~D; functor ~A ~
+has arity ~D" (clause-head clause) n (functor-name functor) arity))))
+    n))
 
 (defmethod prolog-compile ((functor functor))
-  (if (null (functor-clauses functor))
-      (prolog-compile-null functor)
-      (prolog-compile-help functor (functor-clauses functor))))
-
-(defun clauses-with-arity (clauses test arity)
-  "Return all clauses whose head has given arity."
-  (find-all arity clauses
-            :key #'(lambda (clause) (relation-arity (clause-head clause)))
-            :test test))
+  "FUNCTOR's clauses compiled afresh: none, the null function; else each
+through %ADD-COMPILED-CLAUSE after one arity check over all of them, so
+a mixed MAKE-FUNCTOR :CLAUSES list signals and leaves a registered
+functor with no clauses (design D6, GH #121)."
+  (let ((clauses (functor-clauses functor)))
+    (setf (functor-clauses functor) nil
+          (functor-arity functor) nil
+          (functor-dispatcher functor) nil
+          (functor-clause-set functor) (%make-clause-set))
+    (prolog-compile-null functor)
+    (when clauses
+      (let ((arity (relation-arity (clause-head (first clauses)))))
+        (dolist (clause clauses)
+          (unless (= arity (relation-arity (clause-head clause)))
+            (error 'prolog-error
+                   :reason (format nil "clause ~S has arity ~D; functor ~
+~A has arity ~D" (clause-head clause)
+                                   (relation-arity (clause-head clause))
+                                   (functor-name functor) arity)))))
+      (dolist (clause clauses)
+        (%add-compiled-clause functor clause)))))
 
 (defun relation-arity (relation)
   "The number of arguments to a relation.
@@ -534,9 +548,10 @@ head is a non-variable symbol.  A bare variable (meta-call) is not static."
 (%commit BARRIER OUTER) compiles the remaining body under OUTER's cut scope (so
 a cut in a Then/Else or tail goal cuts the enclosing clause), then returns from
 BARRIER, committing the preceding goal to its first solution."
-  (destructuring-bind (barrier outer) (args goal)
+  (destructuring-bind (barrier outer outer-flag) (args goal)
     `(progn
-       ,(let ((*functor* outer)) (compile-body body cont bindings))
+       ,(let ((*functor* outer) (*clause-cut-flag* outer-flag))
+          (compile-body body cont bindings))
        (return-from ,barrier nil))))
 
 (def-prolog-compiler-macro not (goal body cont bindings)
@@ -555,7 +570,7 @@ rest of the body does not depend on G's bindings)."
                ;; rest compiled under the clause's *FUNCTOR* (cut after a not
                ;; cuts the clause); G compiled under the barrier (opaque).
                (rest-code (compile-body body cont bindings))
-               (g-code (let ((*functor* barrier))
+               (g-code (let ((*functor* barrier) (*clause-cut-flag* nil))
                          (compile-body (list (first args))
                                        `(lambda ()
                                           (setf ,found t)
@@ -574,11 +589,13 @@ body (which sees G's bindings).  G is an opaque cut barrier."
     (if (or (/= 1 (length args)) (not (static-goal-p (first args))))
         :pass
         (let ((barrier (prolog-gensym "ONCE"))
-              (outer *functor*))
+              (outer *functor*)
+              (outer-flag *clause-cut-flag*))
           `(block ,barrier
-             ,(let ((*functor* barrier))
+             ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                 (compile-body (list* (first args)
-                                     (list '%commit barrier outer)
+                                     (list '%commit barrier outer
+                                           outer-flag)
                                      body)
                               cont bindings)))))))
 
@@ -594,24 +611,28 @@ barrier; a cut in Then or Else cuts the enclosing clause."
         (destructuring-bind (test then &optional else) args
           (let ((barrier (prolog-gensym "IF"))
                 (trail (prolog-gensym "TRAIL"))
-                (outer *functor*))
+                (outer *functor*)
+                (outer-flag *clause-cut-flag*))
             ;; The Test->commit->Then->tail path is one walk so Test's bindings
             ;; thread into Then.  %commit returns from BARRIER after the first
             ;; Test solution; if Test never succeeds the block falls through.
             (if (= n 2)
                 `(block ,barrier
-                   ,(let ((*functor* barrier))
+                   ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                       (compile-body
-                       (list* test (list '%commit barrier outer) then body)
+                       (list* test (list '%commit barrier outer outer-flag)
+                              then body)
                        cont bindings)))
                 `(let ((,trail (fill-pointer *trail*)))
                    ;; BLOCK yields NIL when Test succeeded (return-from in
                    ;; %commit), or :TEST-FAILED when it fell through -- the
                    ;; latter is the only case in which Else runs.
                    (if (block ,barrier
-                         ,(let ((*functor* barrier))
+                         ,(let ((*functor* barrier) (*clause-cut-flag* nil))
                             (compile-body
-                             (list* test (list '%commit barrier outer) then body)
+                             (list* test
+                                    (list '%commit barrier outer outer-flag)
+                                    then body)
                              cont bindings))
                          :test-failed)
                        (progn
@@ -669,17 +690,21 @@ Subsystems register (rules/facts.lisp, #451); core registers none.")
   (reduce (lambda (goals f) (funcall f goals))
           *clause-body-rewriters* :initial-value goals))
 
-(defun compile-clause (parms clause cont)
-  "Transform away the head, and compile the resulting body."
+(defun compile-clause (parms clause cont &key cut-flag)
+  "Transform away the head, and compile the resulting body.  CUT-FLAG,
+when given, is the symbol a cut in this clause sets before it returns
+from the clause block (design D3, GH #121); the top-level query
+builders pass none."
   (let ((body
          (bind-unbound-vars
           parms
-          (compile-body
-           (nconc
-            (mapcar #'make-= parms (args (clause-head clause)))
-            (%rewrite-clause-body (clause-body clause)))
-           cont
-           (mapcar #'self-cons parms)))))
+          (let ((*clause-cut-flag* cut-flag))
+            (compile-body
+             (nconc
+              (mapcar #'make-= parms (args (clause-head clause)))
+              (%rewrite-clause-body (clause-body clause)))
+             cont
+             (mapcar #'self-cons parms))))))
     (when *prolog-trace*
       (format t "TRACE: ~A BODY:~% ~A~%" (clause-head clause) body))
     body))
@@ -746,21 +771,174 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
     (set-functor-fn *functor*
                     #'(lambda (&rest args) (declare (ignore args)) nil))))
 
-(defun compile-functor (functor arity clauses)
-  "Compile all the clauses for a given symbol/arity into a single LISP
- function."
-  (let ((*functor* (functor-name functor))
-        (parameters (make-parameters arity)))
-    (let ((func `#'(lambda (,@parameters cont)
-                     (block ,*functor*
-                       .,(maybe-add-undo-bindings
-                          (mapcar
-                           #'(lambda (clause)
-                               (compile-clause parameters clause 'cont))
-                           clauses))))))
-      (when *prolog-trace*
-        (format t "TRACE: Adding ~A to ~A~%" func *functor*))
-      (set-functor-fn *functor* (eval func)))))
+(defun %compile-clause-fn (functor clause)
+  "CLAUSE as its own closure of (CELL ARG1 .. ARGN CONT) (design D1,
+GH #121).  CELL is the dispatcher's cut cell, a cons whose car a cut
+in this clause sets, or NIL when the dispatcher will not look (its
+last candidate); the body is the closure's last form, so a clause
+whose last goal calls a functor keeps that call in tail position.
+*FUNCTOR* is the clause's block while it compiles, so the cut returns
+from it."
+  (let* ((parameters (make-parameters (functor-arity functor)))
+         (block-name (gensym "CLAUSE"))
+         (cell (gensym "CELL"))
+         (body (let ((*functor* block-name))
+                 (compile-clause parameters clause 'cont :cut-flag cell)))
+         (func `(lambda (,cell ,@parameters cont)
+                  (block ,block-name ,body))))
+    (when *prolog-trace*
+      (format t "TRACE: clause ~A of ~A~%" func (functor-name functor)))
+    (incf *clause-compile-count*)
+    (eval func)))
+
+(defun %clause-index-key (x)
+  "X's first-argument index key (design D4): (VALUES KEY ALL-P).  ALL-P
+means every clause is a candidate: an unbound variable, a non-string
+array (EQUALP can equal a string) or a float RATIONAL refuses.  A KEY
+of :OPAQUE reaches only the variable-headed clauses.  The keys are a
+superset of PROLOG-EQUAL: 1 and 1.0 share one, a string and a keyword
+share one case-insensitively."
+  (let ((v x))
+    (var-deref v)
+    (cond ((var-p v) (values nil t))
+          ((stringp v) (values (cons :text (string-upcase v)) nil))
+          ((keywordp v) (values (cons :text (string-upcase (symbol-name v)))
+                                nil))
+          ((symbolp v) (values v nil))
+          ((numberp v) (handler-case (values (cons :number (rational v)) nil)
+                         (error () (values nil t))))
+          ((characterp v) (values v nil))
+          ((consp v) (values :cons nil))
+          ((arrayp v) (values nil t))
+          (t (values :opaque nil)))))
+
+(defun %head-index-key (arg)
+  "(VALUES KEY VAR-P) for a clause head's first argument: VAR-P when a
+call of any key may reach the clause."
+  (if (or (eq arg '?) (variable-p arg))
+      (values nil t)
+      (multiple-value-bind (key all-p) (%clause-index-key arg)
+        (if (or all-p (eq key :opaque))
+            (values nil t)
+            (values key nil)))))
+
+(defun %extend-clause-set (old clause fn)
+  "OLD with CLAUSE's closure FN appended, as a fresh CLAUSE-SET (design
+D4, D5): the closures vector copied and extended, the index table
+copied with one bucket (or VARS) replaced by a fresh vector one longer,
+every other bucket shared, since a published vector is never written.
+No head but CLAUSE's is keyed again."
+  (let* ((old-fns (clause-set-fns old))
+         (pos (length old-fns))
+         (fns (make-array (1+ pos)))
+         (old-index (clause-set-index old))
+         (index (make-hash-table :test 'equal
+                                 :size (max 16 (* 2 (hash-table-count
+                                                     old-index)))))
+         (head-args (args (clause-head clause)))
+         (vars (clause-set-vars old)))
+    (replace fns old-fns)
+    (setf (svref fns pos) fn)
+    (maphash (lambda (key bucket) (setf (gethash key index) bucket))
+             old-index)
+    (flet ((extended (vector)
+             (let ((new (make-array (1+ (length vector)))))
+               (replace new vector)
+               (setf (svref new (length vector)) pos)
+               new)))
+      (multiple-value-bind (key var-p)
+          (if (null head-args)
+              (values nil t)
+              (%head-index-key (first head-args)))
+        (if var-p
+            (setf vars (extended vars))
+            (setf (gethash key index)
+                  (extended (or (gethash key old-index) #()))))))
+    (%make-clause-set :fns fns :index index :vars vars)))
+
+(defun %candidates (set first-arg first-arg-p)
+  "(VALUES BUCKET ALL-P) for a call of SET with FIRST-ARG (design D4):
+ALL-P means every clause, in order; else the candidates are BUCKET
+merged with the set's VARS by position.  No FIRST-ARG (arity 0), the
+index off, or a value no key covers: every clause."
+  (if (or (not first-arg-p) (not *clause-indexing*))
+      (values nil t)
+      (multiple-value-bind (key all-p) (%clause-index-key first-arg)
+        (cond (all-p (values nil t))
+              ((eq key :opaque) (values #() nil))
+              (t (values (or (gethash key (clause-set-index set)) #())
+                         nil))))))
+
+(defun %make-dispatcher (functor arity)
+  "FUNCTOR's function, built once over ARITY (design D2): the current
+clause set's candidates in order, bindings undone between them, no
+further candidate after one that cut.  The walk is inline and the last
+candidate is tail-called with no cut cell, so a Prolog call level
+costs this frame and the clause closure's, and a clause whose last
+goal recurses runs in constant stack as the old single function did
+(GH #121)."
+  (let ((parameters (make-parameters arity)))
+    (funcall
+     (eval
+      `(lambda (functor)
+         (lambda (,@parameters cont)
+          (block dispatch
+           (let* ((set (functor-clause-set functor))
+                  (fns (clause-set-fns set))
+                  (old-trail (fill-pointer *trail*)))
+             (multiple-value-bind (bucket all-p)
+                 (%candidates set ,@(if (plusp arity)
+                                        (list (first parameters) t)
+                                        (list nil nil)))
+               (let* ((vars (clause-set-vars set))
+                      (ni (if all-p (length fns) (length bucket)))
+                      (nj (if all-p 0 (length vars)))
+                      (n (+ ni nj))
+                      (i 0) (j 0))
+                 (declare (fixnum ni nj n i j))
+                 ;; NEXT: the next candidate position, all of them in
+                 ;; order when ALL-P, else BUCKET merged with VARS.
+                 (flet ((next ()
+                          (cond (all-p (prog1 i (incf i)))
+                                ((and (< i ni)
+                                      (or (>= j nj)
+                                          (< (svref bucket i)
+                                             (svref vars j))))
+                                 (prog1 (svref bucket i) (incf i)))
+                                (t (prog1 (svref vars j) (incf j))))))
+                   (declare (inline next))
+                   (cond
+                     ((zerop n) nil)
+                     ((= n 1)
+                      (funcall (svref fns (next)) nil ,@parameters cont))
+                     (t
+                      (let ((cell (list nil)))
+                        (dotimes (k (1- n))
+                          (unless (zerop k) (undo-bindings old-trail))
+                          (funcall (svref fns (next)) cell ,@parameters cont)
+                          (when (car cell)
+                            (return-from dispatch nil)))
+                        (undo-bindings old-trail)
+                        (funcall (svref fns (next)) nil
+                                 ,@parameters cont))))))))))))
+     functor)))
+
+(defun %add-compiled-clause (functor clause)
+  "Under FUNCTOR's lock: CLAUSE compiled, appended, a new clause set
+published in one slot write, and the dispatcher installed as FN unless
+FN already is it (design D2, D5)."
+  (%clause-arity functor clause)
+  (let ((fn (%compile-clause-fn functor clause)))
+    (setf (functor-clauses functor)
+          (nconc (functor-clauses functor) (list clause)))
+    (setf (functor-clause-set functor)
+          (%extend-clause-set (functor-clause-set functor) clause fn))
+    (unless (functor-dispatcher functor)
+      (setf (functor-dispatcher functor)
+            (%make-dispatcher functor (functor-arity functor))))
+    (unless (eq (functor-fn functor) (functor-dispatcher functor))
+      (set-functor-fn (functor-name functor) (functor-dispatcher functor)))
+    functor))
 
 (defun compile-body (body cont bindings)
   "Compile the body of a clause."
@@ -772,9 +950,9 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
     ((or (eq (first body) '!) (eq (first body) 'cut)
          (equalp (first body) "cut"))
      `(progn ,(compile-body (rest body) cont bindings)
-             ,(if *functor*
-                  `(return-from ,*functor* nil)
-                  `(return-from :prolog-select nil))))
+             ,@(when *clause-cut-flag*
+                 `((when ,*clause-cut-flag* (setf (car ,*clause-cut-flag*) t))))
+             (return-from ,(or *functor* :prolog-select) nil)))
     (t
      (when *prolog-trace*
        (format t "TRACE: GOAL: ~A~%" (first body)))
