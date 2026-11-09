@@ -1,7 +1,8 @@
 # Prolog Engine board in 5.0: release scope
 
-**Status:** proposed 2026-11-09, Kevin's review pending. Tracker: GH #45
-(the epic), board https://github.com/users/kraison/projects/7.
+**Status:** proposed 2026-11-09; the order, the 5.1 fallback and the
+before-and-after rule agreed by Kevin the same day. Tracker: GH #45 (the
+epic), board https://github.com/users/kraison/projects/7.
 
 ## Intent
 
@@ -139,10 +140,10 @@ anything with them.
 ## The release
 
 5.0.0 is cut by `docs/ci.md`'s "Cutting a release" once the seven
-units are on `experiment` and green. **Question for Kevin, in review:**
-if a release date arrives before Unit 7, the author's proposal is that
-Units 6 and 7 move to 5.1 and 5.0 ships with 1 to 5; nothing else on
-the board makes sense to split. Sizes are the author's estimates:
+units are on `experiment` and green. **Agreed 2026-11-09:** if a
+release date arrives before Unit 7, Units 6 and 7 move to 5.1 and 5.0
+ships with 1 to 5; nothing else on the board makes sense to split.
+Sizes are the author's estimates:
 
 | Unit | Sessions |
 |---|---|
@@ -153,6 +154,36 @@ the board makes sense to split. Sizes are the author's estimates:
 | 5 | 2 |
 | 6 | 2 |
 | 7 | 1 to 2 |
+
+## Before and after
+
+Kevin's observation on 2026-11-09: most of these units are performance
+work, so each needs cases to compare before and after. The rule for
+this scope: **the bench comes before the code.**
+
+- **Unit 1b, the Prolog bench**, lands right after Unit 1 and before
+  Unit 2 starts: `tests/perf/prolog-bench.lisp` in `graph-db/perf-test`,
+  reported, not gated, as `rules-bench.lisp` is. One case per
+  performance unit, each sized by `scale`:
+  - asserted clauses: assert N facts of one functor with `<-`, then
+    call it with a bound first argument (Unit 2, #121);
+  - a repeated guarded query shape with a changing literal, through
+    `run-guarded-prolog` (Unit 6, #376), beside the existing two-hop
+    `related/3` case in `spacetime-bench.lisp`;
+  - a recursive predicate over a cyclic graph under `select`'s
+    inference budget (Unit 4, #122), which before tabling records the
+    bound it hits and after records a terminating closure;
+  - a change-feed cursor goal over a namespace with N claims and a
+    cursor past most of them (Unit 7, #392);
+  - `reachable` and `shortest_path` over a generated graph (Unit 5,
+    #123), which before the unit is the hand-written `select` closure
+    the predicate replaces.
+- The bench's third-run numbers on odm at the pre-unit commit go on
+  the unit's issue before its code changes; the unit's plan ends with
+  the same bench, same host, third run, and both tables on the issue.
+  The release notes for 5.0 quote the pairs.
+- `docs/perf-baselines.md`'s comparability rule applies: same host,
+  same generation, or the numbers are not compared.
 
 ## Non-goals
 
