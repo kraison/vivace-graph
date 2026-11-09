@@ -78,6 +78,13 @@ storage formats (#60).
 
 ### Changed
 
+- **`<-` compiles the clause it adds, not the functor** (#121). Each
+  asserted clause is its own closure and the functor's function is a
+  dispatcher built once, so an assert's compile cost no longer grows
+  with the clause count; the cut, the barriers (`once`, `not`, `if`)
+  and the top-level queries behave as before, and a clause asserted
+  after `set-functor-fn` reinstalls the dispatcher as it always
+  recompiled. `*clause-compile-count*` counts clause compiles.
 - **`*prolog-max-query-length*` is enforced by the screen** (#366):
   `run-guarded-prolog` and `guard-query-text` refuse an overlong text;
   it was the GUI endpoint's check alone.

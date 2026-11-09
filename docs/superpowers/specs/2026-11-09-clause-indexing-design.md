@@ -198,12 +198,11 @@ positions live in one immutable `clause-set` struct; an assert builds a
 new one (fresh vectors by `replace`, a fresh index table) and stores it
 in the functor's slot in one write, so a reader that fetched the slot
 sees the three consistent with each other and never a position past
-its vector. Readers take no lock on SBCL, CCL and LispWorks and read
-the set's table concurrently with nobody writing it. On ECL, which has
-no thread-safe hash tables, the dispatcher fetches the set under the
-functor's lock, the rule `with-user-functors-lock` applies to the
-registry. Position vectors are of fixnums; the copy is O(clauses) per
-assert and the compile O(1), which is the point.
+its vector. A published set is never mutated, so no implementation
+needs a read lock: ECL's tables are unsafe only under a concurrent
+write, and the only writes are to a set nobody has seen yet. Position
+vectors are of fixnums; the copy is O(clauses) per assert and the
+compile O(1), which is the point.
 
 ### D6. Compatibility
 

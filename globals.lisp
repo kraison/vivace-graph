@@ -419,6 +419,9 @@ strictly-safe pre-durability abort.")
 that closure's CUT variable, set by a cut before it returns from the
 clause block.  NIL at top level and under a barrier (clause indexing
 design D3, GH #121).")
+(defvar *clause-compile-count* 0
+  "Clauses compiled into their own closure since the image started;
+a test's evidence that an assert compiles one clause (GH #121).")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 

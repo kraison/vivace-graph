@@ -165,26 +165,40 @@ present, so an error from the continuation after Goal succeeds is not caught.")
 (defmethod clause-head ((list list))
   (first list))
 
-(defun prolog-compile-help (functor clauses)
-  ;; Base case: stop once every clause has been compiled.  Without this guard,
-  ;; (first nil) -> nil, relation-arity -> 0, and the function recurses forever
-  ;; on the empty clause set, repeatedly compiling a degenerate arity-0 functor
-  ;; -- which hangs the Lisp compiler.  This made every <- rule definition hang.
-  (unless (null clauses)
-    (let ((arity (relation-arity (clause-head (first clauses)))))
-      (compile-functor functor arity (clauses-with-arity clauses #'= arity))
-      (prolog-compile-help functor (clauses-with-arity clauses #'/= arity)))))
+(defun %clause-arity (functor clause)
+  "CLAUSE's head arity, checked against FUNCTOR's; the first clause
+sets it (design D6, GH #121)."
+  (let ((n (relation-arity (clause-head clause)))
+        (arity (functor-arity functor)))
+    (cond ((null arity) (setf (functor-arity functor) n))
+          ((/= n arity)
+           (error 'prolog-error
+                  :reason (format nil "clause ~S has arity ~D; functor ~A ~
+has arity ~D" (clause-head clause) n (functor-name functor) arity))))
+    n))
 
 (defmethod prolog-compile ((functor functor))
-  (if (null (functor-clauses functor))
-      (prolog-compile-null functor)
-      (prolog-compile-help functor (functor-clauses functor))))
-
-(defun clauses-with-arity (clauses test arity)
-  "Return all clauses whose head has given arity."
-  (find-all arity clauses
-            :key #'(lambda (clause) (relation-arity (clause-head clause)))
-            :test test))
+  "FUNCTOR's clauses compiled afresh: none, the null function; else each
+through %ADD-COMPILED-CLAUSE after one arity check over all of them, so
+a mixed MAKE-FUNCTOR :CLAUSES list signals and leaves a registered
+functor with no clauses (design D6, GH #121)."
+  (let ((clauses (functor-clauses functor)))
+    (setf (functor-clauses functor) nil
+          (functor-arity functor) nil
+          (functor-dispatcher functor) nil
+          (functor-clause-set functor) (%make-clause-set))
+    (prolog-compile-null functor)
+    (when clauses
+      (let ((arity (relation-arity (clause-head (first clauses)))))
+        (dolist (clause clauses)
+          (unless (= arity (relation-arity (clause-head clause)))
+            (error 'prolog-error
+                   :reason (format nil "clause ~S has arity ~D; functor ~
+~A has arity ~D" (clause-head clause)
+                                   (relation-arity (clause-head clause))
+                                   (functor-name functor) arity)))))
+      (dolist (clause clauses)
+        (%add-compiled-clause functor clause)))))
 
 (defun relation-arity (relation)
   "The number of arguments to a relation.
@@ -757,21 +771,83 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
     (set-functor-fn *functor*
                     #'(lambda (&rest args) (declare (ignore args)) nil))))
 
-(defun compile-functor (functor arity clauses)
-  "Compile all the clauses for a given symbol/arity into a single LISP
- function."
-  (let ((*functor* (functor-name functor))
-        (parameters (make-parameters arity)))
-    (let ((func `#'(lambda (,@parameters cont)
-                     (block ,*functor*
-                       .,(maybe-add-undo-bindings
-                          (mapcar
-                           #'(lambda (clause)
-                               (compile-clause parameters clause 'cont))
-                           clauses))))))
-      (when *prolog-trace*
-        (format t "TRACE: Adding ~A to ~A~%" func *functor*))
-      (set-functor-fn *functor* (eval func)))))
+(defun %compile-clause-fn (functor clause)
+  "CLAUSE as its own closure of (ARG1 .. ARGN CONT), true when its body
+executed a cut (design D1, GH #121).  *FUNCTOR* is the clause's block
+while it compiles, so the cut returns from it."
+  (let* ((parameters (make-parameters (functor-arity functor)))
+         (block-name (gensym "CLAUSE"))
+         (cut (gensym "CUT"))
+         (body (let ((*functor* block-name))
+                 (compile-clause parameters clause 'cont :cut-flag cut)))
+         (func `(lambda (,@parameters cont)
+                  (let ((,cut nil))
+                    (block ,block-name ,body)
+                    ,cut))))
+    (when *prolog-trace*
+      (format t "TRACE: clause ~A of ~A~%" func (functor-name functor)))
+    (incf *clause-compile-count*)
+    (eval func)))
+
+(defun %build-clause-set (functor clauses fns)
+  "A fresh CLAUSE-SET over FNS (design D4).  Every position is a
+candidate for every call until the index lands."
+  (declare (ignore functor clauses))
+  (let* ((n (length fns))
+         (vars (make-array n)))
+    (dotimes (i n)
+      (setf (svref vars i) i))
+    (%make-clause-set :fns fns :index (make-hash-table :test 'equal)
+                      :vars vars)))
+
+(defun %map-candidates (visit set first-arg)
+  "VISIT on each candidate closure of SET for FIRST-ARG, in source
+order, stopping when VISIT returns true (a cut)."
+  (declare (ignore first-arg))
+  (let ((fns (clause-set-fns set)))
+    (loop for pos across (clause-set-vars set)
+          when (funcall visit (svref fns pos)) return t)))
+
+(defun %make-dispatcher (functor arity)
+  "FUNCTOR's function, built once over ARITY (design D2): the current
+clause set's candidates in order, bindings undone between them, no
+further clause after one that cut."
+  (let ((parameters (make-parameters arity)))
+    (funcall
+     (eval `(lambda (functor)
+              (lambda (,@parameters cont)
+                (let ((set (functor-clause-set functor))
+                      (old-trail (fill-pointer *trail*))
+                      (first t))
+                  (%map-candidates
+                   (lambda (fn)
+                     (if first (setf first nil) (undo-bindings old-trail))
+                     (funcall fn ,@parameters cont))
+                   set ,(if (plusp arity) (first parameters) nil))
+                  nil))))
+     functor)))
+
+(defun %add-compiled-clause (functor clause)
+  "Under FUNCTOR's lock: CLAUSE compiled, appended, a new clause set
+published in one slot write, and the dispatcher installed as FN unless
+FN already is it (design D2, D5)."
+  (%clause-arity functor clause)
+  (let* ((fn (%compile-clause-fn functor clause))
+         (old-fns (clause-set-fns (functor-clause-set functor)))
+         (n (length old-fns))
+         (fns (make-array (1+ n))))
+    (replace fns old-fns)
+    (setf (svref fns n) fn)
+    (setf (functor-clauses functor)
+          (nconc (functor-clauses functor) (list clause)))
+    (setf (functor-clause-set functor)
+          (%build-clause-set functor (functor-clauses functor) fns))
+    (unless (functor-dispatcher functor)
+      (setf (functor-dispatcher functor)
+            (%make-dispatcher functor (functor-arity functor))))
+    (unless (eq (functor-fn functor) (functor-dispatcher functor))
+      (set-functor-fn (functor-name functor) (functor-dispatcher functor)))
+    functor))
 
 (defun compile-body (body cont bindings)
   "Compile the body of a clause."

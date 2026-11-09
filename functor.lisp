@@ -1,9 +1,21 @@
 (in-package #:graph-db)
 
+(defstruct (clause-set (:constructor %make-clause-set))
+  "A functor's compiled clauses, published whole and never mutated
+(clause indexing design D5, GH #121): FNS the clause closures in source
+order; INDEX first-argument key -> ascending positions; VARS the
+ascending positions the index does not cover."
+  (fns #() :type simple-vector)
+  (index (make-hash-table :test 'equal) :type hash-table)
+  (vars #() :type simple-vector))
+
 (defstruct (functor
              (:constructor %make-functor)
              (:predicate functor-p))
-  name fn clauses (lock (make-recursive-lock)))
+  name fn clauses (lock (make-recursive-lock))
+  ;; GH #121: ARITY from the first clause; DISPATCHER the function
+  ;; built once over the arity; CLAUSE-SET the current published set.
+  arity dispatcher (clause-set (%make-clause-set)))
 
 (defgeneric prolog-compile (functor))
 
@@ -28,17 +40,17 @@
             (prolog-compile functor))))))
 
 (defun add-functor-clause (functor clause)
+  "CLAUSE compiled on its own and appended (GH #121); the clause list."
   (with-recursive-lock-held ((functor-lock functor))
     ;; The lock serializes all writers; no CAS needed.
-    (setf (functor-clauses functor)
-          (nconc (functor-clauses functor) (list clause)))
-    (prolog-compile functor))
+    (%add-compiled-clause functor clause))
   (functor-clauses functor))
 
 (defun delete-functor (functor)
   (with-user-functors-lock (remhash (functor-name functor) *user-functors*)))
 
 (defun reset-functor (functor)
+  "No clauses, no candidates, the null function (GH #121)."
   (with-recursive-lock-held ((functor-lock functor))
     (setf (functor-clauses functor) nil)
     (prolog-compile functor))
