@@ -90,21 +90,24 @@ edges.  With CHORDS, also an edge from every tenth node I to node
 vertex GOAL.  Returns the hop count, or NIL when GOAL is unreachable.
 The loop shortest_path/4 will wrap (GH #45)."
   ;; TO is the target's id, a byte vector: EQUALP keys, LOOKUP-VERTEX
-  ;; for the next frontier.
+  ;; only for a node that joins the next frontier, and the goal is
+  ;; recognised as it is discovered.
   (let ((seen (make-hash-table :test 'equalp))
         (goal-id (id goal))
         (frontier (list start))
         (hops 0))
+    (when (equalp (id start) goal-id)
+      (return-from pbp-bfs 0))
     (setf (gethash (id start) seen) t)
     (loop
-      (when (some (lambda (v) (equalp (id v) goal-id)) frontier)
-        (return hops))
       (when (null frontier)
         (return nil))
       (let ((next nil))
         (dolist (v frontier)
           (dolist (e (outgoing-edges v :edge-type 'p-knows))
             (let ((key (graph-db:to e)))
+              (when (equalp key goal-id)
+                (return-from pbp-bfs (1+ hops)))
               (unless (gethash key seen)
                 (setf (gethash key seen) t)
                 (push (lookup-vertex key) next)))))
@@ -156,6 +159,11 @@ serves every key and the timed loop holds no compile.  Before #121 the
 assert cost grows with the clause count (a full recompile per assert)
 and the lookup is a linear scan."
   (let ((n (scale 500)) (k (scale 5000)))
+    ;; A repeat call in one image measures clauses 1..N again, not
+    ;; N+1..2N on top of the last call's.
+    (let ((old (graph-db::lookup-functor
+                (find-symbol "PBP-FACT/2" '#:graph-db/perf-test))))
+      (when old (graph-db::reset-functor old)))
     (with-perf-prolog-graph (g)
       (timed-ops ("clause-assert" n)
         (dotimes (i n)
