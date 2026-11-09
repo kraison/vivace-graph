@@ -16,6 +16,9 @@ storage formats (#60).
 
 ### Added
 
+- **The Prolog bench** (#45): `tests/perf/prolog-bench.lisp`, five cases,
+  one per performance unit of the 5.0 scope, and
+  `tests/perf/run-bench.sh` to run one bench alone.
 - **`retire-rule`** (#477) withdraws what a stored rule or stored
   production concluded. In one transaction the record leaves scope, a
   rule disabled and a production deleted, and every current claim and

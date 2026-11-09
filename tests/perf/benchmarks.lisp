@@ -1018,6 +1018,12 @@ Measurement-only; always returns T."
            (bench-claim-linking)
            (bench-claim-key-paging)
            (bench-forward-step-reads)
+           ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
+           (bench-clause-assert)
+           (bench-guarded-shape-repeat)
+           (bench-recursive-ring)
+           (bench-change-feed-cursor)
+           (bench-graph-predicates)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).
