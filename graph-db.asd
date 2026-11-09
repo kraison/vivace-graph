@@ -434,7 +434,9 @@ and read-only neighborhood exploration."
                ;; edges under claims, spec sec.9 (GH #372)
                (:file "spacetime-bench")
                ;; paging a namespace by key, first page vs last (GH #451)
-               (:file "rules-bench"))
+               (:file "rules-bench")
+               ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
+               (:file "prolog-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 
