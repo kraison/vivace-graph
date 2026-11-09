@@ -16,6 +16,11 @@ storage formats (#60).
 
 ### Added
 
+- **`claim/7`'s route is one function and `explain-goals` names it**
+  (#124): `%claim-route` decides the route the goal takes in the
+  documented order and `explain-goals` reports the same words for a
+  `claim/7` or `claim-after/9` goal, so a query's route is confirmable
+  before it runs.
 - **`explain-goals`** (#124): one row per goal of a query, without
   running it, naming the functor it resolves to, which arguments are
   bound there, and the access path it takes, from a registry

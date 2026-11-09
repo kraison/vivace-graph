@@ -251,7 +251,8 @@ docs/rules.md; GH #304."
   :components ((:file "package") (:file "suite") (:file "facts-tests")
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
-               (:file "scope-tests") (:file "forward-tests"))
+               (:file "scope-tests") (:file "forward-tests")
+               (:file "explain-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)

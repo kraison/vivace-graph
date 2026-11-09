@@ -297,6 +297,73 @@ re-filters (GH #333)."
                                  (list namespace key))))))))
     (mapc emit (%derived-all))))
 
+(defvar *last-claim-route* nil
+  "The route the last CLAIM/7 call under a port hook took, for the
+tests of EXPLAIN-GOALS' claim rows (GH #124).  Written only while
+*PROLOG-PORT-HOOK* is bound.")
+
+(defun %claim-route (c-p sns-arg sns ons-arg ons skey okey rel
+                     &optional record)
+  "The route CLAIM/7 takes, in docs/rules.md's order (\"Routes, and what
+refuses\"): C-P a bound claim; SNS-ARG / ONS-ARG a bound namespace
+argument and SNS / ONS the keyword it names (NIL for none); SKEY, OKEY,
+REL bound or not.  %CLAIM-GOAL switches on it and EXPLAIN-GOALS reports
+it (GH #124); RECORD true notes it in *LAST-CLAIM-ROUTE*."
+  (let ((route (cond (c-p :bound-claim)
+                     ((and sns skey rel) :subject-relation-index)
+                     ((and sns skey) :subject-index)
+                     ((and ons okey) :object-index)
+                     ((and sns-arg (null sns)) :empty-namespace)
+                     ((and ons-arg (null ons)) :empty-namespace)
+                     (sns :subject-vocabulary)
+                     (ons :object-vocabulary)
+                     (t :family-walk))))
+    (when record (setf *last-claim-route* route))
+    route))
+
+(defun %claim-route-string (route)
+  "ROUTE as docs/rules.md's route table words it."
+  (ecase route
+    (:bound-claim "that claim")
+    (:subject-relation-index "subject-relation index")
+    (:subject-index "subject index")
+    (:object-index "object index")
+    (:empty-namespace "empty: the namespace names no keyword")
+    (:subject-vocabulary
+     "vocabulary route, subject side: keys from the vocabulary index")
+    (:object-vocabulary
+     "vocabulary route, object side: keys from the vocabulary index")
+    (:family-walk "family walk; refused under a resource bound")))
+
+(defun %explain-claim-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM/7 or CLAIM-AFTER/9 goal (design D3):
+the route %CLAIM-ROUTE picks from what is bound, a literal namespace
+resolved as the goal would resolve it, an argument bound by an earlier
+goal counted as bound and the row marked as decided by value."
+  (declare (ignore graph))
+  (destructuring-bind (c family sns skey rel ons okey &rest more) args
+    (declare (ignore family more))
+    (flet ((val (x b) (cond ((not b) nil) ((variable-p x) :bound) (t x))))
+      (let* ((cv (val c (nth 0 bound)))
+             (snsv (val sns (nth 2 bound)))
+             (skeyv (val skey (nth 3 bound)))
+             (relv (val rel (nth 4 bound)))
+             (onsv (val ons (nth 5 bound)))
+             (okeyv (val okey (nth 6 bound)))
+             (runtime (member :bound
+                              (list cv snsv skeyv relv onsv okeyv)))
+             (sns-kw (cond ((eq snsv :bound) :bound)
+                           (snsv (%namespace-keyword snsv))))
+             (ons-kw (cond ((eq onsv :bound) :bound)
+                           (onsv (%namespace-keyword onsv))))
+             (route (%claim-route cv snsv sns-kw onsv ons-kw
+                                  skeyv okeyv relv)))
+        (format nil "~A~:[~;, by value at run time~]"
+                (%claim-route-string route) runtime)))))
+
+(register-access-path 'claim/7 #'%explain-claim-path)
+(register-access-path 'claim-after/9 #'%explain-claim-path)
+
 (defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
                     skey-after okey-after cont)
   "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
@@ -332,22 +399,24 @@ the namespace routes (#451)."
                              okey-after)))
                (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
                              cont))))
-      (cond ((node-p c) (emit c))
-            ((and sns skey rel)
+      (ecase (%claim-route (node-p c) sns-arg sns ons-arg ons skey okey rel
+                           *prolog-port-hook*)
+        (:bound-claim (emit c))
+            (:subject-relation-index
              (mapc #'emit
                    (append (%exclude-producers
                             (%scope-lookup
                              parent +claim-subject-relation-index-slots+
                              (list sns skey rel)))
                            (%derived-by-subject rel (cons sns skey)))))
-            ((and sns skey)
+            (:subject-index
              (mapc #'emit
                    (append (%exclude-producers
                             (%scope-lookup parent
                                            +claim-subject-index-slots+
                                            (list sns skey)))
                            (%derived-by-subject nil (cons sns skey)))))
-            ((and ons okey)
+            (:object-index
              (mapc #'emit
                    (append (%exclude-producers
                             (%scope-lookup binary
@@ -359,16 +428,18 @@ the namespace routes (#451)."
             ;; spelling, a non-string: no solutions, and nothing
             ;; interned.  Not the walk below, which under the guard's
             ;; budget refuses instead (spec §4).
-            ((and sns-arg (null sns)) nil)
-            ((and ons-arg (null ons)) nil)
+            (:empty-namespace nil)
             ;; A namespace without its key: the vocabulary routes
             ;; (GH #389).  Subject first, so a goal binding both
             ;; namespaces and neither key enumerates subjects.
-            (sns (%namespace-route family :subject sns rel #'emit
+            (:subject-vocabulary
+             (%namespace-route family :subject sns rel #'emit
                                    :after skey-after))
-            (ons (%namespace-route family :object ons nil #'emit
+            (:object-vocabulary
+             (%namespace-route family :object ons nil #'emit
                                    :after okey-after))
-            (t (mapc #'emit
+            (:family-walk
+             (mapc #'emit
                      (append (%exclude-producers
                               (%unbound-claim-scan family))
                              (%derived-all))))))))

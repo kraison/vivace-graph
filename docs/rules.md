@@ -222,6 +222,11 @@ Raw, in the image, from any package:
 | object namespace, key unbound | the vocabulary route on the object side |
 | none of the above | the family walk -- see below |
 
+`explain-goals` (GH #124) names the route a `claim/7` goal will take, in
+these words, from what is bound at that point in the goal list, without
+running it; a namespace bound by an earlier goal rather than written
+reports the route as decided by value at run time.
+
 **The vocabulary routes (GH #389).** "Every claim about a subject in
 namespace N" is the natural question of a claim store, and until
 GH #389 it fell to the walk. Now `claim/7` reads the keys filed under
