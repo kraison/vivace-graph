@@ -721,6 +721,7 @@ cl-temporal-extent."
                (:file "prolog-mutation-tests")
                (:file "prolog-functor-tests")
                (:file "clause-indexing-tests")
+               (:file "tracer-explain-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")

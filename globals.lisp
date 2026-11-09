@@ -428,6 +428,13 @@ whose first head argument can unify with it (design D4, GH #121).  NIL
 tries every clause in order: for a PROLOG-EQUAL specialisation that
 widens equality among symbols, strings, numbers or characters, and for
 measuring the index in one image.")
+(defvar *prolog-port-hook* nil
+  "NIL, or a function of (PORT FUNCTOR ARGS DEPTH) called at :CALL,
+:EXIT, :REDO and :FAIL of every goal call and at :CLAUSE when a
+dispatcher tries a candidate (tracer design D1, GH #124).  Bind it;
+TRACE-PROLOG sets it.")
+(defvar *prolog-port-depth* 0
+  "Goal calls open above the current one while the hook runs.")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 

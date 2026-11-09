@@ -276,7 +276,10 @@ compound, or a control construct; its variables are runtime VAR structs."
                  (fn (or (get-functor-fn functor)
                          (gethash functor *prolog-global-functors*))))
             (if (functionp fn)
-                (apply fn (append gargs (list cont)))
+                (let ((hook *prolog-port-hook*))
+                  (if hook
+                      (%ported-call hook functor fn gargs cont)
+                      (apply fn (append gargs (list cont)))))
                 ;; Unknown predicate: noisy, but with an existence_error ball so
                 ;; catch/3 can recover from it.
                 (error 'prolog-error
