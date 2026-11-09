@@ -1,7 +1,7 @@
 ;;;; tests/query/guard-tests.lisp -- RUN-GUARDED-PROLOG (GH #322).
 ;;;;
 ;;;; Type/slot names are bare, never keyword-spelled ("qt-item", not
-;;;; ":qt-item"): %SCAN-QUERY-TEXT refuses any ':' outright (query/
+;;;; ":qt-item"): SCAN-QUERY-TEXT refuses any ':' outright (query/
 ;;;; guard.lisp), the same rule tests/gui/gui-tests.lisp's Prolog
 ;;;; tests already rely on.
 

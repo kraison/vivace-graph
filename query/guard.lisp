@@ -9,7 +9,7 @@
 ;;;;
 ;;;;   1. *ALLOW-PROLOG*     -- the flag, stays in the GUI handler
 ;;;;      (gui/prolog.lisp), checked before the graph is resolved.
-;;;;   2. %SCAN-QUERY-TEXT   -- a character screen that runs BEFORE the
+;;;;   2. SCAN-QUERY-TEXT   -- a character screen that runs BEFORE the
 ;;;;      reader: length, paren depth/balance, and an outright refusal
 ;;;;      of #, `, , and the package marker.  Refusing ':' textually is
 ;;;;      what makes package-qualified input safe -- READ would intern
@@ -23,7 +23,7 @@
 ;;;;      slot of THIS graph, a ?variable, or T/NIL.
 ;;;;   5. RUN-QUERY-GOALS    -- query/dsl.lisp's own runner: :EFFECTS
 ;;;;      NIL, one snapshot, the inference/time/row bounds.  Reached
-;;;;      through %RUN-GUARDED-GOALS in this file.  Goal heads resolve
+;;;;      through %GUARDED-ROWS in this file.  Goal heads resolve
 ;;;;      each in its own package now, not one shared :PACKAGE
 ;;;;      (GH #322).
 ;;;;   6. DELETE-PACKAGE     -- in an UNWIND-PROTECT, so a hostile
@@ -187,7 +187,7 @@ evaluation) least of all"
 
 (defun %prolog-readtable ()
   "A copy of the standard readtable with #, ` and , disabled.  Second
-line of defence: %SCAN-QUERY-TEXT already refuses these characters, so
+line of defence: SCAN-QUERY-TEXT already refuses these characters, so
 this only fires if that screen is ever wrong."
   (or *prolog-readtable*
       (setq *prolog-readtable*
@@ -231,7 +231,7 @@ instead (GH #315)."
 SBCL signals on 1e999999 and ECL reads infinity, both refused later; CCL
 clamps it to the largest float, a finite number the non-finite screen
 cannot tell from a real one (GH #315).  Strings, |...| names and
-comments are skipped, as %SCAN-QUERY-TEXT skips them."
+comments are skipped, as SCAN-QUERY-TEXT skips them."
   (let ((i 0) (n (length text)))
     (flet ((delimiter-p (ch)
              (or (member ch '(#\Space #\Tab #\Newline #\Return #\Page))
