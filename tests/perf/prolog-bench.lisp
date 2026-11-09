@@ -174,6 +174,24 @@ and the lookup is a linear scan."
             (graph-db:select-one (?v) (lisp ?k *pbp-probe*)
               (pbp-fact ?k ?v))))))))
 
+(defun bench-clause-assert-10k ()
+  "Unit 2 (GH #121) at the issue's realistic clause count: 10,000 facts
+asserted one by one, then 20,000 bound-first-argument lookups.  The
+functor is reset first, as BENCH-CLAUSE-ASSERT's is."
+  (let ((n (scale 10000)) (k (scale 20000)))
+    (let ((old (graph-db::lookup-functor
+                (find-symbol "PBP-FACT10K/2" '#:graph-db/perf-test))))
+      (when old (graph-db::reset-functor old)))
+    (with-perf-prolog-graph (g)
+      (timed-ops ("clause-assert-10k" n)
+        (dotimes (i n)
+          (pbp-assert (list (list 'pbp-fact10k (pbp-key i) i)))))
+      (timed-ops ("clause-bound-first-arg-10k" k)
+        (dotimes (i k)
+          (let ((*pbp-probe* (pbp-key (mod (* i 37) n))))
+            (graph-db:select-one (?v) (lisp ?k *pbp-probe*)
+              (pbp-fact10k ?k ?v))))))))
+
 (defun bench-guarded-shape-repeat ()
   "Unit 6 (GH #376): repeated guarded claim lookups of one shape, the key
 changing each call.  One untimed warm-up call first.  Before #376 each
@@ -265,6 +283,7 @@ Binds what RUN-PERF binds (benchmarks.lisp).  Returns T."
                (funcall only)
                (progn
                  (bench-clause-assert)
+                 (bench-clause-assert-10k)
                  (bench-guarded-shape-repeat)
                  (bench-change-feed-cursor)
                  (bench-graph-predicates)

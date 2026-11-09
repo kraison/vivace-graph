@@ -138,3 +138,13 @@ GH #255.)
   at 658/s (#123); and the recursive ring closure exhausting the control
   stack in 0.09 s with no solution (#122). Each unit reruns the same
   bench when it lands and posts both rows on its issue.
+- **Unit 2, clause indexing, after** (#121):
+  `results/prolog-after-u2-odm-f4615a7.report`, same host, SBCL and
+  generation, 2026-11-09, third of three runs. 500 asserts at 482/s
+  (was 16/s), 5,000 bound lookups at 277,762/s (was 49,998/s); the new
+  `clause-assert-10k` case asserts 10,000 clauses in 31.6 s (317/s) and
+  answers 20,000 bound lookups at 144,920/s. The per-assert rate at
+  10,000 is two thirds of the rate at 500: each assert rebuilds the
+  index table for the new immutable set, O(clauses) in hashing, the
+  price of lock-free readers; still linear, not the old quadratic. The
+  other rows are unchanged within noise.

@@ -1020,6 +1020,7 @@ Measurement-only; always returns T."
            (bench-forward-step-reads)
            ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
            (bench-clause-assert)
+           (bench-clause-assert-10k)
            (bench-guarded-shape-repeat)
            (bench-change-feed-cursor)
            (bench-graph-predicates)
