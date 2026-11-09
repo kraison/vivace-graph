@@ -789,24 +789,90 @@ while it compiles, so the cut returns from it."
     (incf *clause-compile-count*)
     (eval func)))
 
-(defun %build-clause-set (functor clauses fns)
-  "A fresh CLAUSE-SET over FNS (design D4).  Every position is a
-candidate for every call until the index lands."
-  (declare (ignore functor clauses))
-  (let* ((n (length fns))
-         (vars (make-array n)))
-    (dotimes (i n)
-      (setf (svref vars i) i))
-    (%make-clause-set :fns fns :index (make-hash-table :test 'equal)
-                      :vars vars)))
+(defun %clause-index-key (x)
+  "X's first-argument index key (design D4): (VALUES KEY ALL-P).  ALL-P
+means every clause is a candidate: an unbound variable, a non-string
+array (EQUALP can equal a string) or a float RATIONAL refuses.  A KEY
+of :OPAQUE reaches only the variable-headed clauses.  The keys are a
+superset of PROLOG-EQUAL: 1 and 1.0 share one, a string and a keyword
+share one case-insensitively."
+  (let ((v x))
+    (var-deref v)
+    (cond ((var-p v) (values nil t))
+          ((stringp v) (values (cons :text (string-upcase v)) nil))
+          ((keywordp v) (values (cons :text (string-upcase (symbol-name v)))
+                                nil))
+          ((symbolp v) (values v nil))
+          ((numberp v) (handler-case (values (cons :number (rational v)) nil)
+                         (error () (values nil t))))
+          ((characterp v) (values v nil))
+          ((consp v) (values :cons nil))
+          ((arrayp v) (values nil t))
+          (t (values :opaque nil)))))
 
-(defun %map-candidates (visit set first-arg)
+(defun %head-index-key (arg)
+  "(VALUES KEY VAR-P) for a clause head's first argument: VAR-P when a
+call of any key may reach the clause."
+  (if (or (eq arg '?) (variable-p arg))
+      (values nil t)
+      (multiple-value-bind (key all-p) (%clause-index-key arg)
+        (if (or all-p (eq key :opaque))
+            (values nil t)
+            (values key nil)))))
+
+(defun %build-clause-set (functor clauses fns)
+  "A fresh CLAUSE-SET over FNS (design D4): each clause's position under
+its head's key, or among VARS when any key may reach it; ascending."
+  (declare (ignore functor))
+  (let ((buckets (make-hash-table :test 'equal))
+        (index (make-hash-table :test 'equal))
+        (vars '()))
+    (loop for clause in clauses
+          for pos from 0
+          do (let ((head-args (args (clause-head clause))))
+               (if (null head-args)
+                   (push pos vars)
+                   (multiple-value-bind (key var-p)
+                       (%head-index-key (first head-args))
+                     (if var-p
+                         (push pos vars)
+                         (push pos (gethash key buckets)))))))
+    (maphash (lambda (key positions)
+               (setf (gethash key index)
+                     (coerce (nreverse positions) 'simple-vector)))
+             buckets)
+    (%make-clause-set :fns fns :index index
+                      :vars (coerce (nreverse vars) 'simple-vector))))
+
+(defun %map-candidates (visit set &optional (first-arg nil first-arg-p))
   "VISIT on each candidate closure of SET for FIRST-ARG, in source
-order, stopping when VISIT returns true (a cut)."
-  (declare (ignore first-arg))
-  (let ((fns (clause-set-fns set)))
-    (loop for pos across (clause-set-vars set)
-          when (funcall visit (svref fns pos)) return t)))
+order, stopping when VISIT returns true (a cut).  Without FIRST-ARG
+(arity 0), with *CLAUSE-INDEXING* off, or for a value no key covers,
+every clause; else the merge, by position, of the key's bucket and the
+variable-headed clauses."
+  (let ((fns (clause-set-fns set))
+        (vars (clause-set-vars set)))
+    (flet ((walk-all ()
+             (dotimes (i (length fns) nil)
+               (when (funcall visit (svref fns i)) (return t))))
+           (walk (bucket)
+             (let ((i 0) (j 0) (ni (length bucket)) (nj (length vars)))
+               (loop
+                 (let ((pos (cond ((and (< i ni)
+                                        (or (>= j nj)
+                                            (< (svref bucket i)
+                                               (svref vars j))))
+                                   (prog1 (svref bucket i) (incf i)))
+                                  ((< j nj) (prog1 (svref vars j) (incf j)))
+                                  (t (return nil)))))
+                   (when (funcall visit (svref fns pos)) (return t)))))))
+      (if (or (not *clause-indexing*) (not first-arg-p))
+          (walk-all)
+          (multiple-value-bind (key all-p) (%clause-index-key first-arg)
+            (cond (all-p (walk-all))
+                  ((eq key :opaque) (walk #()))
+                  (t (walk (or (gethash key (clause-set-index set))
+                               #())))))))))
 
 (defun %make-dispatcher (functor arity)
   "FUNCTOR's function, built once over ARITY (design D2): the current
@@ -823,7 +889,7 @@ further clause after one that cut."
                    (lambda (fn)
                      (if first (setf first nil) (undo-bindings old-trail))
                      (funcall fn ,@parameters cont))
-                   set ,(if (plusp arity) (first parameters) nil))
+                   set ,@(when (plusp arity) (list (first parameters))))
                   nil))))
      functor)))
 

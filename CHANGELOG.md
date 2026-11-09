@@ -16,6 +16,15 @@ storage formats (#60).
 
 ### Added
 
+- **First-argument clause indexing** (#121). A call with a bound first
+  argument tries only the asserted clauses whose first head argument
+  can unify with it, keyed as a superset of `prolog-equal`: 1 and 1.0
+  share a key, a string and a keyword share one case-insensitively,
+  every cons shares one, and a node or other opaque value reaches only
+  the variable-headed clauses. Solution order is unchanged.
+  `*clause-indexing*` nil turns it off, for a `prolog-equal`
+  specialisation that widens equality among symbols, strings, numbers
+  or characters.
 - **The Prolog bench** (#45): `tests/perf/prolog-bench.lisp`, five cases,
   one per performance unit of the 5.0 scope, and
   `tests/perf/run-bench.sh` to run one bench alone.

@@ -422,6 +422,12 @@ design D3, GH #121).")
 (defvar *clause-compile-count* 0
   "Clauses compiled into their own closure since the image started;
 a test's evidence that an assert compiles one clause (GH #121).")
+(defvar *clause-indexing* t
+  "When true a call with a bound first argument tries only the clauses
+whose first head argument can unify with it (design D4, GH #121).  NIL
+tries every clause in order: for a PROLOG-EQUAL specialisation that
+widens equality among symbols, strings, numbers or characters, and for
+measuring the index in one image.")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 
