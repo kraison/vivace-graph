@@ -13,4 +13,6 @@
    ;; the runner (spec SS4, GH #322)
    #:run-guarded-prolog
    ;; the compile half, for a caller that keeps the goals (GH #331)
-   #:guard-query-text #:*guarding-rule-text*))
+   #:guard-query-text #:*guarding-rule-text* #:run-guarded-goals
+   ;; the screened reader, for embedders (GH #366)
+   #:scan-query-text #:call-with-screened-forms #:with-screened-forms))

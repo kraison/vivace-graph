@@ -46,8 +46,8 @@
       (declare (ignore columns))
       (is (= 3 (length rows)))
       (is (null truncated)))
-    ;; :LIMIT 5000 clamps to the 1000 ceiling (%CLAMP-CAP), where
-    ;; %PROBE leaves no room for an extra row: TRUNCATED-P is NIL
+    ;; :LIMIT 5000 clamps to the 1000 ceiling (CLAMP-ROW-CAP), where
+    ;; PROBE-LIMIT leaves no room for an extra row: TRUNCATED-P is NIL
     ;; here because 3 rows is short of the 1000 cap -- (>= 3 1000) is
     ;; NIL, not because being at the ceiling makes it NIL.  The other
     ;; ceiling case, an EXACTLY-full 1000-row page reading TRUNCATED-P
@@ -304,3 +304,114 @@ string is data and passes."
     (graph-db.query::%screen-exponent-text "(= ?x 2.5d+99999)"))
   (finishes (graph-db.query::%screen-exponent-text
              "(= ?x 1.5e3) (= ?y 1e308) (= ?z \"1e999999\")")))
+
+(test the-cap-and-probe-rule-has-one-home
+  "CLAMP-ROW-CAP and PROBE-LIMIT are the DSL's rule about
+*QUERY-DEFAULT-LIMIT*, used by the runner, the guard and the GUI (#328)."
+  (let ((ceiling graph-db:*query-default-limit*))
+    (is (= ceiling (graph-db:clamp-row-cap nil)))
+    (is (= ceiling (graph-db:clamp-row-cap 0)))
+    (is (= ceiling (graph-db:clamp-row-cap -3)))
+    (is (= ceiling (graph-db:clamp-row-cap "7")))
+    (is (= 7 (graph-db:clamp-row-cap 7)))
+    (is (= ceiling (graph-db:clamp-row-cap (1+ ceiling))))
+    (is (= 8 (graph-db:probe-limit 7)))
+    (is (= ceiling (graph-db:probe-limit ceiling))))
+  (let ((graph-db:*query-default-limit* 5))
+    (is (= 5 (graph-db:clamp-row-cap 9)))
+    (is (= 4 (graph-db:clamp-row-cap 4)))
+    (is (= 5 (graph-db:probe-limit 4)))
+    (is (= 5 (graph-db:probe-limit 5)))))
+
+(test the-length-cap-is-enforced-by-the-screen
+  "*prolog-max-query-length* is the screen's own limit, so every entry
+refuses an overlong text, not only the GUI endpoint (#366)."
+  (with-query-graph (g)
+    (let ((long (make-string (1+ graph-db.query:*prolog-max-query-length*)
+                             :initial-element #\Space))
+          (full (make-string graph-db.query:*prolog-max-query-length*
+                             :initial-element #\Space)))
+      (signals graph-db.query:prolog-guard-error
+        (graph-db.query:scan-query-text long))
+      (signals graph-db.query:prolog-guard-error
+        (graph-db.query:run-guarded-prolog long g))
+      (signals graph-db.query:prolog-guard-error
+        (graph-db.query:guard-query-text long g))
+      (is (eq t (graph-db.query:scan-query-text full))))))
+
+(test with-screened-forms-reads-into-a-scratch-package-that-leaves-with-it
+  (let ((packages (length (list-all-packages)))
+        (home nil))
+    (graph-db.query:with-screened-forms (forms "(sr-probe-head ?x \"s\" 3)")
+      (is (= 1 (length forms)))
+      (destructuring-bind (head var str num) (first forms)
+        (setf home (package-name (symbol-package head)))
+        (is (string= "SR-PROBE-HEAD" (symbol-name head)))
+        (is (string= "?X" (symbol-name var)))
+        (is (string= "s" str))
+        (is (= 3 num))
+        (is (eq (symbol-package head) (symbol-package var)))
+        (is (not (member (symbol-package head)
+                         (list (find-package :graph-db)
+                               (find-package :graph-db.query)
+                               (find-package :keyword)
+                               *package*))))))
+    (is (null (find-package home)))
+    (is (= packages (length (list-all-packages))))
+    (is (null (find-symbol "SR-PROBE-HEAD" :graph-db)))
+    (is (null (find-symbol "SR-PROBE-HEAD" :graph-db.query)))))
+
+(test the-screened-reader-refuses-what-the-guard-refuses
+  "Each refusal is the guard's own condition, and a refusal mid-read
+still deletes the scratch package."
+  (let ((packages (length (list-all-packages))))
+    (dolist (text '("graph-db::vertex" "(a #.(+ 1 2))" "(a `b)" "(a"
+                    "1e999999"))
+      (signals graph-db.query:prolog-guard-error
+        (graph-db.query:call-with-screened-forms text #'identity)))
+    (is (= packages (length (list-all-packages))))))
+
+(test run-guarded-goals-runs-kept-goals-under-the-same-rails
+  "A caller that kept guard-query-text's goals runs them with
+run-guarded-prolog's clamp, probe, paging, budgets and shaping (#383)."
+  (with-query-graph (g)
+    (seed g)
+    (let ((text "(is-a ?i qt-item) (node-slot-value ?i label ?l)"))
+      (multiple-value-bind (vars goals)
+          (graph-db.query:guard-query-text text g)
+        (multiple-value-bind (columns rows truncated)
+            (graph-db.query:run-guarded-goals vars goals g)
+          (multiple-value-bind (columns* rows* truncated*)
+              (graph-db.query:run-guarded-prolog text g)
+            (is (equal columns columns*))
+            (is (equal (sort (copy-list rows) #'string< :key #'second)
+                       (sort (copy-list rows*) #'string< :key #'second)))
+            (is (eq truncated truncated*))))
+        (multiple-value-bind (columns rows truncated)
+            (graph-db.query:run-guarded-goals vars goals g :limit 2)
+          (declare (ignore columns))
+          (is (= 2 (length rows)))
+          (is (eq t truncated)))
+        (multiple-value-bind (columns rows truncated)
+            (graph-db.query:run-guarded-goals vars goals g
+                                              :limit 2 :offset 2)
+          (declare (ignore columns))
+          (is (= 1 (length rows)))
+          (is (null truncated)))
+        (is (graph-db::node-p
+             (first (first (nth-value 1 (graph-db.query:run-guarded-goals
+                                         vars goals g :format :raw))))))
+        (signals type-error
+          (graph-db.query:run-guarded-goals vars goals g :format :json))
+        (multiple-value-bind (vars2 goals2)
+            (graph-db.query:guard-query-text
+             "(is-a ?i qt-item) (is-a ?j qt-item) (is-a ?k qt-item)" g)
+          (signals graph-db:prolog-resource-error
+            (graph-db.query:run-guarded-goals vars2 goals2 g
+                                              :max-inferences 2)))
+        ;; The kept goals are re-runnable: a later write is seen.
+        (with-transaction ((graph-db::transaction-manager g))
+          (graph-db/query-test.schema::make-qt-item
+           :graph g :label "d" :rank 4))
+        (is (= 4 (length (nth-value 1 (graph-db.query:run-guarded-goals
+                                       vars goals g)))))))))

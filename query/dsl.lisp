@@ -23,6 +23,19 @@
 (defvar *query-default-timeout* 30
   "Wall-clock seconds a DEF-QUERY may run unless it overrides :TIMEOUT.")
 
+(defun clamp-row-cap (limit)
+  "LIMIT as the row cap: a positive integer, at most
+*QUERY-DEFAULT-LIMIT*; anything else is the ceiling (GH #328)."
+  (if (and (integerp limit) (plusp limit))
+      (min limit *query-default-limit*)
+      *query-default-limit*))
+
+(defun probe-limit (cap)
+  "Rows to ask for so CAP of them can be shown: one past CAP tells
+truncated from exactly full; at the ceiling there is no room, and an
+exactly-full page reads as truncated (GH #278, #328)."
+  (if (< cap *query-default-limit*) (1+ cap) cap))
+
 (defvar *pattern-query-callback* nil
   "Per-row callback for an EVAL'd ad-hoc pattern query (which has no lexical
 environment to capture one); RUN-PATTERN-QUERY binds it around the SELECT.")
@@ -328,9 +341,7 @@ prolog's :DATA format still converts them; :RAW does not)."
   ;; The eval'd SELECT / node-slot-value goals key off *GRAPH*.
   (let* ((*graph* graph)
          (*package* package)
-         (cap (if (and (integerp limit) (plusp limit))
-                  (min limit *query-default-limit*)
-                  *query-default-limit*))
+         (cap (clamp-row-cap limit))
          (run (lambda (cb)
                 ;; the select form is EVAL'd (null lexenv), so pass the
                 ;; callback through a special the form references
