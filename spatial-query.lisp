@@ -552,8 +552,9 @@ is needed here."
 
 ;;; What EXPLAIN-GOALS says of the spatial predicates (design D3, GH
 ;;; #124).
-(dolist (functor '(find-within/3 find-within/4 find-intersects/3 find-intersects/4
-                   find-near/5 find-near/6 find-nearest/5 find-nearest/6))
+(dolist (functor '(find-within/3 find-within/4 find-intersects/3
+                   find-intersects/4 find-near/5 find-near/6
+                   find-nearest/5 find-nearest/6))
   (register-access-path functor
                         (lambda (bound args graph)
                           (declare (ignore bound args graph))

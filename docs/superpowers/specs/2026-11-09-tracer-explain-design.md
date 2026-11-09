@@ -269,7 +269,11 @@ Lisp caller, under the same refusals.
 ### D6. Cross-implementation
 
 Plain CL throughout: a special, a few closures, `get-internal-real-time`.
-No new reader conditional.
+The two reader conditionals added are the house idioms already in the
+file next door: the per-implementation hash-table construction for
+`*access-paths*` (as `*cost-unbounded-functors*`), and `#+sbcl
+sb-ext:*evaluator-mode*` around `profile-goals`' `eval` (as
+`run-query-goals`), which degrades to a plain `eval` elsewhere.
 
 ## Tests
 

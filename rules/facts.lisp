@@ -350,16 +350,23 @@ goal counted as bound and the row marked as decided by value."
              (relv (val rel (nth 4 bound)))
              (onsv (val ons (nth 5 bound)))
              (okeyv (val okey (nth 6 bound)))
-             (runtime (member :bound
-                              (list cv snsv skeyv relv onsv okeyv)))
              (sns-kw (cond ((eq snsv :bound) :bound)
                            (snsv (%namespace-keyword snsv))))
              (ons-kw (cond ((eq onsv :bound) :bound)
                            (onsv (%namespace-keyword onsv))))
              (route (%claim-route cv snsv sns-kw onsv ons-kw
                                   skeyv okeyv relv)))
-        (format nil "~A~:[~;, by value at run time~]"
-                (%claim-route-string route) runtime)))))
+        ;; Decided by value only when the route would differ with the
+        ;; run-time-bound arguments unbound: a bound argument the
+        ;; route never consulted does not mark the row.
+        (flet ((literal (x) (if (eq x :bound) nil x)))
+          (let ((without (%claim-route (literal cv) (literal snsv)
+                                       (literal sns-kw) (literal onsv)
+                                       (literal ons-kw) (literal skeyv)
+                                       (literal okeyv) (literal relv))))
+            (format nil "~A~:[~;, by value at run time~]"
+                    (%claim-route-string route)
+                    (not (eq route without)))))))))
 
 (register-access-path 'claim/7 #'%explain-claim-path)
 (register-access-path 'claim-after/9 #'%explain-claim-path)

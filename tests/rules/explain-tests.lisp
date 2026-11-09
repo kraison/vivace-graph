@@ -49,3 +49,17 @@ when the goal runs (design D3)."
                          (ter-path goal))
                  "~S: ran ~S, explained ~S" goal
                  graph-db::*last-claim-route* (ter-path goal)))))
+
+(test ter-explain-marks-run-time-only-when-the-route-depends-on-it
+  "An argument bound by an earlier goal marks the row as decided at run
+time only when the route consulted it (design D3, docs/rules.md)."
+  (with-rules-graph (g)
+    (seed g)
+    ;; The object namespace never participates: subject side decides.
+    (is (equal "subject-relation index"
+               (ter-path '(claim ?c rt-claim "host" "h1" "runs" ?x ?o)
+                         '((= ?x "app")))))
+    ;; The subject namespace does: by value at run time.
+    (is (search "by value at run time"
+                (ter-path '(claim ?c rt-claim ?ns "h1" ?r ?ons ?o)
+                          '((= ?ns "host")))))))

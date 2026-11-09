@@ -178,9 +178,13 @@ STREAM, the rows are also printed, one line each."
      (cond ((first bound) "type check")
            ((and (second bound) (variable-p type))
             "type index, by value at run time")
+           ((null graph) "every vertex, type by type (no graph to ask)")
            ((second bound)
+            ;; A row, never an error: an ambiguous or unknown name
+            ;; reads as not a type here.
             (if (and (symbolp type)
-                     (lookup-node-type-by-name type :vertex :graph graph))
+                     (ignore-errors
+                      (lookup-node-type-by-name type :vertex :graph graph)))
                 (format nil "type index: ~A" type)
                 (format nil "every vertex, type by type (~A is not a type ~
 here)" type)))

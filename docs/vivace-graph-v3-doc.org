@@ -1132,9 +1132,11 @@ depth)~; unset, a goal call costs what it always did (GH #124).
 ~trace-prolog~ installs a printing hook, for every functor or for the
 ones named (~'ancestor~ every arity, ~'ancestor/2~ one), and
 ~untrace-prolog~ removes it. Over three ~parent~ facts and the usual two
-~ancestor~ clauses, ~(select-flat (?x) (ancestor bob ?x))~ traces as
-follows; the number is the depth, and ~CLAUSE 2/3~ is the second of the
-functor's three clauses, the one the first-argument index left:
+~ancestor~ clauses, ~(select-flat (?x) (ancestor bob ?x))~ under
+~(trace-prolog 'ancestor 'parent)~ traces as follows (unfiltered, the
+engine's own ~select/2~ goal shows too); the number is the depth, and
+~CLAUSE 2/3~ is the second of the functor's three clauses, the one the
+first-argument index left:
 
 #+BEGIN_EXAMPLE
 [0] CALL ANCESTOR/2 (BOB ?1)
@@ -1168,9 +1170,11 @@ its ~FAIL~ on the way out, so a trace always balances. ~(setf
 *prolog-trace* t)~ is something else: the compiler's own chatter.
 
 ~explain-goals~ tells you, without running anything, what each goal
-will do for the arguments bound at that point in the goal list: the
-functor it resolves to, which arguments are bound, and the *access
-path*, from a registry the type, slot, edge, ordered-index, unique,
+will do for the arguments bound at that point in the goal list (a
+variable counts as bound once an earlier goal mentioned it, which is
+the compiler's own reading and can be optimistic for a ~=~ between two
+fresh variables): the functor it resolves to, which arguments are
+bound, and the *access path*, from a registry the type, slot, edge, ordered-index, unique,
 spatial and ~claim/7~ predicates fill (~register-access-path~ adds
 one). An asserted functor reports how many of its clauses the
 first-argument index leaves; a path decided by a value only known at

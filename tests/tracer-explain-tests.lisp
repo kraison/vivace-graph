@@ -258,6 +258,15 @@ whatever package the functor symbol lives in (review focus 4)."
                                   '((= ?s code)
                                     (find-by-slot ?n te-item ?s "x"))))))))
 
+(test te-explain-answers-a-row-with-no-graph-to-ask
+  "explain-goals promises a row, not an error, even when the type
+lookup cannot be made: no graph bound."
+  (let ((rows (let ((*graph* nil))
+                (graph-db:explain-goals '(?p) '((is-a ?p g-person))
+                                        :graph nil))))
+    (is (= 1 (length rows)))
+    (is (search "no graph" (getf (first rows) :path)))))
+
 (test te-explain-prints-a-table-and-flags-cost-unbounded
   (with-test-graph (g)
     (declare (ignore g))
