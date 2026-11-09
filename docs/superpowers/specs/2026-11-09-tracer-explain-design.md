@@ -2,7 +2,13 @@
 
 **Issue:** GH #124, unit 3 of the Prolog Engine 5.0 scope
 (`2026-11-09-prolog-engine-5.0-scope.md`). **Status:** proposed
-2026-11-09; the calls are the author's, Kevin's review pending.
+2026-11-09, revised the same day after a builder check (its six
+questions are settled in D1, D3 and D4 below); the calls are the
+author's, Kevin's review pending. **Builds on unit 2** (PR #483): the
+`:clause` event and `explain`'s candidate counts read the dispatcher
+that branch adds (`%candidates`, `%make-dispatcher`,
+`%clause-index-key` in prologc.lisp), so this unit branches from
+`experiment` once #483 has landed.
 
 ## Intent
 
@@ -14,7 +20,9 @@ goal takes, which nothing today reports. This unit gives the engine the
 standard 4-port box model (call, exit, redo, fail) as a hook that costs
 nothing when unset, a `trace-prolog` that prints it, an `explain` that
 says per goal which access path the engine will take for that binding
-pattern, and a `profile` that runs a query under the hook and counts.
+pattern, and a `profile` that runs a query under the hook and counts. The hook
+costs an untraced call what today's `*prolog-trace*` check costs it:
+one special read and a branch, at the same place.
 
 ## Goals
 
@@ -55,7 +63,8 @@ pattern, and a `profile` that runs a query under the hook and counts.
 - `%solve` (prolog-functors.lisp:~240) is the dynamic meta-call: it
   resolves the functor and `apply`s it to the arguments and `cont`.
 - `trace-prolog` / `untrace-prolog` set and clear `*prolog-trace*`;
-  `%edge-functor/2` and a dozen functors print under it.
+  `%edge-functor/2` and a dozen functors print under it. The manual
+  mentions neither.
 - Access paths are chosen inside each functor from which arguments
   dereference to non-variables: `is-a/2` (node bound: a type check;
   type bound: the type index; neither: every type), `node-slot-value/3`
@@ -64,10 +73,13 @@ pattern, and a `profile` that runs a query under the hook and counts.
   of the type), the `find-*` index predicates (one index each),
   `claim/7` (`%claim-goal`'s `cond`, rules/facts.lisp:300: bound claim,
   subject-relation index, subject index, object index, empty namespace,
-  subject or object vocabulary route, family walk), and since unit 2
-  an asserted functor's dispatcher (`%candidates`).
-- `%static-goal-functors` (prologc.lisp:1007) already walks a goal list
-  through the control constructs to name its functors.
+  subject or object vocabulary route, family walk, the walk refused
+  under a resource bound), and on the unit 2 branch an asserted
+  functor's dispatcher (`%candidates`). `map-edges` with both endpoints
+  reads the vev index per type (edge.lisp:525).
+- `%static-goal-functors` (prologc.lisp:1007) walks a goal list through
+  `and`, `or`, `not`, `if`, `when` and `unless` to name its functors;
+  `once`, `forall` and `call` it records as ordinary functors.
 
 ## Design
 
@@ -92,17 +104,27 @@ candidate the dispatcher is about to try and how many it has.
 
 in place of today's `*prolog-trace*` print and bare funcall, so the
 untraced path reads one special and branches, as it does now.
-`%ported-call` (prologc.lisp) fires `:call`, binds `*prolog-port-depth*`
-one deeper, applies `func` to the arguments and a wrapped continuation
-that fires `:exit`, calls `cont`, then fires `:redo` when `cont`
-returns, and fires `:fail` when `func` returns. `%solve` does the same
-for a dynamic meta-call; the unit 2 dispatcher fires `:clause` before
-each candidate when the hook is set (one special read per dispatch).
-A traced call is not a tail call; an untraced one is, as unit 2 left it.
+`%ported-call` (prologc.lisp), with `d` the depth at entry, fires
+`:call` at `d`, applies `func` to the arguments with
+`*prolog-port-depth*` bound to `d + 1` (so the callee's own goals print
+one level in) and a wrapped continuation that rebinds the depth to `d`
+(so the goals after this one print as its siblings, not its children),
+fires `:exit`, calls `cont`, then fires `:redo` when `cont` returns.
+When `func` returns, `:fail` fires. The whole is under an
+`unwind-protect` whose cleanup fires `:fail` when the call is left by
+a non-local exit before its own `:fail`: a cut's `return-from`, or a
+budget or timeout error from `%tick`, unwinds through every open
+ported call and each reports itself abandoned, so a trace stays
+balanced and a profile under `:max-inferences` still charges every
+functor it left. `%solve` does the same for a dynamic meta-call; the
+unit 2 dispatcher fires `:clause` before each candidate when the hook
+is set (one special read per dispatch). A traced call is not a tail
+call; an untraced one is, as unit 2 left it.
 
 The `*prolog-trace*` prints inside functors stay; `trace-prolog` no
-longer sets that flag, and the manual says `(setf *prolog-trace* t)` is
-the compiler's own chatter, separate from the ports.
+longer sets that flag, and the manual's new section says
+`(setf *prolog-trace* t)` is the compiler's own chatter, separate from
+the ports.
 
 ### D2. `trace-prolog`
 
@@ -147,11 +169,26 @@ the rows are also printed as a table, one goal per line.
 **Binding analysis** is static and left-to-right: a literal is bound; a
 variable is bound once an earlier goal mentioned it, except that a
 `not` or `forall` body binds nothing for the goals after it, and the
-anonymous `?` is never bound. The walk follows `%static-goal-functors`'
-rules through `and`, `or`, `not`, `if`, `once`, `forall` and a static
-`call`; a goal whose head is a variable (a dynamic meta-call) is one
-row with `:kind :control` and the path "meta-call, decided at run
-time". `vars` are unbound at the start.
+anonymous `?` is never bound. The walk is `explain`'s own (a sibling
+of `%static-goal-functors`, which stops at `and`, `or`, `not`, `if`,
+`when`, `unless`): it also enters `once`, `forall` and a static `call`
+with extra arguments appended, as the compiler macros do; a goal whose
+head is a variable (a dynamic meta-call) is one row with
+`:kind :control` and the path "meta-call, decided at run time". `vars`
+are unbound at the start.
+
+**A path that depends on a value the walk does not have** (an
+argument bound by an earlier goal, not a literal) is reported as
+decided at run time: "first-argument index: by value at run time, N
+clauses" for an asserted functor, "ordered index: class and slot by
+value at run time" for `find-by-slot`, and so on; the registry
+function receives the literal where there is one and `:bound` where
+there is not.
+
+**A path a budget may refuse** says so in its string whatever the
+budget, since the walk cannot know it: `claim/7`'s family walk reads
+"family walk; refused under a resource bound", and a functor declared
+cost-unbounded carries ", cost-unbounded".
 
 **Access paths** come from a registry: `(register-access-path
 functor-symbol function)`, the function of `(bound-list args graph)`
@@ -160,7 +197,9 @@ returning the path string. Core registers:
 | functor | bound | path |
 |---|---|---|
 | `is-a/2` | node | "type check" |
-| | type only, a known type | "type index: TYPE" |
+| | type only, a literal naming a type of GRAPH | "type index: TYPE" |
+| | type only, a literal naming no type | "every vertex, type by type (TYPE is not a type here)" |
+| | type only, bound by an earlier goal | "type index, by value at run time" |
 | | neither | "every vertex, type by type" |
 | `node-slot-value/3` | node | "slot read" |
 | | node unbound | "every vertex of every type" |
@@ -168,10 +207,12 @@ returning the path string. Core registers:
 | | from | "ve-out index of FROM" |
 | | to | "ve-in index of TO" |
 | | neither | "every E edge" |
-| `find-by-slot/4`, `find-by-unique/4`, `find-slot-range/5` | | "ordered index on CLASS.SLOT" (or "no such index" when the literal names none) |
+| `find-by-slot/4`, `find-slot-range/5` | class and slot literals | "ordered index on CLASS.SLOT", or "no index on CLASS.SLOT: the call signals" when none is declared |
+| `find-by-unique/4` | class and slot literals | "unique constraint on CLASS.SLOT", or "no unique constraint on CLASS.SLOT: the call signals" |
 | `find-within/3,4`, `find-intersects/3,4`, `find-near/5,6`, `find-nearest/5,6` | | "spatial index" |
-| an asserted functor | first argument bound to a literal | "first-argument index: K of N clauses" |
-| | first argument unbound or a variable | "every clause: N" |
+| an asserted functor | first argument a literal | "first-argument index: K of N clauses" |
+| | first argument bound by an earlier goal | "first-argument index: by value at run time, N clauses" |
+| | first argument unbound, or arity 0 | "every clause: N" |
 | any functor declared cost-unbounded | | its path suffixed ", cost-unbounded" |
 | a functor with no registered path | | "no path declared" |
 
@@ -189,8 +230,7 @@ per-schema step.
 
 The `:user` row's `:candidates` is computed by the same
 `%clause-index-key` and bucket lookup the dispatcher uses, on the
-literal; a bound variable (bound by an earlier goal, value unknown) is
-reported as "first-argument index: by value at run time, N clauses".
+literal, and is `(nil . N)` when the value is only known at run time.
 
 ### D4. `profile-goals`
 
@@ -205,7 +245,10 @@ the four port counts and the summed wall time from each `:call` to its
 `:fail` (inclusive of callees, like a flat profile's "total"), and the
 number of `:clause` events. `rows` is one plist per functor sorted by
 time; with `stream`, a table. The select runs with `:effects nil` and
-`:snapshot t`, the guard's rails, so a profile never writes.
+`:snapshot t`, the guard's rails, so a profile never writes. A run that
+ends in a budget or timeout error still returns its rows, with the
+error as a third value, since D1's cleanup fires the fails on the way
+out; the counts of a run cut short are per-functor totals of what ran.
 
 ### D5. The text entries
 
