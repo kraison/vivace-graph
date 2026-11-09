@@ -21,8 +21,13 @@ the functor registry behaving as they do now.
 ## Goals
 
 - `<-` compiles the new clause and nothing else: the compile cost of
-  an assert is independent of the clause count. The bookkeeping is one
-  vector copy per assert (D5), microseconds at ten thousand clauses.
+  an assert is independent of the clause count. The bookkeeping (D5)
+  is a copy of the closures vector and of the index table, linear in
+  the clause count: measured at about a third of the assert's cost at
+  ten thousand clauses (`docs/perf-baselines.md`).
+- A clause whose last goal calls a functor keeps that call in tail
+  position: a tail-recursive rule runs in constant stack, as the old
+  single-function functor's last clause did.
 - A call whose first argument is bound tries only the clauses whose
   first head argument can unify with it; an unbound first argument
   tries every clause, in source order, as today.
@@ -85,17 +90,22 @@ A clause compiles once, when it is added, into its own function of
 `(arg1 ... argN cont)`: `compile-clause`'s code wrapped as
 
 ```lisp
-(lambda (p1 ... pN cont)
-  (let ((cut nil))
-    (block CLAUSE-BLOCK
-      <compiled body; a cut sets CUT, then returns from CLAUSE-BLOCK>)
-    cut))
+(lambda (cell p1 ... pN cont)
+  (block CLAUSE-BLOCK
+    <compiled body; a cut sets (car CELL) when CELL is non-nil,
+     then returns from CLAUSE-BLOCK>))
 ```
 
 `eval`ed as today (one small lambda, not the whole functor), with
 `*functor*` bound to `CLAUSE-BLOCK` while the body compiles, so the
-cut's `return-from` names it. The closure returns true when its body
-executed a cut, nil otherwise. The `functor` struct gains `arity`, set
+cut's `return-from` names it. `CELL` is the dispatcher's cut cell, a
+cons whose car a cut in this clause sets, or nil when the dispatcher
+will not look (its last candidate). The body is the closure's last
+form: a clause without a cut has no non-local exit, SBCL drops the
+block, and the body's last call is a tail call, which is what keeps a
+tail-recursive rule in constant stack (measured: the unchanged engine
+and this design both pass a 2,000,000-deep probe; a first version
+that read a flag after the block died at 7,000). The `functor` struct gains `arity`, set
 from the first clause's head (the name's `/N` suffix is not parsed; a
 later clause of another arity is a `prolog-error`), `dispatcher` (D2)
 and `clause-set` (D5): the compiled closures, the index and the
@@ -108,11 +118,16 @@ arity-specific dispatcher as the functor's `fn`:
 
 ```lisp
 (lambda (p1 ... pN cont)
-  (let ((old-trail (fill-pointer *trail*)))
-    (do-candidates (fn functor p1)        ; D4 chooses them
-      (when (funcall fn p1 ... pN cont) (return))
-      (undo-bindings old-trail))))
+  (let ((old-trail (fill-pointer *trail*))
+        (cell (list nil)))                ; only when there are 2+
+    <for each candidate but the last (D4 chooses them):
+       undo-bindings between them, (funcall fn cell p1 ... pN cont),
+       stop when (car cell)>
+    (funcall last-fn nil p1 ... pN cont)))   ; tail call
 ```
+
+The walk is inline in the dispatcher (no helper frame, no visit
+closure); one candidate costs no cell at all.
 
 Built by `eval` of a template over the arity when the functor gets its
 first clause (or at `make-functor :clauses`), closing over the struct,
@@ -200,9 +215,13 @@ in the functor's slot in one write, so a reader that fetched the slot
 sees the three consistent with each other and never a position past
 its vector. A published set is never mutated, so no implementation
 needs a read lock: ECL's tables are unsafe only under a concurrent
-write, and the only writes are to a set nobody has seen yet. Position
-vectors are of fixnums; the copy is O(clauses) per assert and the
-compile O(1), which is the point.
+write, and the only writes are to a set nobody has seen yet. An
+assert extends the previous set rather than rebuilding it: the
+closures vector is copied one longer, the index table is copied with
+every bucket vector shared and only the new clause's bucket (or the
+variable positions) replaced by a vector one longer, and only the new
+clause's head is keyed. Position vectors are of fixnums; the copy is
+O(clauses) per assert and the compile O(1), which is the point.
 
 ### D6. Compatibility
 

@@ -1061,6 +1061,58 @@ This is a two-hop traversal: Alice -> Follows -> User -> Authored -> Post.
     ;; The final result is ("Hello, graph world!").
 #+END_SRC
 
+*** Asserted clauses with ~<-~: one closure each, first-argument indexing
+
+~<-~ adds a clause to a user functor at run time, the Prolog
+~assert~: ~(<- (parent alice bob))~ is a fact, ~(<- (ancestor ?a ?c)
+(parent ?a ?b) (ancestor ?b ?c))~ a rule. The functor is named by its
+head and arity (~parent/2~), lives in the image, and answers ~select~
+goals like any built-in predicate.
+
+Since GH #121 each clause compiles once, into its own closure, when it
+is added; the functor's function is a dispatcher built once that walks
+the candidate clauses in source order, undoes bindings between them,
+and stops at a cut. An assert's compile cost is therefore independent
+of how many clauses the functor already has: the unit's bench went
+from 16 asserts per second at 500 clauses to a rate that does not fall
+with the count. The cut keeps its meaning: it commits to the clause,
+discards the clause's earlier choice points and the remaining clauses,
+and ~once~, ~not~ and ~if~ stay opaque to it as before. A clause whose
+last goal calls a functor keeps that call in tail position, so a
+tail-recursive rule runs in constant stack as it always did.
+
+A call whose first argument is bound tries only the clauses whose
+first head argument can unify with it. The index keys that argument as
+a *superset* of ~prolog-equal~, so a bucket may hold a clause that then
+fails unification but never misses one that matches:
+
+| first argument | key |
+|---|---|
+| unbound variable | every clause, in order |
+| ~nil~ or a non-keyword symbol | the symbol |
+| string or keyword | its upcased name (a string and a keyword unify case-insensitively) |
+| number | its ~rational~ value (1 and 1.0 unify) |
+| character | the character |
+| cons | one bucket for every cons |
+| non-string array, non-finite float | every clause (~equalp~ can equal a string) |
+| node, timestamp, other object | only the variable-headed clauses |
+
+Clauses whose first head argument is a variable are merged into every
+lookup by source position, so solution order is exactly what trying
+every clause would give. ~*clause-indexing*~ set to ~nil~ turns the
+index off and tries every clause; set it if you specialise
+~prolog-equal~ to make two values of the indexed types equal across
+those keys (a symbol equal to a string, say).
+
+Introspection: ~(graph-db::functor-clauses (lookup-functor
+(make-functor-symbol 'parent 2)))~ is the ordered clause list;
+~reset-functor~ empties a functor and ~delete-functor~ unregisters it;
+~graph-db::*clause-compile-count*~ counts clause compiles since the
+image started. A clause of another arity than the functor's signals
+~prolog-error~; a functor's arity is part of its name, so ~<-~ can
+never raise that, only a direct ~add-functor-clause~ or
+~make-functor :clauses~ can.
+
 *** Pattern Matching Graph Structures
 
 The most iconic graph query is finding "friends of a friend." Let's find users who are followed by people Alice follows, but who are not Alice herself and are not already followed by Alice.
@@ -1260,56 +1312,6 @@ This is the exact problem that indexes solve in a traditional relational databas
 Both ~def-index~ and ~def-unique~ also take a *slot list* instead of one slot, for an index or constraint over a tuple of values — see "Multi-slot (tuple) indexes and unique constraints" below.
 
 If you just want "find the user whose email is X", the general ordered index is what you want, and it is a one-word slot annotation; see "General ordered indexes" below. Views are the more powerful tool for when that is not enough.
-
-*** Asserted clauses with ~<-~: one closure each, first-argument indexing
-
-~<-~ adds a clause to a user functor at run time, the Prolog
-~assert~: ~(<- (parent alice bob))~ is a fact, ~(<- (ancestor ?a ?c)
-(parent ?a ?b) (ancestor ?b ?c))~ a rule. The functor is named by its
-head and arity (~parent/2~), lives in the image, and answers ~select~
-goals like any built-in predicate.
-
-Since GH #121 each clause compiles once, into its own closure, when it
-is added; the functor's function is a dispatcher built once that walks
-the candidate clauses in source order, undoes bindings between them,
-and stops at a cut. An assert's compile cost is therefore independent
-of how many clauses the functor already has: the unit's bench went
-from 16 asserts per second at 500 clauses to a rate that does not fall
-with the count. The cut keeps its meaning: it commits to the clause,
-discards the clause's earlier choice points and the remaining clauses,
-and ~once~, ~not~ and ~if~ stay opaque to it as before.
-
-A call whose first argument is bound tries only the clauses whose
-first head argument can unify with it. The index keys that argument as
-a *superset* of ~prolog-equal~, so a bucket may hold a clause that then
-fails unification but never misses one that matches:
-
-| first argument | key |
-|---|---|
-| unbound variable | every clause, in order |
-| ~nil~ or a non-keyword symbol | the symbol |
-| string or keyword | its upcased name (a string and a keyword unify case-insensitively) |
-| number | its ~rational~ value (1 and 1.0 unify) |
-| character | the character |
-| cons | one bucket for every cons |
-| non-string array, non-finite float | every clause (~equalp~ can equal a string) |
-| node, timestamp, other object | only the variable-headed clauses |
-
-Clauses whose first head argument is a variable are merged into every
-lookup by source position, so solution order is exactly what trying
-every clause would give. ~*clause-indexing*~ set to ~nil~ turns the
-index off and tries every clause; set it if you specialise
-~prolog-equal~ to make two values of the indexed types equal across
-those keys (a symbol equal to a string, say).
-
-Introspection: ~(graph-db::functor-clauses (lookup-functor
-(make-functor-symbol 'parent 2)))~ is the ordered clause list;
-~reset-functor~ empties a functor and ~delete-functor~ unregisters it;
-~graph-db::*clause-compile-count*~ counts clause compiles since the
-image started. A clause of another arity than the functor's signals
-~prolog-error~; a functor's arity is part of its name, so ~<-~ can
-never raise that, only a direct ~add-functor-clause~ or
-~make-functor :clauses~ can.
 
 *** The "Why": Avoiding Full Graph Scans
 

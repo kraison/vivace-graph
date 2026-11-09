@@ -65,6 +65,37 @@ clause's own cut still commits the clause (design D3)."
       (is (equal '(1 z)     (select-flat (?x) (ci-i2 ?x))))
       (is (equal '(1) (select-flat (?x) (= ?g (ci-f ?x)) (call ?g)))))))
 
+(test ci-a-cut-under-not-does-not-cut-the-clause
+  "A cut inside (not ...) is under the barrier: not fails as it should
+and the dispatcher still reaches clause two.  forall expands through
+not, so it inherits this."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((ci-g 1) (ci-n 1) (ci-fa 1))
+      (<- (ci-g 1)) (<- (ci-g 2)) (<- (ci-g 3))
+      (<- (ci-n ?x) (not (and (ci-g 1) !)) (ci-g ?x))
+      (<- (ci-n z))
+      (<- (ci-fa ?x) (forall (ci-g ?y) (and (> ?y 5) !)) (ci-g ?x))
+      (<- (ci-fa z))
+      (is (equal '(z) (select-flat (?x) (ci-n ?x))))
+      (is (equal '(z) (select-flat (?x) (ci-fa ?x)))))))
+
+(test ci-tail-recursion-runs-in-constant-stack
+  "A clause whose last goal calls itself recurses as deep as before
+#121: the dispatcher tail-calls its last candidate and the clause
+closure's body is in tail position, so the default control stack
+holds a depth the old single-function functor held (design D2)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((ci-down 1))
+      (<- (ci-down 0))
+      (<- (ci-down ?n) (> ?n 0) (lisp ?m (1- ?n)) (ci-down ?m))
+      (let ((outcome (handler-case
+                         (select (:max-inferences 10000000) (?r)
+                           (lisp ?x 200000) (ci-down ?x) (= ?r done))
+                       (storage-condition () :stack-exhausted))))
+        (is (equal '((done)) outcome))))))
+
 (test ci-an-assert-after-set-functor-fn-wins
   "A function set by SET-FUNCTOR-FN answers until the next assert, which
 reinstalls the dispatcher (design D2)."

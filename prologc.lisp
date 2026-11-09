@@ -772,18 +772,20 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
                     #'(lambda (&rest args) (declare (ignore args)) nil))))
 
 (defun %compile-clause-fn (functor clause)
-  "CLAUSE as its own closure of (ARG1 .. ARGN CONT), true when its body
-executed a cut (design D1, GH #121).  *FUNCTOR* is the clause's block
-while it compiles, so the cut returns from it."
+  "CLAUSE as its own closure of (CELL ARG1 .. ARGN CONT) (design D1,
+GH #121).  CELL is the dispatcher's cut cell, a cons whose car a cut
+in this clause sets, or NIL when the dispatcher will not look (its
+last candidate); the body is the closure's last form, so a clause
+whose last goal calls a functor keeps that call in tail position.
+*FUNCTOR* is the clause's block while it compiles, so the cut returns
+from it."
   (let* ((parameters (make-parameters (functor-arity functor)))
          (block-name (gensym "CLAUSE"))
-         (cut (gensym "CUT"))
+         (cell (gensym "CELL"))
          (body (let ((*functor* block-name))
-                 (compile-clause parameters clause 'cont :cut-flag cut)))
-         (func `(lambda (,@parameters cont)
-                  (let ((,cut nil))
-                    (block ,block-name ,body)
-                    ,cut))))
+                 (compile-clause parameters clause 'cont :cut-flag cell)))
+         (func `(lambda (,cell ,@parameters cont)
+                  (block ,block-name ,body))))
     (when *prolog-trace*
       (format t "TRACE: clause ~A of ~A~%" func (functor-name functor)))
     (incf *clause-compile-count*)
@@ -820,77 +822,105 @@ call of any key may reach the clause."
             (values nil t)
             (values key nil)))))
 
-(defun %build-clause-set (functor clauses fns)
-  "A fresh CLAUSE-SET over FNS (design D4): each clause's position under
-its head's key, or among VARS when any key may reach it; ascending."
-  (declare (ignore functor))
-  (let ((buckets (make-hash-table :test 'equal))
-        (index (make-hash-table :test 'equal))
-        (vars '()))
-    (loop for clause in clauses
-          for pos from 0
-          do (let ((head-args (args (clause-head clause))))
-               (if (null head-args)
-                   (push pos vars)
-                   (multiple-value-bind (key var-p)
-                       (%head-index-key (first head-args))
-                     (if var-p
-                         (push pos vars)
-                         (push pos (gethash key buckets)))))))
-    (maphash (lambda (key positions)
-               (setf (gethash key index)
-                     (coerce (nreverse positions) 'simple-vector)))
-             buckets)
-    (%make-clause-set :fns fns :index index
-                      :vars (coerce (nreverse vars) 'simple-vector))))
+(defun %extend-clause-set (old clause fn)
+  "OLD with CLAUSE's closure FN appended, as a fresh CLAUSE-SET (design
+D4, D5): the closures vector copied and extended, the index table
+copied with one bucket (or VARS) replaced by a fresh vector one longer,
+every other bucket shared, since a published vector is never written.
+No head but CLAUSE's is keyed again."
+  (let* ((old-fns (clause-set-fns old))
+         (pos (length old-fns))
+         (fns (make-array (1+ pos)))
+         (old-index (clause-set-index old))
+         (index (make-hash-table :test 'equal
+                                 :size (max 16 (* 2 (hash-table-count
+                                                     old-index)))))
+         (head-args (args (clause-head clause)))
+         (vars (clause-set-vars old)))
+    (replace fns old-fns)
+    (setf (svref fns pos) fn)
+    (maphash (lambda (key bucket) (setf (gethash key index) bucket))
+             old-index)
+    (flet ((extended (vector)
+             (let ((new (make-array (1+ (length vector)))))
+               (replace new vector)
+               (setf (svref new (length vector)) pos)
+               new)))
+      (multiple-value-bind (key var-p)
+          (if (null head-args)
+              (values nil t)
+              (%head-index-key (first head-args)))
+        (if var-p
+            (setf vars (extended vars))
+            (setf (gethash key index)
+                  (extended (or (gethash key old-index) #()))))))
+    (%make-clause-set :fns fns :index index :vars vars)))
 
-(defun %map-candidates (visit set &optional (first-arg nil first-arg-p))
-  "VISIT on each candidate closure of SET for FIRST-ARG, in source
-order, stopping when VISIT returns true (a cut).  Without FIRST-ARG
-(arity 0), with *CLAUSE-INDEXING* off, or for a value no key covers,
-every clause; else the merge, by position, of the key's bucket and the
-variable-headed clauses."
-  (let ((fns (clause-set-fns set))
-        (vars (clause-set-vars set)))
-    (flet ((walk-all ()
-             (dotimes (i (length fns) nil)
-               (when (funcall visit (svref fns i)) (return t))))
-           (walk (bucket)
-             (let ((i 0) (j 0) (ni (length bucket)) (nj (length vars)))
-               (loop
-                 (let ((pos (cond ((and (< i ni)
-                                        (or (>= j nj)
-                                            (< (svref bucket i)
-                                               (svref vars j))))
-                                   (prog1 (svref bucket i) (incf i)))
-                                  ((< j nj) (prog1 (svref vars j) (incf j)))
-                                  (t (return nil)))))
-                   (when (funcall visit (svref fns pos)) (return t)))))))
-      (if (or (not *clause-indexing*) (not first-arg-p))
-          (walk-all)
-          (multiple-value-bind (key all-p) (%clause-index-key first-arg)
-            (cond (all-p (walk-all))
-                  ((eq key :opaque) (walk #()))
-                  (t (walk (or (gethash key (clause-set-index set))
-                               #())))))))))
+(defun %candidates (set first-arg first-arg-p)
+  "(VALUES BUCKET ALL-P) for a call of SET with FIRST-ARG (design D4):
+ALL-P means every clause, in order; else the candidates are BUCKET
+merged with the set's VARS by position.  No FIRST-ARG (arity 0), the
+index off, or a value no key covers: every clause."
+  (if (or (not first-arg-p) (not *clause-indexing*))
+      (values nil t)
+      (multiple-value-bind (key all-p) (%clause-index-key first-arg)
+        (cond (all-p (values nil t))
+              ((eq key :opaque) (values #() nil))
+              (t (values (or (gethash key (clause-set-index set)) #())
+                         nil))))))
 
 (defun %make-dispatcher (functor arity)
   "FUNCTOR's function, built once over ARITY (design D2): the current
 clause set's candidates in order, bindings undone between them, no
-further clause after one that cut."
+further candidate after one that cut.  The walk is inline and the last
+candidate is tail-called with no cut cell, so a Prolog call level
+costs this frame and the clause closure's, and a clause whose last
+goal recurses runs in constant stack as the old single function did
+(GH #121)."
   (let ((parameters (make-parameters arity)))
     (funcall
-     (eval `(lambda (functor)
-              (lambda (,@parameters cont)
-                (let ((set (functor-clause-set functor))
-                      (old-trail (fill-pointer *trail*))
-                      (first t))
-                  (%map-candidates
-                   (lambda (fn)
-                     (if first (setf first nil) (undo-bindings old-trail))
-                     (funcall fn ,@parameters cont))
-                   set ,@(when (plusp arity) (list (first parameters))))
-                  nil))))
+     (eval
+      `(lambda (functor)
+         (lambda (,@parameters cont)
+          (block dispatch
+           (let* ((set (functor-clause-set functor))
+                  (fns (clause-set-fns set))
+                  (old-trail (fill-pointer *trail*)))
+             (multiple-value-bind (bucket all-p)
+                 (%candidates set ,@(if (plusp arity)
+                                        (list (first parameters) t)
+                                        (list nil nil)))
+               (let* ((vars (clause-set-vars set))
+                      (ni (if all-p (length fns) (length bucket)))
+                      (nj (if all-p 0 (length vars)))
+                      (n (+ ni nj))
+                      (i 0) (j 0))
+                 (declare (fixnum ni nj n i j))
+                 ;; NEXT: the next candidate position, all of them in
+                 ;; order when ALL-P, else BUCKET merged with VARS.
+                 (flet ((next ()
+                          (cond (all-p (prog1 i (incf i)))
+                                ((and (< i ni)
+                                      (or (>= j nj)
+                                          (< (svref bucket i)
+                                             (svref vars j))))
+                                 (prog1 (svref bucket i) (incf i)))
+                                (t (prog1 (svref vars j) (incf j))))))
+                   (declare (inline next))
+                   (cond
+                     ((zerop n) nil)
+                     ((= n 1)
+                      (funcall (svref fns (next)) nil ,@parameters cont))
+                     (t
+                      (let ((cell (list nil)))
+                        (dotimes (k (1- n))
+                          (unless (zerop k) (undo-bindings old-trail))
+                          (funcall (svref fns (next)) cell ,@parameters cont)
+                          (when (car cell)
+                            (return-from dispatch nil)))
+                        (undo-bindings old-trail)
+                        (funcall (svref fns (next)) nil
+                                 ,@parameters cont))))))))))))
      functor)))
 
 (defun %add-compiled-clause (functor clause)
@@ -898,16 +928,11 @@ further clause after one that cut."
 published in one slot write, and the dispatcher installed as FN unless
 FN already is it (design D2, D5)."
   (%clause-arity functor clause)
-  (let* ((fn (%compile-clause-fn functor clause))
-         (old-fns (clause-set-fns (functor-clause-set functor)))
-         (n (length old-fns))
-         (fns (make-array (1+ n))))
-    (replace fns old-fns)
-    (setf (svref fns n) fn)
+  (let ((fn (%compile-clause-fn functor clause)))
     (setf (functor-clauses functor)
           (nconc (functor-clauses functor) (list clause)))
     (setf (functor-clause-set functor)
-          (%build-clause-set functor (functor-clauses functor) fns))
+          (%extend-clause-set (functor-clause-set functor) clause fn))
     (unless (functor-dispatcher functor)
       (setf (functor-dispatcher functor)
             (%make-dispatcher functor (functor-arity functor))))
@@ -925,7 +950,8 @@ FN already is it (design D2, D5)."
     ((or (eq (first body) '!) (eq (first body) 'cut)
          (equalp (first body) "cut"))
      `(progn ,(compile-body (rest body) cont bindings)
-             ,@(when *clause-cut-flag* `((setf ,*clause-cut-flag* t)))
+             ,@(when *clause-cut-flag*
+                 `((when ,*clause-cut-flag* (setf (car ,*clause-cut-flag*) t))))
              (return-from ,(or *functor* :prolog-select) nil)))
     (t
      (when *prolog-trace*
