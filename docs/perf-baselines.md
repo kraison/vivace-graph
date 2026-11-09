@@ -138,3 +138,21 @@ GH #255.)
   at 658/s (#123); and the recursive ring closure exhausting the control
   stack in 0.09 s with no solution (#122). Each unit reruns the same
   bench when it lands and posts both rows on its issue.
+- **Unit 2, clause indexing, after** (#121):
+  `results/prolog-after-u2-odm-6e416f7.report`, same host, SBCL and
+  generation, 2026-11-09, third of three runs. 500 asserts at 430/s
+  (was 16/s; runs 1 and 2: 488/s, 289/s), 5,000 bound lookups at
+  263,144/s (was 49,998/s); the new `clause-assert-10k` case asserts
+  10,000 clauses in 19.6 s (510/s; runs 1 and 2: 25.3 s, 25.5 s) and
+  answers 20,000 bound lookups at 192,298/s. An assert extends the
+  previous immutable clause set (one bucket replaced, the rest shared)
+  rather than rebuilding it, so the per-assert rate at 10,000 clauses
+  matches the rate at 500. The dispatcher tail-calls its last
+  candidate and a clause closure's body is its last form, so a
+  tail-recursive rule keeps constant stack: a probe recursing 2,000,000
+  deep passes on the unchanged engine and on this one, where a first
+  version that read a cut flag after the clause block died at 7,000.
+  `recursive-ring-closure` still exhausts the stack (its recursion
+  runs inside edge-generator frames, not a tail call); it does so in
+  0.065 s against 0.09 s before, a smaller frame per level, not a
+  change of outcome. The other rows are unchanged within noise.

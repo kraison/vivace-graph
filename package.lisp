@@ -545,6 +545,7 @@
            #:*trail*
            #:*var-counter*
            #:*functor*
+           #:*clause-indexing*
            #:make-functor
            #:maybe-add-undo-bindings
            #:compile-clause

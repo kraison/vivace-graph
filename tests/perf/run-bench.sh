@@ -21,7 +21,8 @@ fi
 case "$1" in
   run-prolog-bench)
     CALL="(graph-db/perf-test::run-prolog-bench :scale :small)" ;;
-  bench-clause-assert | bench-guarded-shape-repeat | bench-recursive-ring \
+  bench-clause-assert | bench-clause-assert-10k \
+  | bench-guarded-shape-repeat | bench-recursive-ring \
   | bench-change-feed-cursor | bench-graph-predicates)
     CALL="(graph-db/perf-test::run-prolog-bench :scale :small :only 'graph-db/perf-test::$1)" ;;
   *)
