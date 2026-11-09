@@ -281,6 +281,7 @@
            #:*query-default-limit*
            #:*query-default-max-inferences*
            #:*query-default-timeout*
+           #:clamp-row-cap #:probe-limit    ; the one row-cap rule (GH #328)
            #:query-param-error
            ;; checked query preconditions, typed (GH #286)
            #:query-precondition-error #:query-precondition-error-reason

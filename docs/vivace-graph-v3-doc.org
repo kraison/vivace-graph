@@ -2485,6 +2485,15 @@ reaches the Prolog compiler. In order (~gui/prolog.lisp~):
    distinct names add no symbol to ~GRAPH-DB~ or ~KEYWORD~ and no
    package to the image.
 
+The pipeline is also exported in pieces (~docs/guarded-query.md~):
+~guard-query-text~ is steps 2 to 4, returning the guarded goals for a
+caller that keeps them; ~run-guarded-goals~ is step 5 over those goals,
+with ~run-guarded-prolog~'s cap, probe, paging and budgets (GH #383);
+and ~scan-query-text~ with ~with-screened-forms~ is steps 2 and 3 alone,
+the screened reader for an embedder with its own dispatch (GH #366).
+~*prolog-max-query-length*~ is enforced by the screen itself, so every
+entry refuses an overlong text, not only the GUI endpoint.
+
 The whitelist is *derived from the live image*, never hand-maintained:
 the ~(name . arity)~ pairs are enumerated out of
 ~*prolog-global-functors*~ and ~*user-functors*~ (so a graph's edge

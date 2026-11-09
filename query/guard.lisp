@@ -9,7 +9,7 @@
 ;;;;
 ;;;;   1. *ALLOW-PROLOG*     -- the flag, stays in the GUI handler
 ;;;;      (gui/prolog.lisp), checked before the graph is resolved.
-;;;;   2. %SCAN-QUERY-TEXT   -- a character screen that runs BEFORE the
+;;;;   2. SCAN-QUERY-TEXT   -- a character screen that runs BEFORE the
 ;;;;      reader: length, paren depth/balance, and an outright refusal
 ;;;;      of #, `, , and the package marker.  Refusing ':' textually is
 ;;;;      what makes package-qualified input safe -- READ would intern
@@ -23,7 +23,7 @@
 ;;;;      slot of THIS graph, a ?variable, or T/NIL.
 ;;;;   5. RUN-QUERY-GOALS    -- query/dsl.lisp's own runner: :EFFECTS
 ;;;;      NIL, one snapshot, the inference/time/row bounds.  Reached
-;;;;      through %RUN-GUARDED-GOALS in this file.  Goal heads resolve
+;;;;      through %GUARDED-ROWS in this file.  Goal heads resolve
 ;;;;      each in its own package now, not one shared :PACKAGE
 ;;;;      (GH #322).
 ;;;;   6. DELETE-PACKAGE     -- in an UNWIND-PROTECT, so a hostile
@@ -122,15 +122,19 @@ honouring backslash escapes.  Refuses an unterminated region."
               ((char= ch close) (return (1+ i)))
               (t (incf i)))))))
 
-(defun %scan-query-text (text)
-  "Screen TEXT before the reader touches it (GH #279).
+(defun scan-query-text (text)
+  "Screen TEXT before the reader touches it (GH #279, #366).
 
-Refuses, by name: the package marker (so no READ can intern into
-GRAPH-DB or a schema package), every # reader macro (#. above all),
-backquote and comma, unbalanced or over-deep parentheses, and an
-unterminated string or |...| name.  Inside a string or a |...| name
-none of those characters mean anything, so a literal \"#.(...)\" is
-data and passes -- the guard refuses reader syntax, not text."
+Refuses, by name: a text longer than *PROLOG-MAX-QUERY-LENGTH* (GH
+#366), the package marker (so no READ can intern into GRAPH-DB or a
+schema package), every # reader macro (#. above all), backquote and
+comma, unbalanced or over-deep parentheses, and an unterminated string
+or |...| name.  Inside a string or a |...| name none of those
+characters mean anything, so a literal \"#.(...)\" is data and passes
+-- the guard refuses reader syntax, not text."
+  (when (> (length text) *prolog-max-query-length*)
+    (%refuse "query is ~D characters; the limit is ~D"
+             (length text) *prolog-max-query-length*))
   (let ((depth 0) (i 0) (n (length text)))
     (loop while (< i n) do
       (let ((ch (char text i)))
@@ -183,7 +187,7 @@ evaluation) least of all"
 
 (defun %prolog-readtable ()
   "A copy of the standard readtable with #, ` and , disabled.  Second
-line of defence: %SCAN-QUERY-TEXT already refuses these characters, so
+line of defence: SCAN-QUERY-TEXT already refuses these characters, so
 this only fires if that screen is ever wrong."
   (or *prolog-readtable*
       (setq *prolog-readtable*
@@ -227,7 +231,7 @@ instead (GH #315)."
 SBCL signals on 1e999999 and ECL reads infinity, both refused later; CCL
 clamps it to the largest float, a finite number the non-finite screen
 cannot tell from a real one (GH #315).  Strings, |...| names and
-comments are skipped, as %SCAN-QUERY-TEXT skips them."
+comments are skipped, as SCAN-QUERY-TEXT skips them."
   (let ((i 0) (n (length text)))
     (flet ((delimiter-p (ch)
              (or (member ch '(#\Space #\Tab #\Newline #\Return #\Page))
@@ -617,13 +621,13 @@ would sail past the read guard and 500 at JSON encoding (GH #309)."
          (%refuse "the query could not be read: check the quoting and ~
 the numeric literals"))))
 
-(defun %read-guarded-forms (text scratch ctx)
-  "TEXT screened, read into SCRATCH, and guarded through CTX -- steps 2,
-3 and 4 in order.  The screen runs FIRST and on the raw characters:
-once READ has resolved a package-qualified name the interning it was
-meant to prevent has already happened.  Every way READ can fail is a
-refusal, so a malformed query is a 400 and never a 500."
-  (%scan-query-text text)
+(defun %read-screened-forms (text scratch)
+  "TEXT screened and read into SCRATCH: the forms, steps 2 and 3.  The
+screen runs FIRST and on the raw characters: once READ has resolved a
+package-qualified name the interning it was meant to prevent has
+already happened.  Every way READ can fail is a refusal, so a malformed
+query is a 400 and never a 500."
+  (scan-query-text text)
   (%screen-exponent-text text)
   (let ((forms (handler-case (%read-query-forms text scratch)
                  (prolog-guard-error (c) (error c))
@@ -641,7 +645,32 @@ parentheses or an unterminated string"))
                    (%refuse "the query could not be read: check the ~
 quoting and the numeric literals")))))
     (%screen-non-finite forms)
-    (%guard-query forms ctx)))
+    forms))
+
+(defun %read-guarded-forms (text scratch ctx)
+  "TEXT screened, read into SCRATCH, and guarded through CTX -- steps 2,
+3 and 4 in order (see %READ-SCREENED-FORMS)."
+  (%guard-query (%read-screened-forms text scratch) ctx))
+
+(defun call-with-screened-forms (text function)
+  "FUNCTION called with TEXT's forms, screened and read as the guard
+reads them (GH #366): the screen refuses package markers, every #
+macro, backquote and comma, unbalanced or over-deep parentheses, an
+unterminated string, an absurd exponent and a text longer than
+*PROLOG-MAX-QUERY-LENGTH*; the read interns into a scratch package
+that uses nothing and is deleted when FUNCTION returns or unwinds, so
+nothing lands in a caller's package and a symbol is to be compared by
+SYMBOL-NAME.  Refusals signal PROLOG-GUARD-ERROR.  Returns FUNCTION's
+values."
+  (let ((scratch (%make-scratch-package)))
+    (unwind-protect
+         (funcall function (%read-screened-forms text scratch))
+      (delete-package scratch))))
+
+(defmacro with-screened-forms ((forms text) &body body)
+  "BODY with FORMS bound to TEXT's screened forms; see
+CALL-WITH-SCREENED-FORMS."
+  `(call-with-screened-forms ,text (lambda (,forms) ,@body)))
 
 (defvar *no-applicable-method-type*
   (or #+sbcl (find-symbol "NO-APPLICABLE-METHOD-ERROR" "SB-PCL")
@@ -725,22 +754,12 @@ cut recorded."
 ;;; Step 5-6: the runner, exported (spec SS4, GH #322)
 ;;; ---------------------------------------------------------------------
 
-(defun %clamp-cap (limit)
-  (if (and (integerp limit) (plusp limit))
-      (min limit graph-db::*query-default-limit*)
-      graph-db::*query-default-limit*))
-
-(defun %probe (cap)
-  "One past CAP tells truncated from exactly full; at the ceiling there
-is no room, so an exactly-full page reads as truncated (GH #278)."
-  (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
-
 (defun %clamp-offset (offset)
   "OFFSET as the DSL's :SKIP: a positive integer passes, anything else
 is no offset (GH #387)."
   (and (integerp offset) (plusp offset) offset))
 
-(defun %run-guarded-goals (vars goals graph probe &optional skip)
+(defun %guarded-rows (vars goals graph probe &optional skip)
   "The already-guarded query's rows, RAW, at most PROBE of them after
 the first SKIP, with the GUI's three-way condition contract (GH #279).
 No :PACKAGE is passed -- each head resolves in its own package (GH
@@ -763,6 +782,33 @@ No :PACKAGE is passed -- each head resolves in its own package (GH
                         (type-of c) c)
              (error 'prolog-server-fault))))))
 
+(defun run-guarded-goals (vars goals graph &key limit offset
+                                                max-inferences timeout
+                                                (format :data))
+  "Run already-guarded GOALS collecting VARS, as GUARD-QUERY-TEXT
+returned them, under RUN-GUARDED-PROLOG's rails: (VALUES COLUMNS ROWS
+TRUNCATED-P), the same contract, keyword for keyword.  For a caller
+that guards once and runs many times (GH #383)."
+  (check-type format (member :data :raw))
+  (let* ((cap (graph-db:clamp-row-cap limit))
+         (probe (graph-db:probe-limit cap))
+         (skip (%clamp-offset offset))
+         (graph-db::*query-default-max-inferences*
+           (or max-inferences graph-db::*query-default-max-inferences*))
+         (graph-db::*query-default-timeout*
+           (or timeout graph-db::*query-default-timeout*))
+         (rows (%guarded-rows vars goals graph probe skip))
+         (n (length rows))
+         (truncated (if (> probe cap) (> n cap) (>= n cap)))
+         (shown (if (> n cap) (subseq rows 0 cap) rows)))
+    (values (mapcar #'graph-db::%query-var-field vars)
+            (if (eq format :data)
+                (mapcar (lambda (row)
+                          (mapcar #'graph-db::%query-value->json row))
+                        shown)
+                shown)
+            (and truncated t))))
+
 (defun run-guarded-prolog (text graph &key limit offset max-inferences
                                             timeout (format :data))
   "Screen, read, guard and run TEXT against GRAPH; (VALUES COLUMNS ROWS
@@ -776,28 +822,13 @@ produced and still count against the budgets, which MAX-INFERENCES and
 TIMEOUT bind for this call.  Refusals signal PROLOG-GUARD-ERROR; see
 the header for the rest of the condition contract (spec SS4, GH #322)."
   (check-type format (member :data :raw))
-  (let* ((scratch (%make-scratch-package))
-         (cap (%clamp-cap limit))
-         (probe (%probe cap))
-         (skip (%clamp-offset offset))
-         (graph-db::*query-default-max-inferences*
-           (or max-inferences graph-db::*query-default-max-inferences*))
-         (graph-db::*query-default-timeout*
-           (or timeout graph-db::*query-default-timeout*)))
+  (let ((scratch (%make-scratch-package)))
     (unwind-protect
          (multiple-value-bind (vars goals)
              (%read-guarded-forms text scratch (%guard-context graph scratch))
-           (let* ((rows (%run-guarded-goals vars goals graph probe skip))
-                  (n (length rows))
-                  (truncated (if (> probe cap) (> n cap) (>= n cap)))
-                  (shown (if (> n cap) (subseq rows 0 cap) rows)))
-             (values (mapcar #'graph-db::%query-var-field vars)
-                     (if (eq format :data)
-                         (mapcar (lambda (row)
-                                   (mapcar #'graph-db::%query-value->json row))
-                                 shown)
-                         shown)
-                     (and truncated t))))
+           (run-guarded-goals vars goals graph :limit limit :offset offset
+                              :max-inferences max-inferences
+                              :timeout timeout :format format))
       (delete-package scratch))))
 
 (defun guard-query-text (text graph)

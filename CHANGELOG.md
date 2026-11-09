@@ -48,6 +48,11 @@ storage formats (#60).
   instantiation keys, over a join, a `not`, a comparison, a standing
   filter and a family-wide read, through retractions, deletions and a
   slot update.
+- **The screened reader is exported** (#366): `scan-query-text`,
+  `call-with-screened-forms`, `with-screened-forms`.
+- **`run-guarded-goals`** (#383): `run-guarded-prolog`'s run half,
+  exported, for a caller that kept `guard-query-text`'s goals; the doc
+  no longer calls `run-query-goals` exported.
 
 ### Fixed
 
@@ -70,6 +75,13 @@ storage formats (#60).
 
 ### Changed
 
+- **`*prolog-max-query-length*` is enforced by the screen** (#366):
+  `run-guarded-prolog` and `guard-query-text` refuse an overlong text;
+  it was the GUI endpoint's check alone.
+- **One home for the row-cap and probe rule** (#328):
+  `graph-db:clamp-row-cap` and `graph-db:probe-limit`; the guard's and
+  the GUI's private copies are gone, and `run-query-goals` uses the same
+  function.
 - **A production's instantiation key keeps body position, and its
   firing claim carries the key in the clear** (#471, #466). The key was
   the premises' identity keys sorted, so a self-join's `(a,b)` and
