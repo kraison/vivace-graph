@@ -129,3 +129,52 @@ behind (review focus 2)."
                             (push (list port f) log))
           (select-flat (?x) (lisp ?x (error "callee")))))
       (is (member :fail log :key #'first)))))
+
+;;; trace-prolog (design D2).
+
+(defun te-trace-text (thunk &rest names)
+  "THUNK's trace through TRACE-PROLOG on NAMES, as a string."
+  (let ((*trace-output* (make-string-output-stream)))
+    (unwind-protect
+         (progn (apply #'graph-db:trace-prolog names)
+                (funcall thunk)
+                (get-output-stream-string *trace-output*))
+      (graph-db:untrace-prolog))))
+
+(test te-trace-prolog-prints-ports-indented
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((te-g 1) (te-h 1))
+      (<- (te-g 1)) (<- (te-h ?x) (te-g ?x))
+      (let ((text (te-trace-text
+                   (lambda () (select-flat (?x) (te-h ?x))))))
+        (is (search "[0] CALL TE-H/1 (" text))
+        (is (search "[1]   CALL TE-G/1 (" text))
+        (is (search "[1]   EXIT TE-G/1 (1)" text))
+        (is (search "[0] EXIT TE-H/1 (1)" text))
+        (is (search "CLAUSE TE-G/1 1/1" text))
+        (is (search "[0] FAIL TE-H/1" text))))))
+
+(test te-trace-prolog-filters-by-name-across-packages
+  "A bare name traces every arity of that functor and nothing else,
+whatever package the functor symbol lives in (review focus 4)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-transaction () (make-g-person :name "te-a"))
+    (ci-with-functors ((te-g 1))
+      (<- (te-g 1))
+      (let ((text (te-trace-text
+                   (lambda ()
+                     (select-flat (?x) (is-a ?p g-person) (te-g ?x)))
+                   'te-g)))
+        (is (search "TE-G/1" text))
+        (is (null (search "IS-A/2" text))))
+      (let ((text (te-trace-text
+                   (lambda () (select-flat (?a) (g-knows ?a ?b)))
+                   'g-knows)))
+        (is (search "G-KNOWS/2" text))))))
+
+(test te-untrace-prolog-clears-the-hook
+  (graph-db:trace-prolog)
+  (graph-db:untrace-prolog)
+  (is (null graph-db:*prolog-port-hook*)))

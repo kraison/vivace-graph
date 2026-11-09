@@ -96,6 +96,12 @@ storage formats (#60).
 
 ### Changed
 
+- **`trace-prolog` prints the four ports** (#124), one line per
+  call, exit, redo and fail indented by depth, plus the clause a
+  dispatcher tries; `(trace-prolog 'name)` traces every arity of one
+  functor and `'name/2` one arity, matched by name so a schema
+  package's edge functor is named as written. It no longer sets
+  `*prolog-trace*`, which stays the compiler's own chatter.
 - **`<-` compiles the clause it adds, not the functor** (#121). Each
   asserted clause is its own closure and the functor's function is a
   dispatcher built once, so an assert's compile cost no longer grows

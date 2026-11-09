@@ -44,8 +44,50 @@
   (with-lock ((pg-lock *prolog-gensym*))
     (push symbol (pg-symbols *prolog-gensym*))))
 
-(defun trace-prolog () (setq *prolog-trace* t))
-(defun untrace-prolog () (setq *prolog-trace* nil))
+(defvar *traced-functor-names* nil
+  "NIL for every functor, else the names TRACE-PROLOG was given, as
+strings: \"NAME/N\" for one arity, \"NAME/\" for every arity.")
+
+(defun %traced-p (functor)
+  (or (null *traced-functor-names*)
+      (let ((name (symbol-name functor)))
+        (some (lambda (pattern)
+                (if (char= (char pattern (1- (length pattern))) #\/)
+                    (and (> (length name) (length pattern))
+                         (string= pattern name :end2 (length pattern)))
+                    (string= pattern name)))
+              *traced-functor-names*))))
+
+(defun %print-port (port functor args depth)
+  "One trace line per port to *TRACE-OUTPUT* (tracer design D2, GH
+#124): [DEPTH], two spaces per level, the port, the functor, and the
+arguments dereferenced; a :CLAUSE event as POS/N, 1-based."
+  (when (%traced-p functor)
+    (let ((*print-length* 8) (*print-level* 3) (*print-pretty* nil))
+      (format *trace-output* "~&[~D] ~v@{  ~}~A ~A" depth depth
+              (symbol-name port) (symbol-name functor))
+      (if (eq port :clause)
+          (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args))
+          (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args)))
+      (finish-output *trace-output*))))
+
+(defun trace-prolog (&rest names)
+  "Print the four ports of every goal call, or of the functors NAMES
+name: a symbol with an arity suffix (TE-G/1) traces that functor, a
+bare one (TE-G) every arity of it; matched by name, so a functor in a
+schema package is named as written.  The compiler's own chatter is
+*PROLOG-TRACE*, separate (GH #124)."
+  (setf *traced-functor-names*
+        (mapcar (lambda (n)
+                  (let ((s (string-upcase (string n))))
+                    (if (find #\/ s) s (concatenate 'string s "/"))))
+                names))
+  (setf *prolog-port-hook* #'%print-port)
+  names)
+
+(defun untrace-prolog ()
+  "Stop printing the ports."
+  (setf *prolog-port-hook* nil *traced-functor-names* nil))
 
 (define-condition prolog-error (error)
   ((reason :initarg :reason :initform nil)
