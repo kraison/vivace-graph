@@ -270,3 +270,52 @@ whatever package the functor symbol lives in (review focus 4)."
       (is (= 2 (length rows)))
       (is (search "IS-A/2" text))
       (is (search "cost-unbounded" (getf (second rows) :path))))))
+
+;;; profile-goals (design D4).
+
+(test te-profile-counts-match-the-ports
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((te-g 1))
+      (<- (te-g 1)) (<- (te-g 2))
+      (multiple-value-bind (solutions rows err)
+          (graph-db:profile-goals '(?x) '((te-g ?x)))
+        (is (= 2 solutions))
+        (is (null err))
+        (let ((row (find "TE-G/1" rows
+                         :key (lambda (r) (symbol-name (getf r :functor)))
+                         :test #'string=)))
+          (is (= 1 (getf row :calls)))
+          (is (= 2 (getf row :exits)))
+          (is (= 2 (getf row :redos)))
+          (is (= 1 (getf row :fails)))
+          (is (= 2 (getf row :clauses)))
+          (is (and (realp (getf row :seconds)) (>= (getf row :seconds) 0))))))))
+
+(test te-profile-under-a-budget-returns-rows-and-the-error
+  "Review focus 5: a tripped budget still yields balanced rows, and the
+error comes back as the third value."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((te-g 1))
+      (<- (te-g 1)) (<- (te-g 2)) (<- (te-g 3))
+      (multiple-value-bind (solutions rows err)
+          (graph-db:profile-goals '(?x ?y ?z)
+                                  '((te-g ?x) (te-g ?y) (te-g ?z))
+                                  :max-inferences 2)
+        (declare (ignore solutions))
+        (is (typep err 'graph-db:prolog-resource-error))
+        (let ((row (find "TE-G/1" rows
+                         :key (lambda (r) (symbol-name (getf r :functor)))
+                         :test #'string=)))
+          (is (plusp (getf row :calls)))
+          (is (= (getf row :calls) (getf row :fails))))))))
+
+(test te-profile-prints-a-table
+  (with-test-graph (g)
+    (declare (ignore g))
+    (ci-with-functors ((te-g 1))
+      (<- (te-g 1))
+      (let ((text (with-output-to-string (s)
+                    (graph-db:profile-goals '(?x) '((te-g ?x)) :stream s))))
+        (is (search "TE-G/1" text))))))

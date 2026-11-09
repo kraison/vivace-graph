@@ -191,3 +191,70 @@ here)" type)))
  (lambda (bound args graph)
    (declare (ignore args graph))
    (if (first bound) "slot read" "every vertex of every type")))
+
+;;; profile-goals (design D4): the goals run under a counting hook.
+
+(defun %profile-row (table functor)
+  (or (gethash functor table)
+      (setf (gethash functor table)
+            (list :functor functor :calls 0 :exits 0 :redos 0 :fails 0
+                  :clauses 0 :seconds 0.0 :open '()))))
+
+(defun profile-goals (vars goals &key (graph *graph*) stream limit
+                                      max-inferences timeout)
+  "Run GOALS collecting VARS as SELECT would, read-only and under one
+snapshot, with a hook that counts each functor's ports and sums the
+wall time from each of its calls to the matching fail (callees
+included); (VALUES SOLUTIONS ROWS ERROR), ROWS one plist per functor
+sorted by :SECONDS, ERROR the PROLOG-RESOURCE-ERROR a tripped budget
+signalled, else NIL -- the rows of a run cut short are what ran, and
+balanced, since the fails fire on the way out (design D1, D4, GH
+#124).  LIMIT, MAX-INFERENCES and TIMEOUT as SELECT's; with STREAM the
+rows are also printed."
+  (let ((table (make-hash-table :test 'eq))
+        (solutions 0)
+        (err nil))
+    (flet ((hook (port functor args depth)
+             (declare (ignore args depth))
+             (let ((r (%profile-row table functor)))
+               (ecase port
+                 (:call (incf (getf r :calls))
+                        (push (get-internal-real-time) (getf r :open)))
+                 (:exit (incf (getf r :exits)))
+                 (:redo (incf (getf r :redos)))
+                 (:fail (incf (getf r :fails))
+                        (let ((start (pop (getf r :open))))
+                          (when start
+                            (incf (getf r :seconds)
+                                  (/ (- (get-internal-real-time) start)
+                                     (float internal-time-units-per-second))))))
+                 (:clause (incf (getf r :clauses)))))))
+      (handler-case
+          (let ((*graph* graph)
+                (form `(select (:effects nil :snapshot t :limit ,limit
+                                ,@(when max-inferences
+                                    `(:max-inferences ,max-inferences))
+                                ,@(when timeout `(:timeout ,timeout))
+                                :callback ,(lambda (row)
+                                             (declare (ignore row))
+                                             (incf solutions)))
+                               ,vars ,@goals)))
+            (call-with-prolog-ports
+             #'hook
+             (lambda ()
+               (let (#+sbcl (sb-ext:*evaluator-mode* :interpret))
+                 (eval form)))))
+        (prolog-resource-error (c) (setf err c))))
+    (let ((rows (sort (loop for r being the hash-values of table
+                            collect (let ((plist (copy-list r)))
+                                      (remf plist :open)
+                                      plist))
+                      #'> :key (lambda (r) (getf r :seconds)))))
+      (when stream
+        (dolist (r rows)
+          (format stream "~&~A: ~D calls, ~D exits, ~D redos, ~D fails, ~
+~D clauses, ~,3F s~%"
+                  (symbol-name (getf r :functor)) (getf r :calls)
+                  (getf r :exits) (getf r :redos) (getf r :fails)
+                  (getf r :clauses) (getf r :seconds))))
+      (values solutions rows err))))

@@ -269,6 +269,23 @@ The length cap is the screen's, so `run-guarded-prolog` and
 `guard-query-text` refuse an overlong text too, not only the GUI
 endpoint.
 
+## `explain-text` and `profile-text` (GH #124)
+
+```lisp
+(explain-text text graph &key stream)   => explain-goals' rows
+(profile-text text graph &key stream limit max-inferences timeout)
+  => (values solutions rows error)
+```
+
+Both screen, read and guard `text` exactly as `guard-query-text` does,
+then hand the goals to `graph-db:explain-goals` and
+`graph-db:profile-goals` (manual, Chapter 6). `explain-text` runs
+nothing; `profile-text` runs the query read-only under one snapshot
+with the guard's budgets as its defaults, so a profile from text is
+always bounded, and a tripped budget comes back as the third value with
+the rows of what ran. Refusals are `prolog-guard-error`, as everywhere
+in this file.
+
 ## What the guard admits
 
 The whitelist, the exclusions, and the control-word list are derived

@@ -16,6 +16,12 @@ storage formats (#60).
 
 ### Added
 
+- **`profile-goals`, `explain-text`, `profile-text`** (#124):
+  `profile-goals` runs a query under the port hook and reports, per
+  functor, its call, exit, redo, fail and clause counts and the time
+  from its calls to its fails, with a tripped budget returned beside
+  the rows; the two text entries in `graph-db.query` explain or profile
+  guarded query text under the guard's refusals and budgets.
 - **`claim/7`'s route is one function and `explain-goals` names it**
   (#124): `%claim-route` decides the route the goal takes in the
   documented order and `explain-goals` reports the same words for a
