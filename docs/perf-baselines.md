@@ -127,3 +127,14 @@ GH #255.)
   in a real workload, the fix is maintained per-transaction buckets
   behind the same overlay functions (spec 2026-10-29 §6), not a bigger
   scan.
+
+- **The Prolog Engine 5.0 "before"** (`run-prolog-bench`, GH #45).
+  `results/prolog-before-odm-55240fd.report` is the third of three
+  normal-scale runs on odm, SBCL 2.6.6, generation 5, 2026-11-09, taken
+  before any unit's code changed: 500 clause asserts at 16/s and 5,000
+  bound-first-argument lookups at 50,000/s (#121); 500 repeated guarded
+  shapes at 1,208/s (#376); a change-feed cursor over 20,000 claims in
+  6.9 s (#392); 100 three-hop selects at 2,041/s and 100 Lisp BFS paths
+  at 658/s (#123); and the recursive ring closure exhausting the control
+  stack in 0.09 s with no solution (#122). Each unit reruns the same
+  bench when it lands and posts both rows on its issue.
