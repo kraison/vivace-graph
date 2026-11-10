@@ -203,3 +203,17 @@ GH #255.)
   654). The case records `k-hop-3-predicate`, `reachable-predicate`,
   `aggregate-count-predicate` and `shortest-path-predicate` when the
   predicates exist in the image.
+- **Unit 5, aggregation and graph predicates, after** (#123):
+  `results/prolog-after-u5-odm-faacd94.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `graph-db/algorithms`
+  loaded. `k-hop-3-predicate` 33,333/s (runs 1 and 2: 20,000, 25,000)
+  against `k-hop-3-select` 1,064/s: distinct nodes at distance 3
+  against one row per walk, so the work differs, but this is the query
+  a reader writes either way. `shortest-path-predicate` 961/s (1,020,
+  752) against `shortest-path-lisp-bfs` 224/s (1,064, 238; the BFS row
+  is noisy on this host). `reachable-predicate` 244/s (216, 220)
+  against the hand-written closure's 245/s: the same tabled shape made
+  a predicate. `aggregate-count-predicate` 50,000/s (33,322, 33,333)
+  against `findall` plus `lisp` at 50,000/s: a one-to-four-path
+  neighbourhood either way. The spine row stays deferred (#123: the
+  predicate reaches the application's image with the release).

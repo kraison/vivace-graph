@@ -93,6 +93,14 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   Chapter 6). `not`, `forall`, `if` with an else arm, `findall`,
   `bagof` and `setof` over the predicate's own component signal
   `prolog-unstratified-error`.
+- **Count with `aggregate-all`, close over with `reachable`, step with
+  `k-hop`,** not with `findall` plus a `lisp` call or a chain of edge
+  goals. `(aggregate-all count GOAL ?n)` with the goal written out
+  compiles inline and is admitted in guarded text; `(reachable ?from ?x
+  type)` is the engine's tabled closure over one edge type from a bound
+  start; `(k-hop ?from k ?x type)` the distinct nodes at distance k.
+  Weighted paths are `graph-db/algorithms`' `shortest-path/4` (GH #123,
+  manual Chapters 6 and 14).
 - **Pass `:collect-p t` only when you use the list,** since it builds one
   cons per edge.
 - **Key a hash table by an id, with `:test 'equalp`.** An id is a 16-byte
