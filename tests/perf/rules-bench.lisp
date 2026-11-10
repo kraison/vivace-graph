@@ -178,3 +178,25 @@ short; the acceptance run is :N 100000 by hand (the numbers on #457)."
     (record "forward-step-large" :ms (float-3 (* 1000 large)))
     (record "forward-step-scale-ratio"
             :ratio (if (zerop small) 0 (float-3 (/ large small))))))
+
+(defun bench-rules-rerun ()
+  "Unit 6 (GH #376): one rule over N base claims run K times through
+RUN-RULE, the same body every time: the shape a compiled-query cache
+serves.  Before the cache every run interprets the body afresh; after,
+the second run compiles it and the rest run compiled.  Runs per second."
+  (let ((n (scale 2000)) (k (scale 20)))
+    (with-perf-forward-graph (g)
+      (pf-insert-base g 0 n)
+      (let ((rule (graph-db:with-transaction
+                      ((graph-db::transaction-manager g))
+                    (graph-db.rules:make-rule
+                     :graph g :name "pf-rerun" :version "1"
+                     :family "pf-claim"
+                     :head "(claim ?c pf-claim \"pf-things\" ?k \"derived\" nil nil)"
+                     :body "(claim ?p pf-claim \"pf-things\" ?k \"base\" nil nil)")))
+            (graph-db.rules::*rules-max-solutions* (* 2 n))
+            (graph-db::*query-default-max-inferences* (* 100 n))
+            (graph-db::*query-default-timeout* 600))
+        (timed-ops ("rules-rerun" k)
+          (dotimes (i k)
+            (graph-db.rules:run-rule g rule)))))))

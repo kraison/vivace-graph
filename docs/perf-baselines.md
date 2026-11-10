@@ -217,3 +217,13 @@ GH #255.)
   against `findall` plus `lisp` at 50,000/s: a one-to-four-path
   neighbourhood either way. The spine row stays deferred (#123: the
   predicate reaches the application's image with the release).
+- **Unit 6, the compiled query cache, the before** (#376):
+  `results/perf-before-u6-odm-0729954.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, engine at the unit 5
+  merge, the three cases in one image through the new `run-perf-only`.
+  `guarded-shape-repeat` 2,008/s (runs 1 and 2: 1,520, 1,634);
+  `two-hop-related` (the consumer's guarded two-hop read from
+  `bench-claim-linking`) 840/s (966, 847); the new `rules-rerun` case
+  (one rule over 2,000 base claims, `run-rule` 20 times) 12.1 s for
+  the 20 runs, 0.60 s per run (12.2, 12.6). Each run of a rule
+  interprets its body's `select` afresh today.
