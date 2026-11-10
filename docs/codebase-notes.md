@@ -85,6 +85,14 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   the clauses whose first head argument can unify with it; unbound, it
   tries them all in order (first-argument indexing, GH #121, manual
   Chapter 6). Asserting a clause compiles that clause only.
+- **Table a recursive predicate over a graph that may be cyclic, and
+  write it left-recursive.** `(table-functor 'path 2)` evaluates each
+  distinct call once per query to a fixpoint, so the closure terminates
+  on a cycle; the left-recursive shape runs in constant stack, the
+  right-recursive one as deep as the distinct nodes (GH #122, manual
+  Chapter 6). `not`, `forall`, `if` with an else arm, `findall`,
+  `bagof` and `setof` over the predicate's own component signal
+  `prolog-unstratified-error`.
 - **Pass `:collect-p t` only when you use the list,** since it builds one
   cons per edge.
 - **Key a hash table by an id, with `:test 'equalp`.** An id is a 16-byte

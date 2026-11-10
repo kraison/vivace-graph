@@ -176,3 +176,15 @@ GH #255.)
   `chain-closure-tabled` row on an engine with `table-functor`; the
   ring row stays the termination check, this one is the per-call cost
   of a table against a plain recursion.
+- **Unit 4, tabling, after** (#122):
+  `results/prolog-after-u4-odm-d5eaa6e.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `pbp-path/2` tabled by
+  the bench. `recursive-ring-closure` completes: 200 solutions in
+  0.444 s (runs 1 and 2: 0.487, 0.545) where the before exhausted the
+  control stack in 0.09 s with none; the right-recursive rule
+  evaluates one table per node inside its caller's, which is where the
+  time goes. `chain-closure-tabled` 0.108 s (0.112, 0.115) against
+  `chain-closure-untabled` 0.080 s (0.097, 0.090): the tabling tax on
+  an acyclic query, about a third. The spine row is deferred to unit 5
+  (#122: a bare bench image cannot open the application's store
+  without its schema classes).

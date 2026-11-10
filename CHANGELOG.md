@@ -16,6 +16,20 @@ storage formats (#60).
 
 ### Added
 
+- **Tabled predicates: `table-functor`, `untable-functor`,
+  `functor-tabled-p`** (#122): a declared user functor's calls are
+  memoised per query in variant tables and evaluated to a fixpoint by
+  recursive component, so a recursive `select` terminates on a cyclic
+  graph with the complete answer set (the 200-node ring bench: control
+  stack exhausted before, 200 solutions in 0.44 s after). `not`,
+  `forall`, `if` with an else arm, `findall`, `bagof` and `setof` over
+  an incomplete table of the predicate's own component signal
+  `prolog-unstratified-error`, which `catch/3` declines. A new `:table`
+  port, printed by `trace-prolog`, says whether a call led, followed,
+  consumed or was answered from a complete table; `explain-goals`
+  marks a tabled functor and `profile-goals` counts the events.
+  `deref-copy` now follows a bound variable instead of copying it as a
+  fresh one (its one caller pre-dereferenced).
 - **`profile-goals`, `explain-text`, `profile-text`** (#124):
   `profile-goals` runs a query under the port hook and reports, per
   functor, its call, exit, redo, fail and clause counts and the time

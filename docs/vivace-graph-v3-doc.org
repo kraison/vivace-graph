@@ -1113,13 +1113,94 @@ image started. A clause of another arity than the functor's signals
 never raise that, only a direct ~add-functor-clause~ or
 ~make-functor :clauses~ can.
 
+*** Tabled predicates: ~table-functor~
+
+A recursive rule over a graph that may hold a cycle never finishes
+top-down: the ring bench of GH #122 exhausted the control stack before
+it reached its inference budget. ~table-functor~ declares a user
+functor *tabled*: each distinct call, by variant (~(path a ?x)~ and
+~(path a ?y)~ are one call, ~(path ?x ?y)~ another), gets a table of
+answers for the length of the query, the table is evaluated to
+completion by iterating its recursive component to a fixpoint, and
+every later call of the same variant is answered from it. It is
+declared from Lisp, like a view; there is no Prolog-side directive, so
+guarded query text cannot declare one:
+
+#+BEGIN_SRC lisp
+(<- (path ?a ?b) (knows ?a ?b))
+(<- (path ?a ?c) (knows ?a ?b) (path ?b ?c))
+(table-functor 'path 2)        ; interns PATH/2 in *PACKAGE*, as <- does
+(functor-tabled-p 'path 2)     ; => T
+(select (?x) (path alice ?x))  ; terminates on a cycle; each node once
+(untable-functor 'path 2)
+#+END_SRC
+
+~table-functor~ before any clause registers the functor; a built-in
+(~is-a/2~) is refused with ~prolog-error~. The declaration survives
+~reset-functor~ and ~make-functor :clauses~.
+
+Which recursive shape to write matters for the stack, not the answer:
+
+- *left-recursive*, ~(<- (path ?a ?c) (path ?a ?b) (knows ?b ?c))~: the
+  recursive call is the variant being evaluated and reads the table as
+  it is built, so the Lisp stack is as deep as the clause body,
+  whatever the graph's size. Write this one for closure over a large
+  graph.
+- *right-recursive*, ~(<- (path ?a ?c) (knows ?a ?b) (path ?b ?c))~:
+  each reachable node gets its own table, evaluated inside its
+  caller's, so the stack is as deep as the distinct nodes on the way.
+  It terminates on a cycle, but a chain longer than the control stack
+  holds still exhausts it.
+
+Answers are stored once per variant (1 and 1.0 are one answer, two
+lookups of one vertex are one) in first-derivation order, and a
+non-ground answer is copied fresh for each consumer. A cut inside a
+tabled clause prunes that evaluation, as it does untabled: the table is
+the answer set under the clauses with their cuts, and an answer stored
+in an earlier round stays when a later round's cut skips its clause.
+To take one answer, put ~once~ on the consumer side.
+
+Under ~trace-prolog~ a tabled call fires one extra port, ~:table~,
+after its ~:call~: ~TABLE PATH/2 leader 3~ (it led its component to
+completion in three passes), ~follower 4~ (evaluated, left incomplete
+with four answers so far, completed by its leader), ~consume 2~ (read
+an incomplete table without evaluating) or ~complete 6~ (answered from
+a finished table: no ~CLAUSE~ lines follow). ~explain-goals~ appends
+~, tabled~ to the functor's path and ~profile-goals~ counts the events
+under ~tables~.
+
+*Negation is stratified or refused.* ~not~, ~forall~, ~if~ with an
+else arm, ~findall~, ~bagof~ and ~setof~ conclude something from a goal
+having no further solution, so they read the goal's tables as closed.
+Over a tabled predicate outside the current recursive component that
+is sound and works: ~(not (reachable ?x ?y))~ inside a rule that is not
+itself part of ~reachable~. Inside the predicate's own component the
+table is not closed yet, and the call signals
+~prolog-unstratified-error~ (ball ~(:permission-error :negate
+:procedure NAME/ARITY)~), which ~catch/3~ declines as it declines the
+resource and permission errors. ~once~, two-argument ~if~ and the cut
+only prune and are allowed.
+
+Tables live for one query: ~select~ and ~?-~ bind them fresh and drop
+them on exit, so a clause asserted between two queries is seen by the
+second, and a ~:write~ effect inside a query (~retract~) is not seen by
+a table that query already built. Threads never share a table.
+
+Measured on odm (SBCL 2.6.6, third of three runs,
+~tests/perf/results/prolog-after-u4-odm-d5eaa6e.report~): the 200-node
+ring went from control stack exhausted in 0.09 s with no solution to
+200 solutions in 0.44 s; down a 200-node chain, where the untabled
+recursion finishes, the tabled closure takes 0.11 s against 0.08 s
+untabled, the price of a table a query did not need.
+
 *** Watching and explaining a query: the ports, ~trace-prolog~, ~explain-goals~
 
 Every goal call fires four *ports* when a hook is set: ~:call~ when the
 goal is tried, ~:exit~ on each solution, ~:redo~ when the engine comes
 back for the next one, and ~:fail~ when there are no more. An asserted
-functor's dispatcher also fires ~:clause~ before each clause it tries.
-The hook is ~*prolog-port-hook*~, a function of ~(port functor args
+functor's dispatcher also fires ~:clause~ before each clause it tries,
+and a tabled functor's entry ~:table~ once per call with the path it
+took (the previous section).  The hook is ~*prolog-port-hook*~, a function of ~(port functor args
 depth)~; unset, a goal call costs what it always did (GH #124).
 ~with-prolog-ports~ binds it for one form:
 
