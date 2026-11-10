@@ -2,8 +2,13 @@
 
 **Issue:** GH #376; unit 6 of the Prolog Engine 5.0 scope
 (`2026-11-09-prolog-engine-5.0-scope.md`). **Status:** proposed
-2026-11-10; builder check pending; the calls are the author's, Kevin's
-review pending. **Depends on:** units 1 to 5 on `experiment` (0729954);
+2026-11-10, revised the same day after a builder check (its findings
+are settled below: the generation moves only on a user functor's
+content, never on a query root; the literal vector has its own special;
+variables are renamed everywhere and literals lifted only in term
+positions; the parameter goal is a compiler macro, so it costs no
+tick; ECL and CCL cache the function `eval` makes); the calls are the
+author's, Kevin's review pending. **Depends on:** units 1 to 5 on `experiment` (0729954);
 #373 (the interpreter switch this replaces for repeated shapes).
 
 ## Intent
@@ -78,7 +83,23 @@ pb-thing thing-id "t-3")` and `... "t-4"` are one entry.
   *forms* must be there, not the values.
 - `select` creates and deletes a transient functor per execution
   (`prolog-gensym`, `make-functor`, `set-functor-fn`, `delete-functor`,
-  `release-prolog-symbol`); its name symbol is uninterned.
+  `release-prolog-symbol`). Only the gensym `#:PROVE12` is uninterned:
+  `make-functor-symbol ... :define t` interns `PROVE12/0` in
+  `*package*`, so the root's functor name is an interned symbol like
+  any user functor's, and per execution it passes through
+  `%install-functor-fn`, `set-functor-fn` and `delete-functor`. What
+  tells a root from a user functor is content: a root never has a
+  clause, a dispatcher or the tabled flag.
+- `*query-params*` already exists (prologc.lisp:1386, exported): the
+  alist `param/2` reads, bindable around any `select`; `param/2` is a
+  registered functor free text may call. A new name is needed for the
+  literal vector.
+- `compile-call` ticks once per goal call (`%tick`), so an extra goal
+  in the form moves a query's inference count by one.
+- On ECL, `compile nil` is the C compiler (seconds per form) unless the
+  bytecodes compiler is installed; `eval` of a lambda is the bytecodes
+  compiler (milliseconds). The engine never calls `compile` itself;
+  `%make-dispatcher` and `%compile-clause-fn` use `eval`.
 - `compile-call` resolves a goal head to a functor symbol at compile
   time (`make-functor-symbol`, by registry lookup, falling back to
   `*package*`) and fetches the functor's function at run time, so a
@@ -111,39 +132,51 @@ pb-thing thing-id "t-3")` and `... "t-4"` are one entry.
 
 ### D1. The canonical shape and the parameter vector
 
-`(%canonical-query vars goals)` → `(values shape params)`.
+`(%canonical-query vars goals)` → `(values shape literals)`.
 
 - **Variables** are renamed by first appearance across `vars` then
-  `goals`: the n-th distinct variable becomes the symbol `?Vn` of
-  `graph-db`. `?` (anonymous) stays `?` (the compiler gensyms it).
-- **Literals**: a string, number or character in a goal argument
-  (walked into nested lists, which is how a compound term is written)
-  becomes the next parameter: the shape holds `(%param . i)` and
-  `params` gets the literal at index i. Two equal literals are two
-  parameters (position, not value, is the shape). Symbols, keywords,
-  `nil` and `t` stay in the shape: they are schema names, functor
-  names, slot names and spec words, canonical since the guard.
-- **Not walked:** argument 1 of an `aggregate-all` goal (the spec
-  term), and the whole argument list of `lisp`, `lispp` and `is` goals
-  (an expression, not a term). Everything else is walked by the same
-  rule, control constructs included (`not`, `and`, `if`, `forall`,
-  `once`, `aggregate-all`'s goal).
+  `goals`, *everywhere* in the tree, an `aggregate-all` spec template
+  included (its `?r` must stay the same symbol as the goal's): the n-th
+  distinct variable becomes the symbol `?Vn` of `graph-db`. `?`
+  (anonymous) stays `?` (the compiler gensyms it). A variable is a
+  symbol whose name starts with `?`, whatever its package (the guard's
+  scratch symbols, the rules' uninterned ones).
+- **Literals**: a string, number or character in a *term position*
+  (a goal argument, walked into nested lists, which is how a compound
+  term is written) becomes the next literal: the shape holds
+  `(%lit . i)` and `literals` gets the value at index i. Two equal
+  literals are two entries (position, not value, is the shape).
+  Symbols, keywords, `nil` and `t` stay in the shape: they are schema
+  names, functor names, slot names and spec words, canonical since the
+  guard.
+- **Not term positions:** argument 1 of an `aggregate-all` goal (the
+  spec term: its words stay, its variables are renamed, a number in it
+  would be a domain error anyway), and the arguments of `lisp`, `lispp`
+  and `is` goals (an expression; the guard refuses all three under
+  `:effects nil` before the expression is touched, so this is for the
+  Lisp caller of `run-query-goals` only). Everything else is walked by
+  the same rule, control constructs included (`not`, `and`, `if`,
+  `forall`, `once`, `aggregate-all`'s goal).
 - The shape is an `equal`-comparable tree of symbols, `(%param . i)`
   conses and `?` ; `vars` canonicalised the same way is its head, so
   two queries with the same goals and different projections are two
   entries.
 
 The cached form is the `select` over the canonical goals with the
-parameters bound first: `(select (OPTIONS) (?V0 ...) (%bind-params
-?P0 ... ?Pk) ,@canonical-goals)` where each `(%param . i)` in a goal
-was replaced by the variable `?Pi` (after the `?V`s in the renaming,
-so a parameter variable never collides), and `%bind-params/N` is a
-family of internal global functors, or one functor over a list, that
-unifies each `?Pi` with `(svref *query-params* i)`. From then on the
-compiled code sees `?Pi` as an ordinary variable bound at run time:
-`(= ?x ?P0)` unifies, `(> ?x ?P0)` compares, `(find-by-slot ?s pb-thing
-thing-id ?P0)` looks up by value, `claim/7` routes by bound-ness. A
-goal list with no literal has no `%bind-params` goal.
+literals bound first: `(select (OPTIONS) (?V0 ...) (%bind-literals
+?L0 ... ?Lk) ,@canonical-goals)` where each `(%lit . i)` in a goal was
+replaced by the variable `?Li` (a name no `?V` takes), and
+`%bind-literals` is an *internal compiler macro* (a sibling of
+`%commit`) that emits one `(unify ?Li (svref *query-literals* i))` per
+variable inline and then the body: no functor, so no `%tick`, and a
+query's inference count is what it was. `*query-literals*` is a new
+special in globals.lisp (the existing `*query-params*` and `param/2`
+are untouched). The macro joins `*prolog-excluded-predicates*` like
+`%unfloor`. From then on the compiled code sees `?Li` as an ordinary
+variable bound at run time: `(= ?x ?L0)` unifies, `(> ?x ?L0)`
+compares, `(find-by-slot ?s pb-thing thing-id ?L0)` looks up by value,
+`claim/7` routes by bound-ness. A goal list with no literal has no
+`%bind-literals` goal.
 
 ### D2. Options read at run time
 
@@ -176,18 +209,20 @@ goals` calls into it):
   (`(compile nil `(lambda () ,form))` under `*package*` `graph-db`),
   then store `fn` under the lock. A second thread that finds
   `compiling` set runs interpreted this time. Returns `fn` when set.
-- `run-query-goals`: canonicalise; bind `*query-params*` to the
+- `run-query-goals`: canonicalise; bind `*query-literals*` to the
   vector, `*query-run-limit*`, `*query-run-skip*`; if the cache gives a
   function, `funcall` it; else `eval` the canonical form under the
   interpreter, as today. `%cached-query-function` is called with the
   shape only; the form is built from the shape on demand.
-- `*functor-generation*` (globals.lisp, a fixnum): incremented by
-  `%install-functor-fn` and `delete-functor` when the functor's name
-  symbol is interned (the query roots' transient functors are
-  uninterned and must not move it), by `%install-edge-functors`, and
-  by `set-functor-fn` on an interned name. The key carries it, so a
-  stale entry is simply never found again and ages out. `clear-query-
-  cache` empties the table. `query-cache-stats` → a plist `(:entries n
+- `*functor-generation*` (globals.lisp, a fixnum): incremented where a
+  *user functor's content* changes: `%add-compiled-clause` (every
+  assert), `reset-functor`, `table-functor`, `untable-functor`,
+  `%install-edge-functors`, and `delete-functor` when the functor has a
+  clause or is tabled. A query root has none of those, so an execution
+  never moves it; `set-functor-fn` (the roots' own install and a test
+  hook) never moves it. The key carries the generation, so a stale
+  entry is simply never found again and ages out. `clear-query-cache`
+  empties the table. `query-cache-stats` → a plist `(:entries n
   :compiled n :hits n :misses n :compiles n :evictions n)` for tests and
   the GUI's stats page later.
 - Correctness does not depend on the generation (a compiled form looks
@@ -221,11 +256,14 @@ is consulted; the cache never sees text.
 
 ### D6. Cross-implementation
 
-`compile nil` is standard; the interpreter switch is `#+sbcl` as
-today, and on ECL/CCL the "interpreted" first run is whatever `eval`
-does there (ECL compiles `eval`'d lambdas; the cache then saves the
-repeated compile). The lock is bordeaux-threads. The `equal` hash and
-the struct have no per-implementation arms.
+The step that makes the cached function is `#+sbcl (compile nil
+`(lambda () ,form))` and elsewhere `(eval `(lambda () ,form))`: on
+ECL that is the bytecodes compiler (milliseconds), where `compile nil`
+would be the C compiler (seconds per shape, and on the committing
+thread in the forward step); on CCL `eval` compiles natively. Either
+way the cache saves the repeated compile. The interpreter switch for
+the first run is `#+sbcl` as today. The lock is bordeaux-threads. The
+`equal` hash and the struct have no per-implementation arms.
 
 ## Tests
 
@@ -262,9 +300,18 @@ prefixed `cq-`:
 - `cq-generation-moves`: a cached shape over an asserted functor; `<-`
   another clause; the next run returns the new clause's rows and the
   stats show a second entry (the old generation's entry is not
-  reused); `table-functor`, `untable-functor`, `delete-functor` and
-  `def-edge` each move the generation; a `select` from Lisp (a
-  transient root functor) does not.
+  reused); `reset-functor`, `table-functor`, `untable-functor`,
+  `delete-functor` of a functor with a clause and `def-edge` each move
+  the generation; a `select` from Lisp and a `run-guarded-prolog` call
+  (a query root) do not, and `delete-functor` of an empty functor does
+  not.
+- `cq-param-still-works`: `*query-params*` bound to `(("k" . 1))`
+  around `(param ?x "k")` through `run-guarded-prolog` gives `((1))`
+  on the first and the third call.
+- `cq-no-extra-tick`: a shape with two literals run interpreted and
+  compiled under `profile-goals`' inference count, or `:max-inferences`
+  at the exact count the uncached form needs: the compiled run fits
+  the same budget.
 - `cq-bounded-and-lru`: `*compiled-query-cache-size*` bound to 3,
   four shapes, the first evicted; touching the second before the fourth
   keeps it.
@@ -304,9 +351,11 @@ the rounds' repeated shapes compiled once.
   (the `cq-` tests).
 - Literals lifted: one entry per shape, not per key (`cq-canonical-
   shape`, `cq-second-hit-compiles`).
-- Bounded, invalidated on functor redefinition and edge-type
-  installation, thread-safe (`cq-bounded-and-lru`, `cq-generation-
-  moves`, `cq-two-threads-one-shape`).
+- Bounded, invalidated when a user functor's content changes (assert,
+  reset, table, untable, delete of a functor with clauses) and on
+  edge-type installation, never by a query's own root; thread-safe
+  (`cq-bounded-and-lru`, `cq-generation-moves`,
+  `cq-two-threads-one-shape`).
 - The three consumers covered (`run-guarded-prolog`, the DSL through
   `run-query-goals`, the rules' `%solutions`).
 - Before/after on odm, third run; full SBCL suite green on the
@@ -314,8 +363,7 @@ the rounds' repeated shapes compiled once.
 
 ## Left to the builder
 
-- Whether `%bind-params` is one functor over a list or a family by
-  arity; the exact struct and special names beyond those given.
+- The exact struct and special names beyond those given.
 - The LRU bookkeeping (a clock counter and a scan at eviction is fine
   at 256 entries).
 - Where `query-cache-stats` counts hits and misses (the lookup).
