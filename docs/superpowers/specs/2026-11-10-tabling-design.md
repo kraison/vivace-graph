@@ -2,9 +2,14 @@
 
 **Issue:** GH #122 (unit 2 of its 2026-09-06 split), unit 4 of the
 Prolog Engine 5.0 scope (`2026-11-09-prolog-engine-5.0-scope.md`).
-**Status:** proposed 2026-11-10; the calls are the author's, Kevin's
-review pending. **Depends on:** units 2 (#121, the per-clause
-dispatcher) and 3 (#124, the port hook), both on `experiment`.
+**Status:** proposed 2026-11-10, revised the same day after a builder
+check (its findings are settled in D2 to D5 below: component detection
+with early completion replaces the coarse leader, the negation check
+covers every construct that reads a table as closed, a follower's
+evaluation unwinds like a leader's, the refusal is uncatchable); the
+calls are the author's, Kevin's review pending. **Depends on:** units
+2 (#121, the per-clause dispatcher) and 3 (#124, the port hook), both
+on `experiment`.
 
 ## Intent
 
@@ -29,9 +34,9 @@ the derivation's length.
   `untable-functor` undoes it; `functor-tabled-p` reports it. The
   declaration may come before or after the functor's clauses and
   survives `<-`, `reset-functor` and `make-functor :clauses`.
-- A tabled call terminates on a cyclic graph with the complete, duplicate
-  free answer set: the ring bench records `:complete` and 200 solutions
-  where it recorded `:stack-exhausted` and 0.
+- A tabled call terminates on a cyclic graph with the complete,
+  duplicate-free answer set: the ring bench records `:complete` and 200
+  solutions where it recorded `:stack-exhausted` and 0.
 - Left-recursive and right-recursive forms of the same rule give the
   same answers; the left-recursive form runs in stack depth independent
   of the derivation length (D8).
@@ -40,9 +45,12 @@ the derivation's length.
   persistent tables, no cross-query staleness.
 - Untabled predicates compile and run exactly as today: the tabled
   path is a different functor function, not a check in every call.
-- Negation over a tabled predicate inside its own recursive component
-  is refused with a `prolog-error`, not answered wrongly (#122:
-  "stratified negation enforced, not assumed").
+- A construct that reads a tabled predicate's answers as closed
+  (negation, `if` with an else arm, `findall`, `bagof`, `setof`,
+  `forall`) inside that predicate's own recursive component is refused
+  with an uncatchable error, not answered wrongly (#122: "stratified
+  negation enforced, not assumed"); the same construct over an
+  independent tabled predicate works.
 - `:max-inferences`, `:timeout`, `:limit`, `:callback`, `:count`, the
   port hook, `explain-goals` and `profile-goals` keep working through a
   tabled call.
@@ -53,17 +61,15 @@ the derivation's length.
   linear tabling: an incomplete table is re-evaluated, never resumed.
 - Subsumptive tabling (answering `p(a,X)` from a table for `p(X,Y)`).
   Variant tabling only.
-- Finer strongly connected components than "everything first called
-  while a leader is evaluating" (D3). The cost is re-evaluation of
-  independent sub-tables in each of the leader's rounds, not a wrong
-  answer.
 - Persistent or shared tables; tables across `:write` effects within
   one query (a `retract/1` after a tabled call reads stale answers; the
   guard's `:effects nil` queries cannot do this).
 - Tabling a built-in or an edge functor directly. Wrap it in a `<-`
   rule and table that; unit 5 defines `reachable/3` that way.
-- Magic sets. Filed separately against the rules layer (the issue is
-  linked from #122 when this unit starts), per the scope.
+- A static stratification check of the program. `run-rules` does one
+  for rule sets (#333); for `select`, the refusal is at the call, and
+  it is exact for the calls a query makes, not for the program.
+- Magic sets: #486, against the rules layer, per the scope.
 - Changing the compiler's stack behaviour for untabled recursion: its
   bound is documented, not lifted (D8).
 
@@ -75,8 +81,9 @@ the derivation's length.
   set's candidates for the call's first argument, undoes bindings
   between them and tail-calls the last. `%add-compiled-clause`
   (prologc.lisp:1040) installs the dispatcher as `fn` unless it already
-  is; `prolog-compile` (:222) resets the functor to the null function
-  and re-adds every clause; `reset-functor` goes through it.
+  is; `prolog-compile` (:222) resets the functor through
+  `prolog-compile-null` (:865, which sets `fn` directly) and re-adds
+  every clause; `reset-functor` goes through it.
 - `compile-call` (prologc.lisp:301) fetches `fn` at run time
   (`get-functor-fn`, else the global functor table), ticks the budget,
   and calls it with the arguments and the continuation, through
@@ -84,21 +91,26 @@ the derivation's length.
   (prolog-functors.lisp:247) does the same for a dynamic goal. So
   whatever a functor's `fn` is, every static and dynamic call reaches
   it: a tabled functor needs only a different `fn`.
-- A query root (`select` prologc.lisp:1356, `?-` :1107, the two other
-  `*trail*` rebinding sites at :1396 and :1512) binds a fresh `*trail*`,
-  `*var-counter*`, the budget specials and `*seen-table*`, builds a
-  clause-less functor for the goals and runs it with `prolog-ignore` as
-  the final continuation. `run-query-goals` (query/dsl.lisp:315) and
-  the rules layer's `%solutions` both `eval` a `select` form.
+- Two live query roots bind a fresh `*trail*`, `*var-counter*`, the
+  budget specials and `*seen-table*`: `select` (prologc.lisp:1396) and
+  `?-` (:1116); the two other `*trail*` sites are inside a `#| |#`
+  block. `run-query-goals` (query/dsl.lisp:315) and the rules layer's
+  `%solutions` both `eval` a `select` form.
 - A solution is delivered by calling the continuation with the
   bindings in place; failure is a return. `undo-bindings` to a saved
   trail fill-pointer unbinds. `deref-copy` (prologc.lisp:831) copies a
   term with fresh variables; `deref-exp` dereferences in place.
-- Negation: the `not` compiler macro (prologc.lisp:653) runs the goal
-  under a barrier block with a continuation that sets a flag and
-  returns; `not/1` (prolog-functors.lisp:420) is the dynamic form;
-  `forall` compiles to nested `not`; `if`'s test and `once` commit to a
-  first solution but do not negate.
+- Constructs that read a goal's answers as closed: the `not` compiler
+  macro (prologc.lisp:653) and `not/1` (prolog-functors.lisp:420);
+  `forall` compiles to nested `not`, `forall/2` (:383) is its own loop;
+  `if` with an else arm (:698, three-argument form; `if/3` :360) runs
+  the else when the test has no solution; `findall/3`, `bagof/3`,
+  `setof/3` (:523-560) collect every solution. `once`, two-argument
+  `if` and the cut only prune: they never conclude anything from a
+  goal having no further solution.
+- `catch/3` (prolog-functors.lisp:321) declines
+  `prolog-resource-error` and `prolog-permission-error` so a bounded
+  query cannot swallow its own enforcement.
 - A cut inside a clause sets the dispatcher's cut cell and returns from
   the clause block (unit 2, D3); `once`, `not` and `if` are barriers.
 
@@ -114,45 +126,54 @@ clears the slot and reinstalls the dispatcher (or the null function
 when there are no clauses). `functor-tabled-p name arity` reads the
 slot of a registered functor, `nil` for none.
 
-`%add-compiled-clause` and `prolog-compile` install `fn` through one
-helper, `%install-functor-fn`, which picks the tabled entry when the
-slot is set and the dispatcher otherwise; today's `(unless (eq fn
-dispatcher) (set-functor-fn ...))` moves into it. The tabled entry
-calls the functor's `dispatcher` slot directly, so the dispatcher is
-built even for a tabled functor and `functor-dispatcher` keeps meaning
-"the clause walk".
+`%add-compiled-clause`, `prolog-compile` and `prolog-compile-null`
+install `fn` through one helper, `%install-functor-fn`, which picks the
+tabled entry when the slot is set and the dispatcher (or the null
+function) otherwise; today's `(unless (eq fn dispatcher)
+(set-functor-fn ...))` moves into it. The tabled entry calls the
+functor's `dispatcher` slot directly, so the dispatcher is built even
+for a tabled functor and `functor-dispatcher` keeps meaning "the clause
+walk". A tabled functor with no clauses answers nothing, as an untabled
+one does.
 
 A global functor (`def-global-prolog-functor`) cannot be tabled:
 `table-functor` signals a `prolog-error` naming it, as `add-clause`
 does for a clause on one. The three functions are exported from
 `graph-db`. There is no Prolog-side directive; the guard's query text
 cannot declare a table, by design (the declaration is a schema-level
-decision, like a view).
+decision, like a view). `make-functor-symbol :define t` interns in the
+run-time `*package*`, as `<-` does, so a declaration made under another
+package tables a clause-less twin; the docstring and the manual say to
+declare in the package the clauses were asserted in.
 
 ### D2. Tables, variant keys and answers
 
-`*tables*` is a special, `defvar`ed in globals.lisp, bound by every
-query root (the four `*trail*` sites, in the same `let*`) to a fresh
-`equal` hash table; its value outside a query is `nil`. A tabled call
-that finds `*tables*` nil (a `%solve` from Lisp with no query around
-it) binds one for its own extent, so a tabled predicate never runs
-without a table and never leaks one past the query.
+`*tables*` is a special, `defvar`ed in globals.lisp, bound by both
+query roots (in the same `let*` as `*trail*`) to a fresh `equal` hash
+table; its value outside a query is `nil`. A tabled call that finds
+`*tables*` nil (a `%solve` from Lisp with no query around it) binds one
+for its own extent, so a tabled predicate never runs without a table
+and never leaks one past the query. The other per-query specials of D3
+and D4 (`*table-stack*`, `*round*`, `*answers-added*`,
+`*negation-floor*`) are bound at the roots beside it.
 
 **Key.** The call's variant key is the dereferenced argument list with
 each atom canonicalised so that `equal` on keys implies `prolog-equal`
-on the arguments, and each unbound variable replaced by `(:var . i)`
+on the arguments, and each unbound variable replaced by a marker
 numbered by first occurrence, so `p(X,Y)`, `p(A,B)` share a key and
-`p(X,X)` has another:
+`p(X,X)` has another. The markers are conses headed by uninterned
+symbols held in constants (`+var-tag+`, `+node-tag+`, `+ts-tag+`,
+`+array-tag+`), so no user term can equal one:
 
 | argument | key |
 |---|---|
-| unbound variable | `(:var . i)`, i by first occurrence |
+| unbound variable | `(+var-tag+ . i)`, i by first occurrence |
 | number | its `rational` (1 and 1.0 are `prolog-equal`) |
 | string | the string (`string=`) |
 | symbol, character, `nil` | itself |
-| node | `(:node . id-as-list)` (nodes are equal by id) |
-| timestamp | `(:ts . universal-time nanoseconds)` |
-| array | `(:array . contents-as-list)` |
+| node | `(+node-tag+ . id-as-list)` (nodes are equal by id) |
+| timestamp | `(+ts-tag+ universal-time nanoseconds)` |
+| array | `(+array-tag+ . contents-as-list)` |
 | cons | the cons of the parts' keys |
 | any other object | itself under `equal` |
 
@@ -161,14 +182,15 @@ different keys: the two calls get two tables, each correct. Sharing
 is a performance property; the soundness property is that one key
 never serves two calls that could differ, and the table above keeps it.
 
-**Table.** `(defstruct table key answers seen complete round leader
-negation-level)`: `answers` an adjustable vector of answer tuples in
-insertion order (so consumption is by index and sees answers added
-while it runs), `seen` an `equal` hash of answer keys (canonicalised
-as above, variables numbered) for duplicate elimination, `complete` a
-boolean, `round` the leader's round number at which this table was
-last evaluated, `leader` the table that completes it (itself for a
-leader), `negation-level` the depth of negation at creation (D4).
+**Table.** `(defstruct table key answers seen complete created-at
+round index leader)`: `answers` an adjustable vector of answer tuples
+in insertion order (so consumption is by index and sees answers added
+while it runs); `seen` an `equal` hash of answer keys (canonicalised
+as above, variables numbered) for duplicate elimination; `complete` a
+boolean; `created-at` a per-query serial; `round` the global round
+number (D3) at which this table was last evaluated; `index` its
+position in `*table-stack*` while it is being evaluated; `leader` the
+provisional leader (D3), `nil` for none.
 
 **Answer.** An answer is the argument tuple as it stands when the
 clause body succeeds: `deref-copy` of the argument list, so it holds
@@ -178,46 +200,63 @@ argument with the stored term when `ground-p`, else with a
 `deref-copy` of it (fresh variables per consumer), under the caller's
 trail; bindings are undone between answers.
 
-### D3. Evaluation: leaders, followers, consumers
+### D3. Evaluation: components, early completion, rounds
 
-The tabled entry is one function per functor, closed over the functor,
-of `(args... cont)`. On a call it computes the key, looks the table up
-in `*tables*` and takes one of four paths. `*table-stack*` is a special
-holding the tables whose evaluation is in progress, innermost first;
-`*leader*` the current leader table or `nil`.
+The tabled entry is one closure per functor, of `(args... cont)`. It
+computes the key, looks the table up in `*tables*` and takes one of
+the paths below. The per-query state: `*table-stack*`, the tables
+whose evaluation is in progress, innermost first, rebound with `let`
+around each evaluation (never pushed and popped, so any exit leaves it
+right); `*round*`, a counter every leader round increments;
+`*answers-added*`, a counter every stored answer increments.
 
-1. **Complete table.** Consume: for each answer in order, unify, call
-   `cont`, undo. Return.
-2. **No table, no leader** (`*leader*` nil, or the current leader is
-   separated from this call by a negation, D4). The call is a
-   **leader**. Create the table with `leader` itself, push it, and
-   iterate:
-   - set `round` to the next round number; mark `changed` nil;
-   - evaluate: call the dispatcher with the original arguments and the
-     continuation *add-answer*, which copies the argument tuple into
-     the table unless `seen` has its key, sets `changed` when it adds,
-     and returns `nil` (so the dispatcher backtracks through every
-     clause);
-   - if any table whose `leader` is this one gained an answer in the
-     round, repeat; else mark every such table `complete`, pop, and
-     consume this table into `cont` as in path 1.
+**Evaluate** a table T means: bind `*table-stack*` to T on top, set
+T's `index` to its depth and T's `round` to `*round*`, set T's
+`leader` to `nil`, call the dispatcher with the original arguments and
+the continuation *add-answer* (copy the tuple into T unless `seen` has
+its key; on adding, bump `*answers-added*`; return `nil`, so the
+dispatcher backtracks through every clause). While T evaluates, two
+things lower T's `leader`:
 
-   The repeat condition is a counter on the leader, bumped by every
-   add-answer under it, compared before and after the round.
-3. **No table, a leader active.** The call is a **follower** in the
-   leader's component: create the table with `leader` the current
-   leader and `round` the leader's round, push it, evaluate once with
-   add-answer, pop, then consume its answers so far into `cont`. It is
-   not marked complete; the leader's final round will be.
-4. **Incomplete table** (created in this query by paths 2 or 3):
-   - on `*table-stack*`: an ancestor; a **looping consumer**. Consume
-     the answers so far into `cont` and return. New answers the
-     ancestor finds later reach this call site in the leader's next
-     round, which is why rounds repeat until nothing changes.
-   - not on the stack and `round` is the leader's current round: it
-     was already evaluated this round; consume into `cont`.
-   - not on the stack and `round` is older: re-evaluate as a follower
-     (set `round`, push, evaluate once, pop), then consume into `cont`.
+- a **looping consumer** inside T's extent reading a table A that is
+  on the stack: A is an ancestor; T's `leader` becomes the lower of
+  its current `leader` and A (lower means smaller `index`);
+- a child table C evaluated inside T's extent that ends incomplete:
+  T's `leader` becomes the lower of its `leader` and C's `leader`.
+
+When the dispatcher returns, T's `leader` is the lowest table on the
+stack that T's evaluation depended on, or `nil`.
+
+- **T depends on nothing below itself** (`leader` nil, or `leader` is
+  T): T leads a component. Iterate: increment `*round*`, note
+  `*answers-added*`, evaluate T again (which re-evaluates the stale
+  tables under it, path 4 below), and repeat while `*answers-added*`
+  moved. Then mark complete T and every incomplete table with
+  `created-at` greater than T's: those were all created inside T's
+  extent and depend on T (a table created there that depended on
+  nothing below itself completed on its own, earlier). The first
+  evaluation counts as round one, so a table whose first evaluation
+  added nothing completes without a second.
+- **T depends on an ancestor** (`leader` below T): T stays incomplete,
+  its `leader` propagates to the table below it on the stack, and the
+  ancestor's component will complete it.
+
+The call paths:
+
+1. **Complete table.** Consume: for each answer in order, `%tick`,
+   unify, call `cont`, undo. Return.
+2. **No table.** Create it (`created-at` next serial), evaluate as
+   above, then consume into `cont`: all answers when T completed,
+   the answers so far when it did not.
+3. **Incomplete table on the stack** (an ancestor): a looping consumer.
+   Lower the top table's `leader` to it, consume the answers so far
+   into `cont`, return. New answers the ancestor finds later reach this
+   call site in the component's next round.
+4. **Incomplete table not on the stack:** if its `round` is `*round*`
+   it was evaluated in this round; lower the top table's `leader` to
+   its `leader` (it depends on what that table depended on) and consume.
+   Otherwise re-evaluate it as in path 2 (it may now complete on its
+   own if what it depended on has completed), then consume.
 
 Consumption always reads the vector by index up to its length at each
 step, so a consumer running during evaluation also delivers answers
@@ -227,67 +266,89 @@ nothing new).
 
 Soundness and completeness, for a definite program: every answer in a
 table was derived by a clause from answers and facts, so it is a
-consequence; a leader completes only after a round that derived
-nothing new while every follower was evaluated at least once in that
-round or consumed from a table evaluated in it, so the tables are
-closed under the clauses, hence the least fixpoint. Duplicate
-elimination is by variant, so two derivations of one answer are one
-answer; solution order is first-derivation order and is deterministic
-for one program and graph.
+consequence. Calls are monotone across rounds (tables only grow and
+the dispatcher reruns the same clauses), so every table reached in one
+round is reached in the next and re-evaluated at first touch; a leader
+completes only after a round that stored nothing anywhere, so every
+evaluation in that round read final tables and the component's tables
+are closed under the clauses: the least fixpoint. A table completed
+early depended on nothing still open, so its closure was already
+final. Duplicate elimination is by variant, so two derivations of one
+answer are one answer; solution order is first-derivation order and is
+deterministic for one program and graph. A cut inside a tabled clause
+breaks the monotonicity argument; D5 says what the table then means.
 
 **Budget and deadline.** The clause bodies run through `compile-call`,
 which ticks; a round that cannot finish inside `:max-inferences` or
-`:timeout` signals `prolog-resource-error` out of the leader as any
-query does, and D5's unwind drops the tables. Consumption of a complete
-table also ticks once per answer delivered (an explicit `%tick` in the
-consume loop), so a huge table under a small budget still trips it.
+`:timeout` signals `prolog-resource-error` out of the query, and D5's
+unwind drops the tables. Consumption ticks once per answer delivered,
+so a huge table under a small budget still trips it. For the record:
+the right-recursive 200-ring under the bench's 200,000 budget costs
+about 105,000 ticks over its rounds, so `:complete` fits with headroom.
 
 ### D4. Negation and stratification
 
-`*negation-level*` is a special, 0 at a query root, incremented around
-the goal of the `not` compiler macro, `not/1`, and therefore `forall`
-(which compiles to `not`). `if`'s test and `once` do not increment:
-they commit, they do not negate.
+A construct that concludes something from a goal having no (further)
+solution reads the goal's tables as closed: `not` (compiler macro and
+`not/1`), `forall` (both forms), `if` with an else arm (compiler macro
+and `if/3`; the two-argument form only prunes), `findall/3`, `bagof/3`,
+`setof/3`. Each binds `*negation-floor*` around the goal it reads to
+the current depth of `*table-stack*` (the floor is the deepest ancestor
+that is *outside* the construct). `once`, two-argument `if` and the
+cut do not touch it.
 
-A table records `negation-level` at creation. Path 2's condition "no
-leader" also holds when `*negation-level*` is greater than the current
-leader's `negation-level`: a tabled call first reached under a negation
-inside a leader's evaluation starts its own, nested leader, so an
-independent predicate under `not` completes on its own (the common,
-stratifiable case). Path 4 then checks: consuming an incomplete table
-whose `leader` is not the current leader, or whose `negation-level` is
-less than the current `*negation-level*`, means a negation stands
-between a table's evaluation and a consumer that feeds it; the
-program is not stratified through that call, and the entry signals
-`prolog-error` with reason "tabled NAME/ARITY is called under negation
-inside its own recursive component (unstratified)" and an ISO
-`permission_error`-shaped ball `(:permission-error :negate :procedure
-NAME/ARITY)`, so `catch/3` can take it. A cut, `once` or `if` across a
-tabled call is not negation and is not refused (D5).
+A tabled call under a floor is sound exactly when the tables it reads
+do not depend on an ancestor at or below the floor. So the entry
+refuses, before consuming an incomplete table T (paths 3 and 4), when
+T's lowest open dependency sits at or below the floor: for path 3, T
+itself (its `index` is less than the floor); for path 4, the end of
+T's `leader` chain, followed while the leader is on the stack (its
+`index` is less than the floor). A table that completed on its own
+(D3's early completion) is complete, never refused: an independent
+predicate under `not`, or collected by `findall`, inside a recursive
+one works, and a nested component that starts under the floor
+completes under it and is consumed as complete.
 
-This refuses exactly the cases where negation-as-failure over an
-incomplete table could answer wrongly, and nothing else that this
-design can decide. It does not do a static stratification of the
-program: `run-rules` already does that for rule sets (#333); for
-`select`, the refusal is at the call.
+The refusal is `prolog-unstratified-error`, a `prolog-error` subclass
+with reason "tabled NAME/ARITY is read as closed inside its own
+recursive component (unstratified)" and ball `(:permission-error
+:negate :procedure NAME/ARITY)`. `catch/3` declines it as it declines
+resource and permission errors, for the same reason: a guarded query
+must not swallow the enforcement and go on deriving from the recovery
+branch inside the round. The two builder-check programs the coarse
+design answered wrongly are tests: `p(X) :- q(X), (p(X) -> fail ;
+true)` spelled with three-argument `if`, and `p(a) :- findall(Y, p(Y),
+[])`; both are refused.
 
 ### D5. Cut, commit, limits and non-local exits
 
 - **A cut inside a tabled predicate's clause** commits that clause in
-  that evaluation as today (unit 2, D3); the answers found before and
-  after are tabled. The table is the predicate's answer set under its
-  clauses with their cuts, deterministic per program.
+  that evaluation as today (unit 2, D3). The table is the predicate's
+  answer set under its clauses with their cuts, with the first answer
+  in insertion order stable across rounds; a clause a cut skips in a
+  later round because an earlier clause now has an answer leaves its
+  earlier-round answers in the table. The manual says a cut in a tabled
+  clause means "prune this evaluation", not "the answer set as Prolog
+  would stream it", and shows `once` on the consumer side as the way to
+  take one answer.
 - **A cut, `once`, `if` or `:limit` across a tabled call** (the consumer
-  stops early) is a non-local exit through the entry: `return-from` a
-  barrier block, or `throw :prolog-limit-reached`. During *consumption*
-  of a complete table nothing is harmed: the table stays complete. During
-  *evaluation* (a leader round or a follower's single evaluation) the
-  continuation is add-answer, which never exits non-locally; only an
-  error or the budget can leave a round early. The leader's iteration is
-  wrapped in `unwind-protect`: on an abnormal exit every table whose
-  `leader` is this one is removed from `*tables*`, so a later call in the
-  same query (after `catch/3` recovered, say) starts afresh instead of
-  reading a half-built table.
+  stops early) is a non-local exit through the entry during
+  *consumption*: `return-from` a barrier block, or `throw
+  :prolog-limit-reached`. A complete table stays complete. A consumer
+  of an incomplete table (paths 3 and 4) leaving early does not change
+  the table either; the component's next round does not depend on
+  consumers finishing.
+- **A non-local exit during an evaluation** (a `throw/1` caught by a
+  `catch/3` outside the table, an error, the budget) leaves tables
+  half-built. Every evaluation, leader or follower, is wrapped in
+  `unwind-protect`: on an abnormal exit the table being evaluated and
+  every incomplete table with a greater `created-at` are removed from
+  `*tables*`, so a later call in the same query (after `catch/3`
+  recovered) starts afresh instead of reading a half-built table or
+  completing it later from a stale `round`. The builder check's program
+  (`q` with a throwing middle clause, `p` catching it in one clause and
+  calling `q` plain in another) is the test: `q`'s table must end
+  `{1, 2}`, not `{1}`.
 - **The trail.** The entry saves the fill-pointer on entry and undoes to
   it between answers and before returning, as the dispatcher does.
   Add-answer copies the tuple before the dispatcher undoes the clause's
@@ -308,10 +369,14 @@ query that fetched a dispatcher before an assert does today.
   `:redo`, `:fail` through `%ported-call` exactly as any call: the entry
   is the `fn` `compile-call` wraps. The clause evaluation inside fires
   `:clause` events as now. The entry fires one new port, `:table`, with
-  args `(:complete n)`, `(:leader round)`, `(:follower)`, `(:consume n)`
-  so a trace shows whether a call was answered from a table or evaluated
-  it; `%print-port` prints it as `TABLE NAME/ARITY complete 12`.
-  `profile-goals` counts it under the functor as `tables`.
+  args `(:complete n)` (answered from a complete table), `(:leader
+  rounds)` (led a component to completion), `(:follower n)` (evaluated,
+  left incomplete, n answers so far) or `(:consume n)` (read an
+  incomplete table without evaluating), so a trace shows whether a call
+  was answered from a table or evaluated it; `%print-port` prints it as
+  `TABLE NAME/ARITY complete 12`. `profile-goals`' port `ecase`
+  (prolog-explain.lisp:224) gains the branch and counts it under the
+  functor as `tables`.
 - **`explain-goals`.** A user functor's line gains `, tabled` after the
   clause count when the functor is tabled; nothing else changes.
 - **Budget accounting.** `profile-goals`' inference count includes the
@@ -332,15 +397,14 @@ gives:
   that a single round's in-flight consumption does not already cover
   (two for a ring, as measured by the bench).
 - A **right-recursive** tabled rule, `(<- (path ?a ?c) (edge ?a ?b)
-  (path ?b ?c))`, has one table per reachable node; each is a follower
-  evaluated inside its caller's evaluation, so the Lisp depth is the
-  number of distinct calls on the stack at once: the ring's
-  circumference, the chain's length. It terminates on a cycle where it
-  did not, and its depth is bounded by the number of distinct nodes
-  rather than by the number of paths, but a chain longer than the
-  control stack can hold still exhausts it. The manual says so and
-  shows the left-recursive form as the one to write for closure over
-  large graphs.
+  (path ?b ?c))`, has one table per reachable node; each is evaluated
+  inside its caller's evaluation, so the Lisp depth is the number of
+  distinct calls on the stack at once: the ring's circumference, the
+  chain's length. It terminates on a cycle where it did not, and its
+  depth is bounded by the number of distinct nodes rather than by the
+  number of paths, but a chain longer than the control stack can hold
+  still exhausts it. The manual says so and shows the left-recursive
+  form as the one to write for closure over large graphs.
 - **Untabled recursion** keeps unit 2's property, tail position for a
   last-goal call, and the budget; nothing else changes. No trampoline
   is built: the top-down compiler's calling convention stays direct
@@ -366,7 +430,8 @@ check against this document:
 - `tb-declaration-round-trips`: `table-functor` before clauses, after
   clauses, after `reset-functor`; `functor-tabled-p`; `untable-functor`
   restores the dispatcher (same answers, `:table` port no longer fires);
-  a global functor is refused.
+  a global functor is refused; a tabled functor with no clauses answers
+  nothing.
 - `tb-ring-terminates`: a 6-node ring as asserted facts, right-recursive
   `path/2`, `(select (?x) (path a ?x))` returns the six nodes once each;
   untabled, the same query under `:max-inferences 5000` signals
@@ -374,40 +439,52 @@ check against this document:
 - `tb-left-and-right-recursion-agree`: same facts, both rule shapes,
   same answer set; all-unbound call `(path ?x ?y)` returns the 36 pairs.
 - `tb-mutual-recursion`: `even/odd` over a chain of successor facts,
-  two tabled functors in one component; answers complete.
+  two tabled functors in one component; answers complete; the
+  component's leader is one of them (`:leader` fires once).
+- `tb-independent-subtable-completes-early`: `p` recursive over a
+  ring, calling tabled `q` that depends on facts only: `q` fires
+  `:leader` once and `:complete` thereafter, never `:follower`.
 - `tb-nonground-answers`: a tabled predicate with a clause `(<- (p ?x
   ?x))`: `(p ?a ?b)` yields one answer binding the two together; two
   consumers get independent fresh variables.
 - `tb-answers-dedupe-by-variant`: two derivations of one answer, one
   solution; `1` and `1.0` one answer; two node objects with one id one
-  answer.
+  answer; a user term shaped like a key marker is its own answer.
 - `tb-tables-scope-to-the-query`: a tabled predicate over facts; assert
   a new fact between two queries; the second query sees it. Inside one
-  query, two calls with the same key evaluate once (count `:table`
-  `:leader` events).
+  query, two calls with the same key evaluate once (count `:leader`
+  events).
 - `tb-negation-is-stratified-or-refused`: `(<- (p ?x) (q ?x) (not (r
   ?x)))` with `r` tabled and independent: answers correct; `(<- (p ?x)
-  (not (p ?x)))` with `p` tabled: `prolog-error` with the permission
-  ball, and `catch/3` can take it; `forall` over an independent tabled
-  predicate works.
+  (not (p ?x)))` with `p` tabled: `prolog-unstratified-error`, and a
+  `catch/3` around it does not take it; `forall` over an independent
+  tabled predicate works; the stratified program the coarse design
+  refused (a negated branch calling a variant the positive branch
+  already opened) answers correctly.
+- `tb-if-else-and-findall-read-as-closed`: the two builder-check
+  programs (D4) are refused; `findall` over an independent tabled
+  predicate inside a recursive one works; two-argument `if` and `once`
+  over the recursive predicate itself are not refused.
 - `tb-cut-and-once-across-a-table`: `(once (path a ?x))` returns one
   answer and a following `(path a ?y)` in the same query still returns
   all six (the table completed before the cut); `:limit 2` on a tabled
   query returns two.
+- `tb-abandoned-tables-are-dropped`: the D5 program; `q`'s answers
+  through the plain clause are `{1, 2}`.
 - `tb-budget-trips-inside-a-round`: a tabled closure over a 50-node
-  ring under `:max-inferences 100` signals `prolog-resource-error`; a
-  later call in the same query (under `catch/3`) re-evaluates (no stale
-  half table).
+  ring under `:max-inferences 100` signals `prolog-resource-error` out
+  of the query.
 - `tb-trace-and-explain-see-tables`: `with-prolog-ports` collects a
   `:table` event per tabled call; `explain-goals` prints `tabled` on the
-  line.
+  line; `profile-goals` reports the count.
 - `tb-dynamic-call-is-tabled`: `(call ?g)` with `?g` bound to a tabled
   goal goes through the table (`:table` event fires).
-- `tb-mutation-checks` are not tests but the gate the plan names:
-  removing the `round` check (path 4, second bullet) must break
-  `tb-mutual-recursion`'s evaluation count; removing the `seen` check
-  must break `tb-answers-dedupe-by-variant`; removing the
-  `unwind-protect` must break `tb-budget-trips-inside-a-round`.
+- Mutation checks the plan names as its gate: removing the `round`
+  check (path 4) must raise `tb-mutual-recursion`'s evaluation count;
+  removing the `seen` check must break `tb-answers-dedupe-by-variant`;
+  removing the `unwind-protect` must break
+  `tb-abandoned-tables-are-dropped`; removing the floor binding in the
+  `if` compiler macro must break `tb-if-else-and-findall-read-as-closed`.
 
 Existing suites that must stay green: clause-indexing (51),
 tracer-explain (60), prolog-functor (93), prolog-stress (60), rules
@@ -440,7 +517,8 @@ records `:stack-exhausted`, 0 solutions, 0.09 s at the before commit
 - Recursive queries terminate on a cyclic graph rather than exhausting a
   bound: `tb-ring-terminates` and the bench row.
 - Stratified negation is enforced, not assumed: D4,
-  `tb-negation-is-stratified-or-refused`.
+  `tb-negation-is-stratified-or-refused`,
+  `tb-if-else-and-findall-read-as-closed`.
 - Measured against a real corpus on a named host, third run: the ring
   on odm; the spine row or its stated deferral.
 - Full SBCL suite green on the post-merge run; the cross-impl matrix in
@@ -448,13 +526,13 @@ records `:stack-exhausted`, 0 solutions, 0.09 s at the before commit
 
 ## Left to the builder
 
-- The exact struct and special names beyond those given; whether the
-  tabled entry is a closure per functor or one function taking the
-  functor (one closure per functor, built by `table-functor`, is the
-  author's expectation, mirroring the dispatcher).
-- How the consume loop delivers `:exit` ports: through `%ported-call`
-  as today (the entry is the wrapped function), nothing extra.
+- The exact struct and special names beyond those given; the tabled
+  entry is one closure per functor, built by `%make-tabled-entry`,
+  mirroring the dispatcher.
+- How `*negation-floor*` is bound in the compiler macros (a `let` in
+  the emitted code around the goal's compiled form) versus the dynamic
+  functors (a `let` around the `call/1`); both are mechanical.
 - Whether `tb-with-functors` is lifted into a shared test helper file
   or duplicated; two copies in two files is acceptable, a third is not.
 - The manual section's worked example (the ring, both rule shapes, the
-  trace of a consumer hit).
+  trace of a consumer hit, the cut note of D5).
