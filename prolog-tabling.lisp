@@ -130,10 +130,11 @@ stack; a table that depends on nothing below itself leads, iterating
 while a pass adds an answer anywhere, then completes its component; one
 that depends on an ancestor stays incomplete and hands its leader to
 the table below.  A non-local exit drops the half tables (D5).
-Returns whether TBL completed."
+Returns whether TBL completed, and the number of passes."
   (let ((parent (first *table-stack*))
         (completed nil)
-        (returned nil))
+        (returned nil)
+        (passes 1))
     (unwind-protect
          (let ((*table-stack* (cons tbl *table-stack*)))
            (setf (tbl-index tbl) (length *table-stack*))
@@ -153,13 +154,14 @@ Returns whether TBL completed."
                       (%complete-from tbl)
                       (setf completed t)
                       (return))
-                     (t (incf *round*)))))
+                     (t (incf *round*)))
+             (incf passes)))
            (setf returned t))
       (unless returned
         (%drop-from tbl)))
     (unless completed
       (%lower-leader parent (tbl-leader tbl)))
-    completed))
+    (values completed passes)))
 
 (defun %open-dependency (tbl)
   "The end of TBL's LEADER chain: the lowest table TBL's answers so far
@@ -180,6 +182,17 @@ table it depends on is open at or below the floor (design D4)."
                  (<= (tbl-index dependency) *negation-floor*))
         (%unstratified (functor-name functor))))))
 
+(defun %table-port (functor tbl how passes)
+  "Fire the :TABLE port for FUNCTOR (tracer design D1, tabling D7):
+(:complete n), (:leader passes), (:follower n) or (:consume n)."
+  (let ((hook *prolog-port-hook*))
+    (when hook
+      (funcall hook :table (functor-name functor)
+               (list how (if (eq how :leader)
+                             passes
+                             (fill-pointer (tbl-answers tbl))))
+               *prolog-port-depth*))))
+
 (defun %call-tabled (functor args cont)
   "A call of the tabled FUNCTOR with ARGS: the variant's table found or
 made, evaluated when it is new or stale, then consumed into CONT (the
@@ -188,19 +201,27 @@ four paths of design D3)."
   (let* ((key (cons (functor-name functor) (%variant-key args)))
          (tbl (gethash key *tables*))
          (top (first *table-stack*)))
-    (cond ((null tbl)
-           (setf tbl (%make-tbl key (incf *table-serial*))
-                 (gethash key *tables*) tbl)
-           (%evaluate-tbl tbl functor args))
-          ((tbl-complete tbl))
-          ((member tbl *table-stack* :test #'eq)
-           ;; A looping consumer: the answers so far, the rest next round.
-           (%check-floor tbl functor)
-           (%lower-leader top tbl))
-          ((= (tbl-round tbl) *round*)
-           (%check-floor tbl functor)
-           (%lower-leader top (tbl-leader tbl)))
-          (t (%evaluate-tbl tbl functor args)))
+    (flet ((evaluate ()
+             (multiple-value-bind (completed passes)
+                 (%evaluate-tbl tbl functor args)
+               (%table-port functor tbl (if completed :leader :follower)
+                            passes))))
+      (cond ((null tbl)
+             (setf tbl (%make-tbl key (incf *table-serial*))
+                   (gethash key *tables*) tbl)
+             (evaluate))
+            ((tbl-complete tbl)
+             (%table-port functor tbl :complete nil))
+            ((member tbl *table-stack* :test #'eq)
+             ;; A looping consumer: the answers so far, the rest next round.
+             (%check-floor tbl functor)
+             (%lower-leader top tbl)
+             (%table-port functor tbl :consume nil))
+            ((= (tbl-round tbl) *round*)
+             (%check-floor tbl functor)
+             (%lower-leader top (tbl-leader tbl))
+             (%table-port functor tbl :consume nil))
+            (t (evaluate))))
     (%consume-tbl tbl args cont)))
 
 (defun %make-tabled-entry (functor)

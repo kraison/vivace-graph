@@ -61,14 +61,20 @@ strings: \"NAME/N\" for one arity, \"NAME/\" for every arity.")
 (defun %print-port (port functor args depth)
   "One trace line per port to *TRACE-OUTPUT* (tracer design D2, GH
 #124): [DEPTH], two spaces per level, the port, the functor, and the
-arguments dereferenced; a :CLAUSE event as POS/N, 1-based."
+arguments dereferenced; a :CLAUSE event as POS/N, 1-based; a :TABLE
+event as its path word and count (tabling design D7, GH #122)."
   (when (%traced-p functor)
     (let ((*print-length* 8) (*print-level* 3) (*print-pretty* nil))
       (format *trace-output* "~&[~D] ~v@{  ~}~A ~A" depth depth
               (symbol-name port) (symbol-name functor))
-      (if (eq port :clause)
-          (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args))
-          (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args)))
+      (case port
+        (:clause
+         (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args)))
+        ;; (:complete n), (:leader passes), (:follower n), (:consume n).
+        (:table
+         (format *trace-output* " ~(~A~) ~D~%" (first args) (second args)))
+        (t
+         (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args))))
       (finish-output *trace-output*))))
 
 (defun trace-prolog (&rest names)

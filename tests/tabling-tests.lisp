@@ -160,8 +160,12 @@ tables form one component with one leader (design D3)."
       (is (tb-set-equal '((1) (3) (5) (7) (9))
                         (select (:max-inferences 20000) (?n)
                           (tb-odd ?n))))
-      ;; task 6: the :table port
-      (skip "task 6 fires the :table port"))))
+      (flet ((tb-run-sel () (select (:max-inferences 20000) (?n) (tb-even ?n))))
+        (is (= 1 (+ (length (tb-table-events "TB-EVEN/1" #'tb-run-sel :leader))
+                    (length (tb-table-events "TB-ODD/1" #'tb-run-sel :leader)))))
+        (is (plusp (length (tb-table-events "TB-ODD/1" #'tb-run-sel :follower))))
+        (is (plusp (length (tb-table-events "TB-EVEN/1" #'tb-run-sel
+                                            :consume))))))))
 
 (test tb-independent-subtable-completes-early
   "A tabled fact predicate called inside the ring's evaluation completes
@@ -178,8 +182,13 @@ on its first evaluation and is consumed afterwards (design D3)."
       (is (tb-set-equal *tb-ring*
                         (select (:max-inferences 5000) (?x)
                           (tb-path a ?x))))
-      ;; task 6: the :table port
-      (skip "task 6 fires the :table port"))))
+      (let ((events (tb-table-events
+                     "TB-Q/1"
+                     (lambda ()
+                       (select (:max-inferences 5000) (?x) (tb-path a ?x))))))
+        (is (eq :leader (first (first events))))
+        (is (every (lambda (e) (eq :complete (first e))) (rest events)))
+        (is (plusp (length (rest events))))))))
 
 (defun tb-same-var-p (x y)
   "True when X and Y dereference to one unbound variable."
@@ -243,8 +252,12 @@ by the second; inside one query a second call consumes (design D6)."
       (<- (tb-fact2 2))
       (is (equal '((1) (2)) (select () (?x) (tb-fact2 ?x))))
       (is (= 4 (length (select () (?x ?y) (tb-fact2 ?x) (tb-fact2 ?y)))))
-      ;; task 6: the :table port
-      (skip "task 6 fires the :table port"))))
+      ;; One evaluation; the inner call is consumed once per outer answer.
+      (is (equal '((:leader 1) (:complete 2) (:complete 2))
+                 (tb-table-events
+                  "TB-FACT2/1"
+                  (lambda ()
+                    (select () (?x ?y) (tb-fact2 ?x) (tb-fact2 ?y)))))))))
 
 (test tb-tables-are-per-thread
   "Two threads run the ring select at once; each gets the closure."
@@ -428,5 +441,41 @@ entry (design D1, D6)."
       (is (tb-set-equal *tb-ring*
                         (select (:max-inferences 5000) (?x)
                           (= ?g (tb-path a ?x)) (call ?g))))
-      ;; task 6: the :table port
-      (skip "task 6 fires the :table port"))))
+      (is (plusp (length (tb-table-events
+                          "TB-PATH/2"
+                          (lambda ()
+                            (select (:max-inferences 5000) (?x)
+                              (= ?g (tb-path a ?x)) (call ?g))))))))))
+
+;;; Trace, explain and profile (design D7).
+
+(test tb-trace-and-explain-see-tables
+  "The :table port names the path a tabled call took; TRACE-PROLOG
+prints it; EXPLAIN-GOALS marks the functor tabled; PROFILE-GOALS counts
+the events (design D7)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-edge 2) (tb-path 2))
+      (tb-ring-facts)
+      (tb-right-path)
+      (graph-db:table-functor 'tb-path 2)
+      (flet ((tb-run-sel () (select (:max-inferences 5000) (?x) (tb-path a ?x))))
+        (let ((events (tb-table-events "TB-PATH/2" #'tb-run-sel)))
+          (is (find :leader events :key #'first))
+          (is (find :consume events :key #'first)))
+        (let ((out (with-output-to-string (*trace-output*)
+                     (graph-db:trace-prolog 'tb-path)
+                     (unwind-protect (tb-run-sel)
+                       (graph-db:untrace-prolog)))))
+          (is (search "TABLE TB-PATH/2 leader" out))))
+      (is (search "tabled" (first (te-paths '(?x) '((tb-path a ?x))))))
+      (let ((out (make-string-output-stream)))
+        (multiple-value-bind (solutions rows)
+            (graph-db:profile-goals '(?x) '((tb-path a ?x))
+                                    :stream out :max-inferences 5000)
+          (is (= 6 solutions))
+          (let ((row (find "TB-PATH/2" rows
+                           :key (lambda (r) (symbol-name (getf r :functor)))
+                           :test #'string=)))
+            (is (plusp (getf row :tables))))
+          (is (search "tables" (get-output-stream-string out))))))))
