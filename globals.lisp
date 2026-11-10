@@ -453,6 +453,8 @@ none completes the component (design D3).")
 (defvar *negation-floor* 0
   "The table-stack depth a read-as-closed construct was entered at; a
 dependency on a table below it is unstratified (design D4).")
+(defvar *table-serial* 0
+  "The last CREATED-AT handed to a table of the current query (D2).")
 
 #+sbcl
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))

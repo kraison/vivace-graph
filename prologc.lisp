@@ -829,9 +829,13 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
 ;         exp))
 
 (defun deref-copy (exp)
+  "EXP with every unbound variable replaced by a fresh one, the same
+fresh variable per occurrence, and bound variables followed.  (Before
+GH #122 the walk discarded its dereference and copied a bound variable
+as a fresh unbound one; its one caller pre-dereferenced.)"
   (let ((var-alist nil))
     (labels ((walk (exp)
-               (deref-exp exp)
+               (var-deref exp)
                (cond ((consp exp)
                       (reuse-cons (walk (first exp))
                                   (walk (rest exp))
@@ -1138,6 +1142,7 @@ FN already is it (design D2, D5)."
             (*round* 0)
             (*answers-added* 0)
             (*negation-floor* 0)
+            (*table-serial* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
             (catch 'top-level-prove
@@ -1444,6 +1449,7 @@ SELECT-FIRST for common shorthands."
             (*round* 0)
             (*answers-added* 0)
             (*negation-floor* 0)
+            (*table-serial* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        ;; A resource-bounded query must not carry a goal the rails
        ;; cannot bound (GH #285).  Static over the goal list; checked
