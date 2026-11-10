@@ -15,7 +15,10 @@ ascending positions the index does not cover."
   name fn clauses (lock (make-recursive-lock))
   ;; GH #121: ARITY from the first clause; DISPATCHER the function
   ;; built once over the arity; CLAUSE-SET the current published set.
-  arity dispatcher (clause-set (%make-clause-set)))
+  arity dispatcher (clause-set (%make-clause-set))
+  ;; GH #122: TABLED set by TABLE-FUNCTOR; ENTRY the tabled entry
+  ;; closure FN holds while TABLED (prolog-tabling.lisp).
+  tabled entry)
 
 (defgeneric prolog-compile (functor))
 

@@ -130,6 +130,7 @@
                (:file "txn-log" :depends-on ("replication"))
                (:file "functor" :depends-on ("vertex" "edge" "views" "schema"))
                (:file "prologc" :depends-on ("functor"))
+               (:file "prolog-tabling" :depends-on ("prologc"))
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
@@ -725,6 +726,7 @@ cl-temporal-extent."
                (:file "prolog-functor-tests")
                (:file "clause-indexing-tests")
                (:file "tracer-explain-tests")
+               (:file "tabling-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")

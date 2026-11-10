@@ -863,9 +863,24 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
            (deref-equal (rest x) (rest y)))))
 
 (defmethod prolog-compile-null ((functor functor))
-  (let ((*functor* (functor-name functor)))
-    (set-functor-fn *functor*
-                    #'(lambda (&rest args) (declare (ignore args)) nil))))
+  (%install-functor-fn functor))
+
+(defun %null-functor-fn (&rest args)
+  "The FN of a functor with no clauses: every call fails."
+  (declare (ignore args))
+  nil)
+
+(defun %install-functor-fn (functor)
+  "FUNCTOR's FN from its state: the tabled entry when TABLED (built once,
+kept in ENTRY), else the dispatcher when one exists, else the null
+function.  Every site that sets FN goes through here (GH #122, D1)."
+  (setf (functor-fn functor)
+        (cond ((functor-tabled functor)
+               (or (functor-entry functor)
+                   (setf (functor-entry functor)
+                         (%make-tabled-entry functor))))
+              ((functor-dispatcher functor))
+              (t #'%null-functor-fn))))
 
 (defun %compile-clause-fn (functor clause)
   "CLAUSE as its own closure of (CELL ARG1 .. ARGN CONT) (design D1,
@@ -1050,8 +1065,9 @@ FN already is it (design D2, D5)."
     (unless (functor-dispatcher functor)
       (setf (functor-dispatcher functor)
             (%make-dispatcher functor (functor-arity functor))))
-    (unless (eq (functor-fn functor) (functor-dispatcher functor))
-      (set-functor-fn (functor-name functor) (functor-dispatcher functor)))
+    ;; Every assert reinstalls FN: a SET-FUNCTOR-FN stand-in answers
+    ;; only until the next assert (clause indexing design D2).
+    (%install-functor-fn functor)
     functor))
 
 (defun compile-body (body cont bindings)
@@ -1116,6 +1132,12 @@ FN already is it (design D2, D5)."
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
+            ;; Tabling: fresh tables per query (GH #122, D6).
+            (*tables* (make-hash-table :test 'equal))
+            (*table-stack* nil)
+            (*round* 0)
+            (*answers-added* 0)
+            (*negation-floor* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
             (catch 'top-level-prove
@@ -1416,6 +1438,12 @@ SELECT-FIRST for common shorthands."
             (*select-count-only* ,(cdr (assoc :count options)))
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
+            ;; Tabling: fresh tables per query (GH #122, D6).
+            (*tables* (make-hash-table :test 'equal))
+            (*table-stack* nil)
+            (*round* 0)
+            (*answers-added* 0)
+            (*negation-floor* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        ;; A resource-bounded query must not carry a goal the rails
        ;; cannot bound (GH #285).  Static over the goal list; checked

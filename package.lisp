@@ -590,6 +590,7 @@
            #:*clause-body-rewriters*
            #:trace-prolog
            #:untrace-prolog
+           #:table-functor #:untable-functor #:functor-tabled-p
            #:make-node-table
            #:node-equal
 
