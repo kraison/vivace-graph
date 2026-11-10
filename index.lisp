@@ -1366,3 +1366,39 @@ does not materialise the whole range first."
                      (funcall cont))
                    (undo-bindings old-trail)))
                *graph* class slot :start start :end end)))
+
+;;; What EXPLAIN-GOALS says of the index predicates (design D3, GH
+;;; #124): the index a literal class and slot name, or that the call
+;;; signals, or that the choice waits for a value.
+(flet ((index-declared-p (graph class slot)
+         (handler-case (progn (%require-index graph class slot) t)
+           (error () nil)))
+       (unique-declared-p (graph class slot)
+         (handler-case
+             (progn (%unique-index-for-read graph class
+                                            (%normalize-slots slot))
+                    t)
+           (error () nil))))
+  (flet ((ordered (bound args graph)
+           (declare (ignore bound))
+           (destructuring-bind (node class slot &rest more) args
+             (declare (ignore node more))
+             (cond ((or (variable-p class) (variable-p slot))
+                    "ordered index: class and slot by value at run time")
+                   ((index-declared-p graph class slot)
+                    (format nil "ordered index on ~A.~A" class slot))
+                   (t (format nil "no index on ~A.~A: the call signals"
+                              class slot)))))
+         (unique (bound args graph)
+           (declare (ignore bound))
+           (destructuring-bind (node class slot &rest more) args
+             (declare (ignore node more))
+             (cond ((or (variable-p class) (variable-p slot))
+                    "unique constraint: class and slot by value at run time")
+                   ((unique-declared-p graph class slot)
+                    (format nil "unique constraint on ~A.~A" class slot))
+                   (t (format nil "no unique constraint on ~A.~A: the ~
+call signals" class slot))))))
+    (register-access-path 'find-by-slot/4 #'ordered)
+    (register-access-path 'find-slot-range/5 #'ordered)
+    (register-access-path 'find-by-unique/4 #'unique)))

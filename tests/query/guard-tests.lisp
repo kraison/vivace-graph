@@ -415,3 +415,32 @@ run-guarded-prolog's clamp, probe, paging, budgets and shaping (#383)."
            :graph g :label "d" :rank 4))
         (is (= 4 (length (nth-value 1 (graph-db.query:run-guarded-goals
                                        vars goals g)))))))))
+
+(test teq-explain-text-matches-explain-goals
+  "explain-text screens, reads and guards the text as guard-query-text
+does, then explains the same goals (design D5, GH #124)."
+  (with-query-graph (g)
+    (let* ((text "(is-a ?i qt-item) (qt-links ?i ?j)")
+           (from-text (graph-db.query:explain-text text g))
+           (from-goals (multiple-value-bind (vars goals)
+                           (graph-db.query:guard-query-text text g)
+                         (graph-db:explain-goals vars goals :graph g))))
+      (is (equal (mapcar (lambda (r) (getf r :path)) from-text)
+                 (mapcar (lambda (r) (getf r :path)) from-goals)))
+      (is (equal '("type index: QT-ITEM" "ve-out index of ?I")
+                 (mapcar (lambda (r) (getf r :path)) from-text))))
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:explain-text "(is-a ?p graph-db::vertex)" g))))
+
+(test teq-profile-text-runs-under-the-rails-and-refuses-like-the-guard
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (solutions rows err)
+        (graph-db.query:profile-text "(is-a ?i qt-item)" g)
+      (is (= 3 solutions))
+      (is (null err))
+      (is (find "IS-A/2" rows
+                :key (lambda (r) (symbol-name (getf r :functor)))
+                :test #'string=)))
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:profile-text "(no-such-functor ?x)" g))))

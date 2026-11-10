@@ -236,6 +236,25 @@ the goal walks every claim; after, a range scan from the cursor."
                 (setf rows found))))
           (record "change-feed-cursor-rows" :rows (length rows)))))))
 
+(defun bench-traced-k-hop ()
+  "Unit 3 (GH #124): the three-hop select of BENCH-GRAPH-PREDICATES
+under TRACE-PROLOG to a null stream, for the record of what tracing
+costs when it is on; the untraced rows are the before-and-after."
+  (let ((n (scale 200)) (k (scale 100)))
+    (with-perf-graph (g)
+      (let* ((ids (pbp-ring n :chords t))
+             (starts (loop for i below k
+                           collect (lookup-vertex (aref ids (mod (* i 13) n)))))
+             (*trace-output* (make-broadcast-stream)))
+        (graph-db:trace-prolog)
+        (unwind-protect
+             (timed-ops ("traced-k-hop-3-select" k)
+               (dolist (s starts)
+                 (let ((*pbp-start* s))
+                   (graph-db:select-flat (?d) (lisp ?s *pbp-start*)
+                     (p-knows ?s ?b) (p-knows ?b ?c) (p-knows ?c ?d)))))
+          (graph-db:untrace-prolog))))))
+
 (defun bench-graph-predicates ()
   "Unit 5 (GH #123): a ring with chords.  A hand-written three-hop select
 from varying starts (the query k_hop/4 will replace), and a Lisp
@@ -287,6 +306,7 @@ Binds what RUN-PERF binds (benchmarks.lisp).  Returns T."
                  (bench-guarded-shape-repeat)
                  (bench-change-feed-cursor)
                  (bench-graph-predicates)
+                 (bench-traced-k-hop)
                  ;; last: see PBP-RING-CLOSURE
                  (bench-recursive-ring)))
            (write-perf-report output :tag tag))

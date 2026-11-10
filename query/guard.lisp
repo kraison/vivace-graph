@@ -844,3 +844,22 @@ Refusals signal PROLOG-GUARD-ERROR, as for RUN-GUARDED-PROLOG."
     (unwind-protect
          (%read-guarded-forms text scratch (%guard-context graph scratch))
       (delete-package scratch))))
+
+(defun explain-text (text graph &key stream)
+  "TEXT screened, read and guarded as GUARD-QUERY-TEXT does, then
+EXPLAIN-GOALS' rows for the result (design D5, GH #124)."
+  (multiple-value-bind (vars goals) (guard-query-text text graph)
+    (graph-db:explain-goals vars goals :graph graph :stream stream)))
+
+(defun profile-text (text graph &key stream limit max-inferences timeout)
+  "TEXT screened, read and guarded as GUARD-QUERY-TEXT does, then
+PROFILE-GOALS on the result under the guard's budgets: MAX-INFERENCES
+and TIMEOUT default to *QUERY-DEFAULT-MAX-INFERENCES* and
+*QUERY-DEFAULT-TIMEOUT*, so a profile from text is always bounded
+(design D5, GH #124)."
+  (multiple-value-bind (vars goals) (guard-query-text text graph)
+    (graph-db:profile-goals
+     vars goals :graph graph :stream stream :limit limit
+     :max-inferences (or max-inferences
+                         graph-db::*query-default-max-inferences*)
+     :timeout (or timeout graph-db::*query-default-timeout*))))

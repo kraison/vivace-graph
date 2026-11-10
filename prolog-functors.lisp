@@ -276,7 +276,10 @@ compound, or a control construct; its variables are runtime VAR structs."
                  (fn (or (get-functor-fn functor)
                          (gethash functor *prolog-global-functors*))))
             (if (functionp fn)
-                (apply fn (append gargs (list cont)))
+                (let ((hook *prolog-port-hook*))
+                  (if hook
+                      (%ported-call hook functor fn gargs cont)
+                      (apply fn (append gargs (list cont)))))
                 ;; Unknown predicate: noisy, but with an existence_error ball so
                 ;; catch/3 can recover from it.
                 (error 'prolog-error
@@ -1213,6 +1216,22 @@ is locked (GH #172)." name (package-name pkg))
                    (export sym pkg)
                    (setf (gethash sym *prolog-global-functors*) fn)
                    sym)))
-          (install "/2" (%edge-functor/2 name))
-          (install "/3" (%edge-functor/3 name))))
+          (let ((s2 (install "/2" (%edge-functor/2 name)))
+                (s3 (install "/3" (%edge-functor/3 name)))
+                (path (lambda (bound args graph)
+                        (declare (ignore graph))
+                        (destructuring-bind (from to &rest more) args
+                          (declare (ignore more))
+                          (cond ((and (first bound) (second bound))
+                                 "vev index: one lookup")
+                                ((first bound)
+                                 (format nil "ve-out index of ~A" from))
+                                ((second bound)
+                                 (format nil "ve-in index of ~A" to))
+                                (t (format nil "every ~A edge"
+                                           (symbol-name name))))))))
+            ;; What EXPLAIN-GOALS says of a call on this edge type
+            ;; (design D3, GH #124): the index MAP-EDGES reads.
+            (register-access-path s2 path)
+            (register-access-path s3 path))))
     name))

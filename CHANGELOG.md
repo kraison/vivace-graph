@@ -16,6 +16,34 @@ storage formats (#60).
 
 ### Added
 
+- **`profile-goals`, `explain-text`, `profile-text`** (#124):
+  `profile-goals` runs a query under the port hook and reports, per
+  functor, its call, exit, redo, fail and clause counts and the time
+  from its calls to its fails, with a tripped budget returned beside
+  the rows; the two text entries in `graph-db.query` explain or profile
+  guarded query text under the guard's refusals and budgets.
+- **`claim/7`'s route is one function and `explain-goals` names it**
+  (#124): `%claim-route` decides the route the goal takes in the
+  documented order and `explain-goals` reports the same words for a
+  `claim/7` or `claim-after/9` goal, so a query's route is confirmable
+  before it runs.
+- **`explain-goals`** (#124): one row per goal of a query, without
+  running it, naming the functor it resolves to, which arguments are
+  bound there, and the access path it takes, from a registry
+  (`register-access-path`) the type, slot, edge, ordered-index, unique
+  and spatial predicates fill; an asserted functor reports how many of
+  its clauses the first-argument index leaves; a path decided by a
+  value only known at run time says so; a cost-unbounded functor is
+  flagged.
+- **A 4-port trace hook** (#124). `*prolog-port-hook*`, when bound,
+  is called at the call, exit, redo and fail of every goal call and
+  every dynamic meta-call, and at a clause event when a dispatcher
+  tries a candidate; the depth it is given nests a callee's goals and
+  keeps the goals after a solved goal as its siblings, and a cut or a
+  budget error fires the fails it abandons. An untraced call costs
+  what it did: the check sits where the old `*prolog-trace*` print
+  sat. `with-prolog-ports` and `call-with-prolog-ports` bind the hook
+  for one extent.
 - **First-argument clause indexing** (#121). A call with a bound first
   argument tries only the asserted clauses whose first head argument
   can unify with it, keyed as a superset of `prolog-equal`: 1 and 1.0
@@ -87,6 +115,12 @@ storage formats (#60).
 
 ### Changed
 
+- **`trace-prolog` prints the four ports** (#124), one line per
+  call, exit, redo and fail indented by depth, plus the clause a
+  dispatcher tries; `(trace-prolog 'name)` traces every arity of one
+  functor and `'name/2` one arity, matched by name so a schema
+  package's edge functor is named as written. It no longer sets
+  `*prolog-trace*`, which stays the compiler's own chatter.
 - **`<-` compiles the clause it adds, not the functor** (#121). Each
   asserted clause is its own closure and the functor's function is a
   dispatcher built once, so an assert's compile cost no longer grows

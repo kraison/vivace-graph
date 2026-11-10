@@ -1113,6 +1113,101 @@ image started. A clause of another arity than the functor's signals
 never raise that, only a direct ~add-functor-clause~ or
 ~make-functor :clauses~ can.
 
+*** Watching and explaining a query: the ports, ~trace-prolog~, ~explain-goals~
+
+Every goal call fires four *ports* when a hook is set: ~:call~ when the
+goal is tried, ~:exit~ on each solution, ~:redo~ when the engine comes
+back for the next one, and ~:fail~ when there are no more. An asserted
+functor's dispatcher also fires ~:clause~ before each clause it tries.
+The hook is ~*prolog-port-hook*~, a function of ~(port functor args
+depth)~; unset, a goal call costs what it always did (GH #124).
+~with-prolog-ports~ binds it for one form:
+
+#+BEGIN_SRC lisp
+(with-prolog-ports ((port functor args depth)
+                    (format t "~A ~A ~A~%" port functor depth))
+  (select-flat (?x) (ancestor bob ?x)))
+#+END_SRC
+
+~trace-prolog~ installs a printing hook, for every functor or for the
+ones named (~'ancestor~ every arity, ~'ancestor/2~ one), and
+~untrace-prolog~ removes it. Over three ~parent~ facts and the usual two
+~ancestor~ clauses, ~(select-flat (?x) (ancestor bob ?x))~ under
+~(trace-prolog 'ancestor 'parent)~ traces as follows (unfiltered, the
+engine's own ~select/2~ goal shows too); the number is the depth, and
+~CLAUSE 2/3~ is the second of the functor's three clauses, the one the
+first-argument index left:
+
+#+BEGIN_EXAMPLE
+[0] CALL ANCESTOR/2 (BOB ?1)
+[1]   CLAUSE ANCESTOR/2 1/2
+[1]   CALL PARENT/2 (BOB ?1)
+[2]     CLAUSE PARENT/2 2/3
+[1]   EXIT PARENT/2 (BOB CAROL)
+[0] EXIT ANCESTOR/2 (BOB CAROL)
+[0] REDO ANCESTOR/2 (BOB CAROL)
+[1]   REDO PARENT/2 (BOB CAROL)
+[1]   FAIL PARENT/2 (BOB CAROL)
+[1]   CLAUSE ANCESTOR/2 2/2
+[1]   CALL PARENT/2 (BOB ?2)
+[2]     CLAUSE PARENT/2 2/3
+[1]   EXIT PARENT/2 (BOB CAROL)
+[1]   CALL ANCESTOR/2 (CAROL ?1)
+[2]     CLAUSE ANCESTOR/2 1/2
+[2]     CALL PARENT/2 (CAROL ?1)
+[3]       CLAUSE PARENT/2 3/3
+[2]     EXIT PARENT/2 (CAROL DAN)
+[1]   EXIT ANCESTOR/2 (CAROL DAN)
+[0] EXIT ANCESTOR/2 (BOB DAN)
+...
+[1]   REDO PARENT/2 (BOB CAROL)
+[1]   FAIL PARENT/2 (BOB CAROL)
+[0] FAIL ANCESTOR/2 (BOB ?1)
+#+END_EXAMPLE
+
+A cut or a budget error unwinds through the open calls and each fires
+its ~FAIL~ on the way out, so a trace always balances. ~(setf
+*prolog-trace* t)~ is something else: the compiler's own chatter.
+
+~explain-goals~ tells you, without running anything, what each goal
+will do for the arguments bound at that point in the goal list (a
+variable counts as bound once an earlier goal mentioned it, which is
+the compiler's own reading and can be optimistic for a ~=~ between two
+fresh variables): the functor it resolves to, which arguments are
+bound, and the *access path*, from a registry the type, slot, edge, ordered-index, unique,
+spatial and ~claim/7~ predicates fill (~register-access-path~ adds
+one). An asserted functor reports how many of its clauses the
+first-argument index leaves; a path decided by a value only known at
+run time says so; an unknown functor is a row, not an error.
+
+#+BEGIN_EXAMPLE
+(explain-goals '(?x) '((ancestor bob ?x) (parent ?x ?y) (no-such ?y))
+               :stream *standard-output*)
+(ANCESTOR BOB ?X)
+    ANCESTOR/2 (user): first-argument index: 2 of 2 clauses
+(PARENT ?X ?Y)
+    PARENT/2 (user): first-argument index: by value at run time, 3 clauses
+(NO-SUCH ?Y)
+    UNKNOWN: no such functor: the call signals
+#+END_EXAMPLE
+
+Over a graph the same call says ~type index: PERSON~ for ~(is-a ?p
+person)~, ~ve-out index of ?P~ for ~(knows ?p ?q)~ with ~?p~ bound, ~vev
+index: one lookup~ with both ends bound, ~ordered index on PERSON.NAME~
+for ~find-by-slot~, and ~docs/rules.md~'s route words for ~claim/7~.
+~profile-goals~ runs the query under a counting hook and reports each
+functor's ports and the time from its calls to its fails:
+
+#+BEGIN_EXAMPLE
+(profile-goals '(?x) '((ancestor alice ?x)) :stream *standard-output*)
+ANCESTOR/2: 4 calls, 6 exits, 6 redos, 4 fails, 8 clauses, 0.000 s
+PARENT/2: 8 calls, 6 exits, 6 redos, 8 fails, 6 clauses, 0.000 s
+SELECT/2: 3 calls, 3 exits, 3 redos, 3 fails, 0 clauses, 0.000 s
+#+END_EXAMPLE
+
+Both have text entries in ~graph-db.query~, ~explain-text~ and
+~profile-text~, that go through the guard first (docs/guarded-query.md).
+
 *** Pattern Matching Graph Structures
 
 The most iconic graph query is finding "friends of a friend." Let's find users who are followed by people Alice follows, but who are not Alice herself and are not already followed by Alice.

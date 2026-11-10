@@ -546,6 +546,9 @@
            #:*var-counter*
            #:*functor*
            #:*clause-indexing*
+           #:*prolog-port-hook* #:*prolog-port-depth*
+           #:call-with-prolog-ports #:with-prolog-ports
+           #:explain-goals #:register-access-path #:profile-goals
            #:make-functor
            #:maybe-add-undo-bindings
            #:compile-clause

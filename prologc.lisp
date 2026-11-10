@@ -44,8 +44,50 @@
   (with-lock ((pg-lock *prolog-gensym*))
     (push symbol (pg-symbols *prolog-gensym*))))
 
-(defun trace-prolog () (setq *prolog-trace* t))
-(defun untrace-prolog () (setq *prolog-trace* nil))
+(defvar *traced-functor-names* nil
+  "NIL for every functor, else the names TRACE-PROLOG was given, as
+strings: \"NAME/N\" for one arity, \"NAME/\" for every arity.")
+
+(defun %traced-p (functor)
+  (or (null *traced-functor-names*)
+      (let ((name (symbol-name functor)))
+        (some (lambda (pattern)
+                (if (char= (char pattern (1- (length pattern))) #\/)
+                    (and (> (length name) (length pattern))
+                         (string= pattern name :end2 (length pattern)))
+                    (string= pattern name)))
+              *traced-functor-names*))))
+
+(defun %print-port (port functor args depth)
+  "One trace line per port to *TRACE-OUTPUT* (tracer design D2, GH
+#124): [DEPTH], two spaces per level, the port, the functor, and the
+arguments dereferenced; a :CLAUSE event as POS/N, 1-based."
+  (when (%traced-p functor)
+    (let ((*print-length* 8) (*print-level* 3) (*print-pretty* nil))
+      (format *trace-output* "~&[~D] ~v@{  ~}~A ~A" depth depth
+              (symbol-name port) (symbol-name functor))
+      (if (eq port :clause)
+          (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args))
+          (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args)))
+      (finish-output *trace-output*))))
+
+(defun trace-prolog (&rest names)
+  "Print the four ports of every goal call, or of the functors NAMES
+name: a symbol with an arity suffix (TE-G/1) traces that functor, a
+bare one (TE-G) every arity of it; matched by name, so a functor in a
+schema package is named as written.  The compiler's own chatter is
+*PROLOG-TRACE*, separate (GH #124)."
+  (setf *traced-functor-names*
+        (mapcar (lambda (n)
+                  (let ((s (string-upcase (string n))))
+                    (if (find #\/ s) s (concatenate 'string s "/"))))
+                names))
+  (setf *prolog-port-hook* #'%print-port)
+  names)
+
+(defun untrace-prolog ()
+  "Stop printing the ports."
+  (setf *prolog-port-hook* nil *traced-functor-names* nil))
 
 (define-condition prolog-error (error)
   ((reason :initarg :reason :initform nil)
@@ -262,15 +304,69 @@ its parts the same way, so every path spells the identical symbol
     `(let ((func (or (get-functor-fn ',functor)
                      (gethash ',functor *prolog-global-functors*))))
        (%tick)                          ; account one inference / enforce bounds
-       (when *prolog-trace*
-         (format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
        (if (functionp func)
-           (funcall func ,@args ,cont)
+           ;; The ports (GH #124): one special read where the old
+           ;; *PROLOG-TRACE* check sat; the untraced call is as before.
+           (let ((hook *prolog-port-hook*))
+             (if hook
+                 (%ported-call hook ',functor func (list ,@args) ,cont)
+                 (funcall func ,@args ,cont)))
            ;; Unknown predicate: stay noisy (a mistyped goal surfaces) but carry
            ;; an existence_error ball so catch/3 can recover from it.
            (error 'prolog-error
                   :reason (format nil "unknown Prolog functor ~A" ',functor)
                   :ball (existence-error-ball :procedure ',functor))))))
+
+(defvar *access-paths*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "NAME/ARITY functor symbol -> a function of (BOUND ARGS GRAPH) naming
+the access path the functor takes for a call whose arguments are bound
+as BOUND says (explain design D3, GH #124).")
+
+(defun register-access-path (functor-symbol function)
+  "FUNCTION, of (BOUND ARGS GRAPH) returning a string, describes
+FUNCTOR-SYMBOL's access path to EXPLAIN-GOALS: BOUND a list of
+booleans, one per argument; ARGS the goal's arguments as written, a
+variable's symbol where the walk has no value (GH #124)."
+  (setf (gethash functor-symbol *access-paths*) function))
+
+(defun %ported-call (hook functor func args cont)
+  "FUNC applied to ARGS and a continuation, with HOOK's ports (tracer
+design D1, GH #124): :CALL at the entry depth D, the callee's own goals
+at D + 1, the continuation's goals back at D (siblings, not children),
+:EXIT before and :REDO after CONT, :FAIL when FUNC returns; a non-local
+exit (a cut, a budget error) fires the :FAIL it abandons on the way
+out."
+  (let ((d *prolog-port-depth*) (done nil))
+    (funcall hook :call functor args d)
+    (unwind-protect
+         (let ((*prolog-port-depth* (1+ d)))
+           (apply func
+                  (append args
+                          (list (lambda ()
+                                  (let ((*prolog-port-depth* d))
+                                    (funcall hook :exit functor args d)
+                                    (funcall cont)
+                                    (funcall hook :redo functor args d))))))
+           (setf done t)
+           (funcall hook :fail functor args d))
+      (unless done
+        (funcall hook :fail functor args d)))))
+
+(defun call-with-prolog-ports (hook thunk)
+  "THUNK with *PROLOG-PORT-HOOK* bound to HOOK and the depth at 0."
+  (let ((*prolog-port-hook* hook) (*prolog-port-depth* 0))
+    (funcall thunk)))
+
+(defmacro with-prolog-ports ((lambda-list &body hook-body) &body body)
+  "BODY with the port hook bound to (LAMBDA LAMBDA-LIST HOOK-BODY)."
+  `(call-with-prolog-ports (lambda ,lambda-list ,@hook-body)
+                           (lambda () ,@body)))
 
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
@@ -910,17 +1006,35 @@ goal recurses runs in constant stack as the old single function did
                    (cond
                      ((zerop n) nil)
                      ((= n 1)
-                      (funcall (svref fns (next)) nil ,@parameters cont))
+                      (let ((pos (next)))
+                        (let ((hook *prolog-port-hook*))
+                        (when hook
+                          (funcall hook :clause (functor-name functor)
+                                   (list pos (length fns))
+                                   *prolog-port-depth*)))
+                        (funcall (svref fns pos) nil ,@parameters cont)))
                      (t
                       (let ((cell (list nil)))
                         (dotimes (k (1- n))
                           (unless (zerop k) (undo-bindings old-trail))
-                          (funcall (svref fns (next)) cell ,@parameters cont)
+                          (let ((pos (next)))
+                            (let ((hook *prolog-port-hook*))
+                            (when hook
+                              (funcall hook :clause (functor-name functor)
+                                       (list pos (length fns))
+                                   *prolog-port-depth*)))
+                            (funcall (svref fns pos) cell ,@parameters cont))
                           (when (car cell)
                             (return-from dispatch nil)))
                         (undo-bindings old-trail)
-                        (funcall (svref fns (next)) nil
-                                 ,@parameters cont))))))))))))
+                        (let ((pos (next)))
+                          (let ((hook *prolog-port-hook*))
+                          (when hook
+                            (funcall hook :clause (functor-name functor)
+                                     (list pos (length fns))
+                                   *prolog-port-depth*)))
+                          (funcall (svref fns pos) nil
+                                   ,@parameters cont)))))))))))))
      functor)))
 
 (defun %add-compiled-clause (functor clause)

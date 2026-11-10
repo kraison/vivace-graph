@@ -139,6 +139,8 @@
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; explain-goals: the static account of a goal list (GH #124)
+               (:file "prolog-explain" :depends-on ("index"))
                ;; Counting index (GH #361): its own registry and graph
                ;; slot, parallel to DEF-INDEX's.
                (:file "count-index" :depends-on ("index"))
@@ -249,7 +251,8 @@ docs/rules.md; GH #304."
   :components ((:file "package") (:file "suite") (:file "facts-tests")
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
-               (:file "scope-tests") (:file "forward-tests"))
+               (:file "scope-tests") (:file "forward-tests")
+               (:file "explain-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)
@@ -721,6 +724,7 @@ cl-temporal-extent."
                (:file "prolog-mutation-tests")
                (:file "prolog-functor-tests")
                (:file "clause-indexing-tests")
+               (:file "tracer-explain-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")

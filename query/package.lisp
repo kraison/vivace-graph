@@ -15,4 +15,6 @@
    ;; the compile half, for a caller that keeps the goals (GH #331)
    #:guard-query-text #:*guarding-rule-text* #:run-guarded-goals
    ;; the screened reader, for embedders (GH #366)
-   #:scan-query-text #:call-with-screened-forms #:with-screened-forms))
+   #:scan-query-text #:call-with-screened-forms #:with-screened-forms
+   ;; explain and profile from text (GH #124)
+   #:explain-text #:profile-text))
