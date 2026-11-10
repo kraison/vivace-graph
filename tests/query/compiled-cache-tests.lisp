@@ -40,9 +40,10 @@ shape; a shape with no literal has none (design D1, Review Focus 5)."
              (cq-shape '(?a) '((qt-links ?a ?b) (is-a ?b qt-item)))))
   (is (not (equal (cq-shape '(?x) '((qt-links ?x ?y) (is-a ?y qt-item)))
                   (cq-shape '(?x) '((is-a ?y qt-item) (qt-links ?x ?y))))))
-  ;; ? kept; nested lists walked
-  (is (equal '((graph-db::?v0) (qt-links graph-db::?v0 ?))
-             (cq-shape '(?x) '((qt-links ?x ?)))))
+  ;; graph-db's ? kept (any other ?-named symbol is a variable);
+  ;; nested lists walked
+  (is (equal '((graph-db::?v0) (qt-links graph-db::?v0 graph-db::?))
+             (cq-shape '(?x) '((qt-links ?x graph-db::?)))))
   (multiple-value-bind (s l) (cq-canon '(?x) '((= ?x (a 1 "b"))))
     (is (equal '((graph-db::?v0)
                  (= graph-db::?v0 (a (graph-db::%lit . 0)
@@ -320,19 +321,123 @@ it (design D3, Review Focus 2)."
 
 (test cq-no-extra-tick
   "The literal binding costs no inference: the smallest budget the
-interpreted run fits in, the compiled run fits in too (design D1)."
+pre-unit form fits in (a select from Lisp with the literals in place),
+the compiled run fits in too (design D1; review finding 6)."
   (with-query-graph (g)
     (seed g)
     (graph-db:clear-query-cache)
     (let* ((text "(is-a ?i qt-item) (node-slot-value ?i label \"b\")
                   (node-slot-value ?i rank 2)")
-           (least (loop for n from 1 to 200
-                        when (handler-case (progn (cq-data g text
-                                                           :max-inferences n)
-                                                  t)
-                               (graph-db:prolog-resource-error () nil))
-                          return n)))
+           (rows 0)
+           (item 'graph-db/query-test.schema::qt-item)
+           (least
+             (loop for n from 1 to 200
+                   when (handler-case
+                            (progn
+                              ;; with :callback, select returns the row count
+                              (setf rows
+                                    (let ((*package*
+                                            (find-package
+                                             '#:graph-db/query-test)))
+                                      (eval `(graph-db:select
+                                                 (:effects nil :snapshot t
+                                                  :max-inferences ,n :limit 10
+                                                  :callback
+                                                  (lambda (row)
+                                                    (declare (ignore row))))
+                                                 (?i)
+                                               (is-a ?i ,item)
+                                               (node-slot-value ?i label "b")
+                                               (node-slot-value ?i rank 2)))))
+                              t)
+                          (graph-db:prolog-resource-error () nil))
+                     return n)))
       (is (integerp least))
+      (is (= 1 rows))
       (cq-data g text) (cq-data g text)
       (is (= 1 (cq-stat :compiled)))
       (finishes (cq-data g text :max-inferences least)))))
+
+;;; The whole-branch review's findings (2026-11-10).
+
+(test cq-node-literals-are-lifted
+  "Any non-symbol atom is a literal: a node in a = binder (the
+productions path) keys one shape, not one per node (review finding 2)."
+  (with-query-graph (g)
+    (let ((items (seed g)))
+      (graph-db:clear-query-cache)
+      (flet ((cq-run-node (node)
+               (let ((rows '()))
+                 (graph-db::run-query-goals
+                  '(?l) `((= ?i ,node) (node-slot-value ?i label ?l)) g
+                  :format :raw :callback (lambda (row) (push row rows)))
+                 rows)))
+        (is (equal '(("a")) (cq-run-node (first items))))
+        (is (equal '(("b")) (cq-run-node (second items))))
+        (is (equal '(("c")) (cq-run-node (third items))))
+        (is (= 1 (cq-stat :entries)))
+        (is (= 1 (cq-stat :compiled)))))))
+
+(test cq-anonymous-variable-caches
+  "A free-text ? is renamed like any variable, so the shape repeats
+across requests; graph-db's own ? stays ? (review finding 3)."
+  (with-query-graph (g)
+    (seed g)
+    (graph-db:clear-query-cache)
+    ;; a free-text ? is a named variable shared across its occurrences
+    ;; (the guard's rule), so both links answer
+    (is (= 2 (length (cq-data g "(qt-links ?a ?)"))))
+    (is (= 2 (length (cq-data g "(qt-links ?a ?)"))))
+    (is (= 1 (cq-stat :entries)))
+    (is (= 1 (cq-stat :compiled)))
+    (is (equal '((graph-db::?v0) (qt-links graph-db::?v0 graph-db::?))
+               (cq-shape '(?x) '((qt-links ?x graph-db::?)))))))
+
+(test cq-projection-literal-comes-back
+  "A literal in the projection is returned as itself (review finding
+4)."
+  (with-query-graph (g)
+    (seed g)
+    (graph-db:clear-query-cache)
+    (let ((rows '()))
+      ;; from Lisp the type is the schema package's symbol (the guard
+      ;; canonicalises text to it)
+      (graph-db::run-query-goals
+       '(?i "tag") '((is-a ?i graph-db/query-test.schema::qt-item)) g
+       :format :raw :callback (lambda (row) (push row rows)))
+      (is (= 3 (length rows)))
+      (is (every (lambda (row) (equal "tag" (second row))) rows)))))
+
+(test cq-failed-compile-keeps-the-error
+  "A form the compiler refuses stays interpreted: the same PROLOG-ERROR
+on every call, never a program error (review finding 5)."
+  (with-query-graph (g)
+    (seed g)
+    (graph-db:clear-query-cache)
+    (flet ((formal ()
+             (handler-case
+                 (progn (graph-db::run-query-goals
+                         '(?n) '((aggregate-all (foo ?x)
+                                  (is-a ?x graph-db/query-test.schema::qt-item)
+                                  ?n))
+                         g :format :raw
+                         :callback (lambda (row) (declare (ignore row))))
+                        :no-error)
+               (graph-db:prolog-error (e)
+                 (first (second (graph-db:prolog-error-ball e))))
+               (error (e) (type-of e)))))
+      (is (eq :domain-error (formal)))
+      (is (eq :domain-error (formal)))
+      (is (eq :domain-error (formal)))
+      (is (= 0 (cq-stat :compiled))))))
+
+(test cq-size-zero-disables
+  "A cache size of zero turns the cache off: every call interpreted,
+nothing stored, no hang (review finding 1)."
+  (with-query-graph (g)
+    (seed g)
+    (graph-db:clear-query-cache)
+    (let ((graph-db:*compiled-query-cache-size* 0))
+      (is (= 3 (length (cq-data g "(is-a ?i qt-item)"))))
+      (is (= 3 (length (cq-data g "(is-a ?i qt-item)"))))
+      (is (= 0 (cq-stat :entries))))))

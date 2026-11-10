@@ -1330,9 +1330,10 @@ query's time: GH #373). Since GH #376 the runner canonicalises the
 form first and keeps a per-image cache of compiled shapes:
 
 - *the shape*: the variables renamed by first appearance and every
-  string, number or character in a goal argument lifted into a vector
-  the query reads at run time, so ~(find-by-slot ?s thing key "t-3")~
-  and ~... "t-4"~ are one shape (an ~aggregate-all~ spec word and the
+  atom that is not a symbol (a string, a number, a node a Lisp caller
+  binds with ~=~) in a goal argument lifted into a vector the query
+  reads at run time, so ~(find-by-slot ?s thing key "t-3")~ and
+  ~... "t-4"~ are one shape (an ~aggregate-all~ spec word and the
   expression of a ~lisp~ goal stay in place);
 - *the cache*: a shape runs interpreted the first time it is seen and
   is compiled on its second lookup (~*compile-query-after*~, 2), then
@@ -1353,6 +1354,10 @@ form first and keeps a per-image cache of compiled shapes:
 
 ~(clear-query-cache)~ empties it; ~(query-cache-stats)~ reports
 ~(:entries n :compiled n :hits n :misses n :compiles n :evictions n)~.
+A size of zero turns the cache off. A workload that asserts with ~<-~
+between its queries keeps every shape cold, since each assert is a new
+generation and no shape reaches its second hit; assert first, then
+query.
 On the unit 6 bench (odm, GH #376) the repeated guarded shape, the
 consumer's two-hop read and a rule run twenty times are measured
 before and after; the rows are in ~docs/perf-baselines.md~.

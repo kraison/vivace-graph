@@ -7,11 +7,12 @@
 
 (defun %query-variable-p (x)
   "A Prolog variable as written: a symbol whose name starts with ?,
-other than ? itself, from any package (the guard's scratch symbols and
-the rules' uninterned ones included)."
-  (and (symbolp x) x
+from any package (the guard's scratch symbols, its named ?, and the
+rules' uninterned ones included); GRAPH-DB's own ? is the anonymous
+variable and is kept by the caller (review finding 3)."
+  (and (symbolp x) x (not (eq x '?))
        (let ((name (symbol-name x)))
-         (and (> (length name) 1) (char= (char name 0) #\?)))))
+         (and (plusp (length name)) (char= (char name 0) #\?)))))
 
 (defun %canonical-variable (i)
   "The i-th canonical variable, ?Vi in GRAPH-DB."
@@ -24,8 +25,8 @@ the rules' uninterned ones included)."
 (defun %canonical-query (vars goals)
   "VARS and GOALS as one shape for every call that shares them:
 (VALUES SHAPE LITERALS).  SHAPE is (canonical-vars . canonical-goals)
-with every variable renamed ?Vn by first appearance and every string,
-number or character in a term position replaced by (%lit . i);
+with every variable renamed ?Vn by first appearance and every atom that
+is not a symbol in a term position replaced by (%lit . i);
 LITERALS is the vector of those values (design D1).  Not a term
 position: an aggregate-all's spec (its variables are still renamed) and
 the arguments of lisp, lispp and is (an expression)."
@@ -42,11 +43,14 @@ the arguments of lisp, lispp and is (an expression)."
                (push x literals)
                (prog1 (cons '%lit count) (incf count)))
              (term (x)
+               ;; Any atom that is not a symbol is a literal: a node
+               ;; in a = binder (the productions path) must not key
+               ;; a shape per node (review finding 2).
                (cond ((eq x '?) x)
                      ((%query-variable-p x) (var x))
-                     ((or (stringp x) (numberp x) (characterp x)) (lift x))
                      ((consp x) (cons (term (car x)) (term (cdr x))))
-                     (t x)))
+                     ((symbolp x) x)
+                     (t (lift x))))
              (no-lift (x)
                ;; variables renamed, nothing lifted
                (cond ((%query-variable-p x) (var x))
@@ -89,7 +93,7 @@ the arguments of lisp, lispp and is (an expression)."
   "The SELECT form every call of SHAPE evaluates (design D1, D2): the
 options read from specials, the literals bound first by %BIND-LITERALS
 when there are any, then the canonical goals."
-  (let ((vars (car shape))
+  (let ((vars (%literal-markers-to-variables (car shape)))
         (goals (%literal-markers-to-variables (cdr shape))))
     `(select (:effects nil :snapshot t
               :limit *query-run-limit*
@@ -110,7 +114,7 @@ when there are any, then the canonical goals."
 
 (defvar *compiled-query-cache-size* 256
   "Entries the compiled query cache keeps; the least recently used
-goes first (design D3).")
+goes first; zero or less turns the cache off (design D3).")
 
 (defvar *compile-query-after* 2
   "The hit on which a shape is compiled (design D3).")
@@ -166,7 +170,14 @@ compiling it."
 function EVAL makes (ECL's bytecodes compiler; CCL compiles natively),
 never ECL's C compiler (design D6)."
   (let ((*package* (find-package :graph-db)))
-    #+sbcl (compile nil `(lambda () ,form))
+    ;; SBCL does not signal for a form it cannot compile: it returns a
+    ;; function that signals a program error when called, and says so
+    ;; in FAILURE-P (review finding 5).  Such a shape stays interpreted.
+    #+sbcl (multiple-value-bind (fn warnings-p failure-p)
+               (let ((*error-output* (make-broadcast-stream)))
+                 (compile nil `(lambda () ,form)))
+             (declare (ignore warnings-p))
+             (if failure-p :failed fn))
     #-sbcl (eval `(lambda () ,form))))
 
 (defun %cached-query-function (shape literal-count)
@@ -176,12 +187,17 @@ one the compiler refused (design D3)."
   (let ((key (cons *functor-generation* shape))
         (entry nil)
         (compile-p nil))
+    ;; A size of zero or less is the cache off (review finding 1).
+    (unless (plusp *compiled-query-cache-size*)
+      (return-from %cached-query-function nil))
     (bt:with-lock-held (*compiled-query-cache-lock*)
       (setf entry (gethash key *compiled-query-cache*))
       (cond (entry (incf (getf *query-cache-counters* :hits)))
             (t (incf (getf *query-cache-counters* :misses))
-               (loop while (>= (hash-table-count *compiled-query-cache*)
-                               *compiled-query-cache-size*)
+               (loop while (and (plusp (hash-table-count
+                                        *compiled-query-cache*))
+                                (>= (hash-table-count *compiled-query-cache*)
+                                    *compiled-query-cache-size*))
                      do (%evict-least-recent))
                (setf entry (%make-cached-query shape)
                      (gethash key *compiled-query-cache*) entry)))

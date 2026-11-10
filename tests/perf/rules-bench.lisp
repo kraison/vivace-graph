@@ -192,8 +192,10 @@ the second run compiles it and the rest run compiled.  Runs per second."
                     (graph-db.rules:make-rule
                      :graph g :name "pf-rerun" :version "1"
                      :family "pf-claim"
-                     :head "(claim ?c pf-claim \"pf-things\" ?k \"derived\" nil nil)"
-                     :body "(claim ?p pf-claim \"pf-things\" ?k \"base\" nil nil)")))
+                     :head "(claim ?c pf-claim \"pf-things\" ?k ~
+\"derived\" nil nil)"
+                     :body "(claim ?p pf-claim \"pf-things\" ?k ~
+\"base\" nil nil)")))
             (graph-db.rules::*rules-max-solutions* (* 2 n))
             (graph-db::*query-default-max-inferences* (* 100 n))
             (graph-db::*query-default-timeout* 600))

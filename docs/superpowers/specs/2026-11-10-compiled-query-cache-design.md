@@ -141,7 +141,9 @@ pb-thing thing-id "t-3")` and `... "t-4"` are one entry.
   (anonymous) stays `?` (the compiler gensyms it). A variable is a
   symbol whose name starts with `?`, whatever its package (the guard's
   scratch symbols, the rules' uninterned ones).
-- **Literals**: a string, number or character in a *term position*
+- **Literals**: any atom that is not a symbol (a string, number,
+  character, or a node object a Lisp caller or the rules' productions
+  path binds with `=`) in a *term position*
   (a goal argument, walked into nested lists, which is how a compound
   term is written) becomes the next literal: the shape holds
   `(%lit . i)` and `literals` gets the value at index i. Two equal
