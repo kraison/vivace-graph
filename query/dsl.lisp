@@ -357,7 +357,12 @@ prolog's :DATA format still converts them; :RAW does not)."
                         (*query-run-limit* cap)
                         (*query-run-skip* (when (integerp skip) skip))
                         #+sbcl (sb-ext:*evaluator-mode* :interpret))
-                    (eval (%cached-query-form shape (length literals))))))))
+                    (let ((fn (%cached-query-function shape
+                                                      (length literals))))
+                      (if fn
+                          (funcall fn)
+                          (eval (%cached-query-form shape
+                                                    (length literals))))))))))
     (if (eq format :raw)
         (progn (funcall run callback) nil)
         (emit-query-results vars format run))))

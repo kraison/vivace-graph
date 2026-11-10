@@ -50,13 +50,20 @@ ascending positions the index does not cover."
   (functor-clauses functor))
 
 (defun delete-functor (functor)
+  "Unregister FUNCTOR.  One with content (a clause or the tabled flag)
+moves *FUNCTOR-GENERATION* (GH #376, design D3); a query root never
+has either."
+  (when (or (functor-clauses functor) (functor-tabled functor))
+    (incf *functor-generation*))
   (with-user-functors-lock (remhash (functor-name functor) *user-functors*)))
 
 (defun reset-functor (functor)
-  "No clauses, no candidates, the null function (GH #121)."
+  "No clauses, no candidates, the null function (GH #121); moves
+*FUNCTOR-GENERATION* (GH #376)."
   (with-recursive-lock-held ((functor-lock functor))
     (setf (functor-clauses functor) nil)
     (prolog-compile functor))
+  (incf *functor-generation*)
   nil)
 
 (defun get-functor-fn (functor-symbol)

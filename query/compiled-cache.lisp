@@ -103,3 +103,106 @@ when there are any, then the canonical goals."
                     ,@(loop for i below literal-count
                             collect (%literal-variable i)))))
              ,@goals)))
+
+;;; The cache (design D3): a bounded, locked table from
+;;; (generation . shape) to an entry; a shape compiles on its
+;;; *COMPILE-QUERY-AFTER*th hit, outside the lock.
+
+(defvar *compiled-query-cache-size* 256
+  "Entries the compiled query cache keeps; the least recently used
+goes first (design D3).")
+
+(defvar *compile-query-after* 2
+  "The hit on which a shape is compiled (design D3).")
+
+(defstruct (cached-query (:constructor %make-cached-query (shape)))
+  "One shape's entry: FN the compiled function, NIL until compiled or
+:FAILED when the compiler refused the form; HITS the lookups; LAST-USED
+the cache clock at the last lookup; COMPILING while one thread is
+compiling it."
+  shape (fn nil) (hits 0) (last-used 0) (compiling nil))
+
+(defvar *compiled-query-cache* (make-hash-table :test 'equal))
+(defvar *compiled-query-cache-lock* (bt:make-lock "compiled-query-cache"))
+(defvar *cache-clock* 0)
+(defvar *query-cache-counters* (list :hits 0 :misses 0 :compiles 0
+                                     :evictions 0))
+
+(defun clear-query-cache ()
+  "Empty the compiled query cache and its counters."
+  (bt:with-lock-held (*compiled-query-cache-lock*)
+    (clrhash *compiled-query-cache*)
+    (setf *query-cache-counters*
+          (list :hits 0 :misses 0 :compiles 0 :evictions 0)))
+  nil)
+
+(defun query-cache-stats ()
+  "(:entries n :compiled n :hits n :misses n :compiles n :evictions n)."
+  (bt:with-lock-held (*compiled-query-cache-lock*)
+    (let ((compiled 0))
+      (maphash (lambda (key entry)
+                 (declare (ignore key))
+                 (when (functionp (cached-query-fn entry)) (incf compiled)))
+               *compiled-query-cache*)
+      (list* :entries (hash-table-count *compiled-query-cache*)
+             :compiled compiled
+             (copy-list *query-cache-counters*)))))
+
+(defun %evict-least-recent ()
+  "Under the lock: drop the entry used longest ago."
+  (let ((oldest nil) (oldest-key nil))
+    (maphash (lambda (key entry)
+               (when (or (null oldest)
+                         (< (cached-query-last-used entry)
+                            (cached-query-last-used oldest)))
+                 (setf oldest entry oldest-key key)))
+             *compiled-query-cache*)
+    (when oldest-key
+      (remhash oldest-key *compiled-query-cache*)
+      (incf (getf *query-cache-counters* :evictions)))))
+
+(defun %compile-query-form (form)
+  "The function FORM compiles to: SBCL's native compiler; elsewhere the
+function EVAL makes (ECL's bytecodes compiler; CCL compiles natively),
+never ECL's C compiler (design D6)."
+  (let ((*package* (find-package :graph-db)))
+    #+sbcl (compile nil `(lambda () ,form))
+    #-sbcl (eval `(lambda () ,form))))
+
+(defun %cached-query-function (shape literal-count)
+  "The compiled function for SHAPE, or NIL when this call runs
+interpreted: a new or young entry, one another thread is compiling, or
+one the compiler refused (design D3)."
+  (let ((key (cons *functor-generation* shape))
+        (entry nil)
+        (compile-p nil))
+    (bt:with-lock-held (*compiled-query-cache-lock*)
+      (setf entry (gethash key *compiled-query-cache*))
+      (cond (entry (incf (getf *query-cache-counters* :hits)))
+            (t (incf (getf *query-cache-counters* :misses))
+               (loop while (>= (hash-table-count *compiled-query-cache*)
+                               *compiled-query-cache-size*)
+                     do (%evict-least-recent))
+               (setf entry (%make-cached-query shape)
+                     (gethash key *compiled-query-cache*) entry)))
+      (incf (cached-query-hits entry))
+      (setf (cached-query-last-used entry) (incf *cache-clock*))
+      (when (and (null (cached-query-fn entry))
+                 (not (cached-query-compiling entry))
+                 (>= (cached-query-hits entry) *compile-query-after*))
+        (setf (cached-query-compiling entry) t
+              compile-p t)))
+    (when compile-p
+      (let ((fn (handler-case
+                    (%compile-query-form (%cached-query-form shape
+                                                             literal-count))
+                  (error (e)
+                    (log:error "compiled query cache: ~A" e)
+                    :failed))))
+        (bt:with-lock-held (*compiled-query-cache-lock*)
+          (setf (cached-query-fn entry) fn
+                (cached-query-compiling entry) nil)
+          (when (functionp fn)
+            (incf (getf *query-cache-counters* :compiles))))))
+    (let ((fn (cached-query-fn entry)))
+      (and (functionp fn) fn))))

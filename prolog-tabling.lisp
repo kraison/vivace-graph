@@ -271,6 +271,7 @@ functor can be tabled" global))))
     (with-recursive-lock-held ((functor-lock functor))
       (setf (functor-tabled functor) t)
       (%install-functor-fn functor))
+    (incf *functor-generation*)          ; GH #376, design D3
     functor))
 
 (defun untable-functor (name arity)
@@ -282,6 +283,7 @@ Returns the functor, or NIL when none is registered."
         (setf (functor-tabled functor) nil
               (functor-entry functor) nil)
         (%install-functor-fn functor))
+      (incf *functor-generation*)        ; GH #376, design D3
       functor)))
 
 (defun functor-tabled-p (name arity)

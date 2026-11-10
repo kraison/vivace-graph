@@ -592,6 +592,8 @@
            #:trace-prolog
            #:untrace-prolog
            #:table-functor #:untable-functor #:functor-tabled-p
+           #:clear-query-cache #:query-cache-stats
+           #:*compiled-query-cache-size* #:*compile-query-after*
            #:make-node-table
            #:node-equal
 

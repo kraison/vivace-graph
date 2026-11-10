@@ -1251,6 +1251,9 @@ published in one slot write, and FN reinstalled through
     ;; Every assert reinstalls FN: a SET-FUNCTOR-FN stand-in answers
     ;; only until the next assert (clause indexing design D2).
     (%install-functor-fn functor)
+    ;; The compiled query cache keys on this (GH #376, design D3).  A
+    ;; lost increment under a race only keeps a stale entry warm.
+    (incf *functor-generation*)
     functor))
 
 (defun compile-body (body cont bindings)
