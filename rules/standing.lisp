@@ -42,6 +42,7 @@
     ;; the query's solutions
     ("unique/1" . :meta)
     ("findall/3" . :meta) ("bagof/3" . :meta) ("setof/3" . :meta)
+    ("aggregate-all/3" . :meta)
     ("call/1" . :meta) ("catch/3" . :meta) ("throw/1" . :meta)
     ("map-query/5" . :meta) ("select/2" . :meta)
     ("show-prolog-vars/2" . :meta)

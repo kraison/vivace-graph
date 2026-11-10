@@ -2955,3 +2955,24 @@ records, deletes its record, and its own action hears no :LOST."
              :family rt-claim :head *alarm-head* :body *alarm-body*)
            (signals error (graph-db.rules:retire-rule g "in-image")))
       (graph-db.rules:undef-rule "in-image"))))
+
+;;; aggregate-all in a rule body (GH #123, aggregation design D9)
+
+(defparameter *rl5-busy-head*
+  "(claim ?c rt-claim \"host\" ?h \"busy\" \"app\" \"all\")")
+(defparameter *rl5-busy-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (aggregate-all count (claim ?q rt-claim \"host\" ?h \"runs\" \"app\" ?b) ?n)
+   (> ?n 1)")
+
+(test rl5-aggregate-in-a-rule-body
+  "A rule body may count with aggregate-all: h1 runs two apps, h2 one,
+so one claim is derived."
+  (with-rules-graph (g)
+    (seed g)
+    (let* ((r (write-rule g :name "busy-hosts" :version "1"
+                            :family "rt-claim"
+                            :head *rl5-busy-head* :body *rl5-busy-body*))
+           (report (graph-db.rules:run-rule g r)))
+      (is (= 1 (graph-db.rules:rule-report-derived report)))
+      (is (= 1 (length (derived g 'rt-claim "busy-hosts")))))))

@@ -136,6 +136,19 @@ after them; OR and a two-branch IF bind what every branch binds."
                           (%explain-goal else bound r2 graph)
                         (values r3 (intersection b2 b3)))
                       (values r2 b2))))))
+           ((and (string= name "AGGREGATE-ALL") (= 3 (length args)))
+            ;; The goal explained one level in; only the result is
+            ;; bound after it (GH #123, aggregation design D9).
+            (destructuring-bind (spec inner result) args
+              (declare (ignore spec))
+              (let ((rows (cons (%explain-row goal nil :control
+                                              (%explain-bound args bound)
+                                              "inline aggregate-all")
+                                rows)))
+                (multiple-value-bind (r b)
+                    (%explain-goal inner bound rows graph)
+                  (declare (ignore b))
+                  (values r (%explain-bind (list result) bound))))))
            ((string= name "CALL")
             (let ((g (first args)))
               (if (and (consp g) (symbolp (first g))

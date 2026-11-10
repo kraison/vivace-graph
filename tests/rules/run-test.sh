@@ -4,6 +4,10 @@
 # test's symbol; RULES-SUITE runs the whole suite.
 set -u
 [ $# -ge 1 ] || { echo "usage: $0 TEST-NAME" >&2; exit 2; }
+# THIS checkout's tree, not whichever one Quicklisp's local-projects
+# links (CLAUDE.md, "Working in this repo"; GH #123).
+HERE="$(cd "$(dirname "$0")/../.." && pwd -P)"
+export CL_SOURCE_REGISTRY="$HERE//:"
 exec sbcl --dynamic-space-size 16384 --non-interactive \
   --eval '(ql:quickload :graph-db/rules-test :silent t)' \
   --eval "(let* ((d (graph-db-test-scratch:make-scratch-directory

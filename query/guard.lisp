@@ -293,7 +293,11 @@ Splits at the LAST slash, so /=/2 reads as (\"/=\" . 2)."
     "SELECT" "SHOW-PROLOG-VARS"
     ;; GH #333: the fixpoint's internal generator, injected by
     ;; RUN-RULES.
-    "RULE-DELTA")
+    "RULE-DELTA"
+    ;; Internal compiler macros the if and aggregate-all expansions
+    ;; emit (GH #122, #123): the control-word table is derived from the
+    ;; compiler-macro property, so they are admissible unless named.
+    "%UNFLOOR" "%AGGREGATE-STEP")
   "Predicate names withheld from free text at EVERY arity, whatever the
 registries say.
 
@@ -309,14 +313,63 @@ RULE-DELTA/2 reads *RULE-DELTA*, which only RUN-RULES binds, around a
 recursive stratum -- never from a query (GH #333).")
 
 (defparameter *prolog-goal-argument-control*
-  '("AND" "OR" "NOT" "ONCE" "IF" "FORALL")
-  "Control constructs whose arguments are GOALS.  Every such argument
-must be a parenthesised goal here, never a variable: a variable makes
-STATIC-GOAL-P (prologc.lisp:475) fail, the compiler macro declines, and
-the runtime functor behind it meta-calls whatever the variable holds --
-the %SOLVE path *PROLOG-EXCLUDED-PREDICATES* exists to close.  Demanding
-a static goal keeps all six on the compile-time path (GH #279).  Same
-tripwire as above: PROLOG-FUNCTOR-INVENTORY-IS-PINNED.")
+  '("AND" "OR" "NOT" "ONCE" "IF" "FORALL"
+    ("AGGREGATE-ALL" :spec 1 :goal 2))
+  "Control constructs whose arguments are GOALS.  A bare name: every
+argument must be a parenthesised goal here, never a variable: a
+variable makes STATIC-GOAL-P (prologc.lisp:475) fail, the compiler
+macro declines, and the runtime functor behind it meta-calls whatever
+the variable holds -- the %SOLVE path *PROLOG-EXCLUDED-PREDICATES*
+exists to close.  Demanding a static goal keeps all six on the
+compile-time path (GH #279).  A positional entry (NAME :spec P :goal
+Q): position Q must be a written-out goal, position P a literal
+aggregate spec (%GUARD-SPEC-TERM), the rest ordinary terms; with both
+literal, the compile-time path is the only one text can take (GH #123,
+aggregation design D1).  Same tripwire as above:
+PROLOG-FUNCTOR-INVENTORY-IS-PINNED.")
+
+(defun %goal-argument-entry (name)
+  "NIL, T for a bare name, or the positional plist for NAME."
+  (dolist (entry *prolog-goal-argument-control* nil)
+    (cond ((and (stringp entry) (string= entry name)) (return t))
+          ((and (consp entry) (string= (first entry) name))
+           (return (rest entry))))))
+
+(defparameter *prolog-aggregate-words*
+  '(("COUNT" 0) ("SUM" 1) ("MIN" 1 2) ("MAX" 1 2) ("BAG" 1) ("SET" 1))
+  "The aggregate spec words free text may write and their arities.")
+
+(defun %guard-template (x ctx)
+  "A template inside a spec: a ?variable, a literal, or a proper list
+of those; never a goal.  Returns it translated."
+  (cond ((and (symbolp x) x (char= (char (symbol-name x) 0) #\?))
+         (%guard-symbol x ctx))
+        ((or (null x) (numberp x) (stringp x) (characterp x)) x)
+        ((and (consp x) (ignore-errors (list-length x)))
+         (mapcar (lambda (e) (%guard-template e ctx)) x))
+        (t (%refuse "~A is not a template: a ?variable, a literal or a ~
+list of those" (%term-label x)))))
+
+(defun %guard-spec-term (x ctx name)
+  "X as the aggregate spec in NAME's spec position: COUNT, or (WORD
+TEMPLATE...) with WORD one of *PROLOG-AGGREGATE-WORDS* at a listed
+arity; the word canonicalised into GRAPH-DB.  Anything else is refused
+naming the position."
+  (flet ((word (s)
+           (and s (symbolp s)
+                (assoc (symbol-name s) *prolog-aggregate-words*
+                       :test #'string=)))
+         (refuse ()
+           (%refuse "~A takes a literal spec in its spec position: count, ~
+(sum ?e), (min ?e), (max ?e), (bag ?t), (set ?t), (min ?e ?w) or ~
+(max ?e ?w), not ~A" (string-downcase name) (%term-label x))))
+    (cond ((and (symbolp x) (word x) (member 0 (rest (word x))))
+           (intern (symbol-name x) :graph-db))
+          ((and (consp x) (ignore-errors (list-length x)) (word (first x))
+                (member (length (rest x)) (rest (word (first x)))))
+           (cons (intern (symbol-name (first x)) :graph-db)
+                 (mapcar (lambda (e) (%guard-template e ctx)) (rest x))))
+          (t (refuse)))))
 
 (defparameter *prolog-cost-unbounded-predicates*
   (graph-db:cost-unbounded-predicate-names)   ; single source: GH #285
@@ -473,8 +526,9 @@ straight to the engine's CALL macro, re-opening %SOLVE-CALL -- the one
 path by which a fully whitelisted query can still intern a functor
 symbol from graph data.
 
-Only CALL and %COMMIT are both excluded and compiler-macro-backed, so
-this refuses exactly those two and leaves a schema's own FINDALL,
+CALL, %COMMIT, %UNFLOOR and %AGGREGATE-STEP are both excluded and
+compiler-macro-backed, so this refuses exactly those and leaves a
+schema's own FINDALL,
 SELECT or REGEX-MATCH working, which is what the home-scoping was for
 (GH #279)."
   (let ((sym (find-symbol name (find-package :graph-db))))
@@ -547,15 +601,32 @@ comes from"
           (unless canonical
             (%refuse "~A/~D is not a registered Prolog functor"
                      (string-downcase name) arity))
-          (when (member name *prolog-goal-argument-control* :test #'string=)
-            (dolist (arg (rest form))
-              (unless (or (consp arg) (%cut-symbol-p arg ctx))
-                (%refuse "~A takes goals, not ~A: write the goal out ~
+          (let ((entry (%goal-argument-entry name)))
+            (when (eq entry t)
+              (dolist (arg (rest form))
+                (unless (or (consp arg) (%cut-symbol-p arg ctx))
+                  (%refuse "~A takes goals, not ~A: write the goal out ~
 in full -- a variable there would be meta-called at run time"
-                         (string-downcase name) (%term-label arg)))))
-          (cons canonical
-                (mapcar (lambda (arg) (%guard-term arg ctx))
-                        (rest form))))))))
+                           (string-downcase name) (%term-label arg)))))
+            (if (consp entry)
+                (cons canonical
+                      (loop for arg in (rest form)
+                            for position from 1
+                            collect
+                            (cond ((eql position (getf entry :spec))
+                                   (%guard-spec-term arg ctx name))
+                                  ((eql position (getf entry :goal))
+                                   (unless (consp arg)
+                                     (%refuse "~A takes a written-out ~
+goal in its goal position, not ~A: a variable there would be ~
+meta-called at run time"
+                                              (string-downcase name)
+                                              (%term-label arg)))
+                                   (%guard-term arg ctx))
+                                  (t (%guard-term arg ctx)))))
+                (cons canonical
+                      (mapcar (lambda (arg) (%guard-term arg ctx))
+                              (rest form))))))))))
 
 (defun %guard-term (x ctx)
   "X validated and translated.  Every list is validated AS A GOAL:

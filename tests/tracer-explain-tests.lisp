@@ -328,3 +328,20 @@ error comes back as the third value."
       (let ((text (with-output-to-string (s)
                     (graph-db:profile-goals '(?x) '((te-g ?x)) :stream s))))
         (is (search "TE-G/1" text))))))
+
+;;; aggregate-all (GH #123, aggregation design D9).
+
+(test te-explain-aggregate-all
+  "An aggregate's goal is explained one level in, and only the result
+is bound after it: the next goal sees ?x unbound."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((rows (graph-db:explain-goals
+                 '(?x ?m)
+                 '((aggregate-all count (is-a ?x g-person) ?n)
+                   (node-slot-value ?x name ?m)))))
+      (is (find '(is-a ?x g-person) rows :key (lambda (r) (getf r :goal))
+                :test #'equal))
+      (let ((slot (find '(node-slot-value ?x name ?m) rows
+                        :key (lambda (r) (getf r :goal)) :test #'equal)))
+        (is (equal '(nil t nil) (getf slot :bound)))))))

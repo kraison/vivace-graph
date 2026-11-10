@@ -444,3 +444,48 @@ does, then explains the same goals (design D5, GH #124)."
                 :test #'string=)))
     (signals graph-db.query:prolog-guard-error
       (graph-db.query:profile-text "(no-such-functor ?x)" g))))
+
+;;; aggregate-all in free text (GH #123, aggregation design D1, D6).
+
+(defun ag-refusal (g text)
+  "The guard's message for TEXT, or :answered."
+  (handler-case (progn (q g text) :answered)
+    (graph-db.query:prolog-guard-error (e) (princ-to-string e))))
+
+(test ag-guard-admits-static-and-refuses-dynamic
+  "A literal spec and a written-out goal are admitted; a variable in
+either position is refused naming it; the internal step macros and
+findall stay out; a spec word beside an edge goal reads as the word."
+  (with-query-graph (g)
+    (seed g)
+    ;; Every variable is a column, so the aggregate's result is the
+    ;; last one; the goal's own variables come back unbound.
+    (flet ((last-column (text)
+             (mapcar (lambda (row) (first (last row)))
+                     (nth-value 1 (q g text :format :raw)))))
+      (is (equal '(3)
+                 (last-column "(aggregate-all count (is-a ?i qt-item) ?n)")))
+      (is (equal '(6)
+                 (last-column "(aggregate-all (sum ?r)
+                                 (node-slot-value ?i rank ?r) ?s)")))
+      (is (equal '((1 2 3))
+                 (last-column "(aggregate-all (set ?r)
+                                 (node-slot-value ?i rank ?r) ?s)")))
+      (is (equal '(2)
+                 (last-column "(aggregate-all count (qt-links ?a ?b) ?n)")))
+      ;; The count feeds a later goal: the item of rank 2, one row.
+      (is (= 1 (length (nth-value
+                        1 (q g "(aggregate-all count (qt-links ?a ?b) ?n)
+                                (is-a ?i qt-item)
+                                (node-slot-value ?i rank ?n)"
+                             :format :raw)))))
+      (let ((m (ag-refusal g "(aggregate-all count ?g ?n)")))
+        (is (and (stringp m) (search "goal" m)) "~A" m))
+      (let ((m (ag-refusal g "(aggregate-all ?s (is-a ?i qt-item) ?n)")))
+        (is (and (stringp m) (search "spec" m)) "~A" m))
+      (let ((m (ag-refusal
+                g "(aggregate-all (nonsense ?x) (is-a ?i qt-item) ?n)")))
+        (is (and (stringp m) (search "spec" m)) "~A" m))
+      (is (stringp (ag-refusal g "(%aggregate-step ?a count ?t)")))
+      (is (stringp (ag-refusal g "(%unfloor ?f)")))
+      (is (stringp (ag-refusal g "(findall ?i (is-a ?i qt-item) ?l)"))))))

@@ -1344,6 +1344,7 @@ thing under test."
 
 (defparameter *reviewed-functor-inventory*
   '("/=/2"
+    "aggregate-all/3"
     "</2"
     "<=/2"
     "=/2"
@@ -1454,6 +1455,13 @@ new sibling of not/once/if/forall): add its NAME to ~
 *PROLOG-GOAL-ARGUMENT-CONTROL* there instead -- that forces its ~
 arguments to be written-out goals, which keeps it on the compile-time ~
 path.~%~
+  * Yes, and only SOME positions are goals while another is a literal ~
+spec (an aggregate-all/3): add a positional entry (NAME :spec P :goal Q) ~
+to *PROLOG-GOAL-ARGUMENT-CONTROL*, so the goal position must be written ~
+out and the spec position must be a literal spec term; an internal ~
+compiler macro the expansion emits (a %aggregate-step) goes on ~
+*PROLOG-EXCLUDED-PREDICATES*, since the control-word table is derived ~
+from the compiler-macro property.~%~
   * No: nothing to do for this question.~%~%~
 Note on HOW an exclusion is enforced, if you add one: it is matched ~
 against GRAPH-DB-homed registry keys, so a schema owning the same name ~

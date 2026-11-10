@@ -1489,11 +1489,15 @@ compile-time path (GH #285, #279)."
     (labels ((walk (goal)
                (when (and (consp goal) (symbolp (first goal)))
                  (let ((head (first goal)))
-                   (if (member head '(and or not if when unless))
-                       (mapc #'walk (rest goal))
-                       (push (make-functor-symbol head
-                                                  (length (rest goal)))
-                             acc))))))
+                   (cond ((member head '(and or not if when unless))
+                          (mapc #'walk (rest goal)))
+                         ;; (aggregate-all spec GOAL result): the goal.
+                         ((and (string= (symbol-name head) "AGGREGATE-ALL")
+                               (= 3 (length (rest goal))))
+                          (walk (third goal)))
+                         (t (push (make-functor-symbol head
+                                                       (length (rest goal)))
+                                  acc)))))))
       (mapc #'walk goals))
     acc))
 
