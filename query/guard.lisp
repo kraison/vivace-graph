@@ -297,7 +297,9 @@ Splits at the LAST slash, so /=/2 reads as (\"/=\" . 2)."
     ;; Internal compiler macros the if and aggregate-all expansions
     ;; emit (GH #122, #123): the control-word table is derived from the
     ;; compiler-macro property, so they are admissible unless named.
-    "%UNFLOOR" "%AGGREGATE-STEP")
+    "%UNFLOOR" "%AGGREGATE-STEP"
+    ;; GH #376: the cached query form's literal binding.
+    "%BIND-LITERALS")
   "Predicate names withheld from free text at EVERY arity, whatever the
 registries say.
 

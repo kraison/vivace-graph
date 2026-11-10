@@ -676,6 +676,21 @@ continuation runs inside its test's extent (if with an else arm)."
     `(let ((*negation-floor* ,saved))
        ,(compile-body body cont bindings))))
 
+(def-prolog-compiler-macro %bind-literals (goal body cont bindings)
+  "Internal: (%bind-literals ?L0 ... ?Ln) at the head of a cached query
+form unifies each variable with the literal at its index in
+*QUERY-LITERALS*, inline, then the body: no functor, so no tick (GH
+#376, design D1)."
+  (let ((vars (args goal)))
+    (labels ((bind (vars i)
+               (if (null vars)
+                   (compile-body body cont
+                                 (bind-variables-in (args goal) bindings))
+                   `(when (unify ,(compile-arg (first vars) bindings)
+                                 (svref *query-literals* ,i))
+                      ,(bind (rest vars) (1+ i))))))
+      (bind vars 0))))
+
 (def-prolog-compiler-macro %commit (goal body cont bindings)
   "Internal control-macro helper -- not for use in user queries.
 (%commit BARRIER OUTER) compiles the remaining body under OUTER's cut scope (so
