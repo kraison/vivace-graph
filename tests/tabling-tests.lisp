@@ -264,3 +264,80 @@ by the second; inside one query a second call consumes (design D6)."
                (r2 (bt:join-thread t2)))
           (is (tb-set-equal *tb-ring* r1))
           (is (tb-set-equal *tb-ring* r2)))))))
+
+;;; Negation and stratification (design D4).
+
+(test tb-negation-is-stratified-or-refused
+  "not over a tabled predicate outside the component works; over the
+predicate's own component it is refused, and catch/3 cannot take the
+refusal; forall over an independent table works; a nested component
+under a floor completes there (design D4)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-s 1) (tb-r 1) (tb-p 1) (tb-np 1) (tb-r2 1)
+                       (tb-q3 1) (tb-s3 1) (tb-r3 1) (tb-p3 1)
+                       (tb-cedge 2) (tb-walk 2) (tb-far 2))
+      (<- (tb-s a)) (<- (tb-s b)) (<- (tb-s c))
+      (<- (tb-r b))
+      (<- (tb-p ?x) (tb-s ?x) (not (tb-r ?x)))
+      (graph-db:table-functor 'tb-r 1)
+      (is (tb-set-equal '((a) (c)) (select () (?x) (tb-p ?x))))
+      (<- (tb-np ?x) (tb-s ?x) (not (tb-np ?x)))
+      (graph-db:table-functor 'tb-np 1)
+      (signals graph-db:prolog-unstratified-error
+        (select () (?x) (tb-np ?x)))
+      (signals graph-db:prolog-unstratified-error
+        (select () (?x) (catch (tb-np ?x) ?b (= ?x caught))))
+      (<- (tb-r2 ?x) (tb-s ?x))
+      (graph-db:table-functor 'tb-r2 1)
+      (is (equal '((yes))
+                 (select () (?y) (forall (tb-s ?x) (tb-r2 ?x)) (= ?y yes))))
+      ;; The coarse design refused this stratified program.
+      (<- (tb-q3 a)) (<- (tb-q3 b))
+      (<- (tb-s3 ?x) (tb-q3 ?x))
+      (<- (tb-r3 ?x) (tb-s3 ?y) (= ?y ?x) (= ?x a))
+      (<- (tb-p3 ?x) (tb-s3 ?x) (not (tb-r3 ?x)))
+      (graph-db:table-functor 'tb-s3 1)
+      (graph-db:table-functor 'tb-r3 1)
+      (graph-db:table-functor 'tb-p3 1)
+      (is (equal '((b)) (select () (?x) (tb-p3 ?x))))
+      ;; A recursive table under not, inside another recursive one.
+      (<- (tb-cedge a b)) (<- (tb-cedge b c))
+      (<- (tb-walk ?x ?y) (tb-cedge ?x ?y))
+      (<- (tb-walk ?x ?z) (tb-cedge ?x ?y) (tb-walk ?y ?z))
+      (<- (tb-far ?x ?y) (tb-cedge ?x ?y) (not (tb-walk ?y ?x)))
+      (<- (tb-far ?x ?z) (tb-far ?x ?y) (tb-far ?y ?z))
+      (graph-db:table-functor 'tb-walk 2)
+      (graph-db:table-functor 'tb-far 2)
+      (is (tb-set-equal '((a b) (b c) (a c))
+                        (select (:max-inferences 5000) (?x ?y)
+                          (tb-far ?x ?y)))))))
+
+(test tb-if-else-and-findall-read-as-closed
+  "if with an else arm and findall read their goal's tables as closed:
+refused inside the predicate's own component, fine over an independent
+table; once and two-argument if only prune (design D4)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-q 1) (tb-ip 1) (tb-fp 1) (tb-ind 1) (tb-ok 1)
+                       (tb-ok2 1) (tb-ok3 1))
+      (<- (tb-q a)) (<- (tb-q b))
+      (<- (tb-ip ?x) (tb-q ?x) (if (tb-ip ?x) (fail) (true)))
+      (graph-db:table-functor 'tb-ip 1)
+      (signals graph-db:prolog-unstratified-error
+        (select () (?x) (tb-ip ?x)))
+      (<- (tb-fp a) (findall ?y (tb-fp ?y) nil))
+      (graph-db:table-functor 'tb-fp 1)
+      (signals graph-db:prolog-unstratified-error
+        (select () (?x) (tb-fp ?x)))
+      (<- (tb-ind a)) (<- (tb-ind b))
+      (<- (tb-ok ?x) (tb-q ?x) (findall ?y (tb-ind ?y) ?l))
+      (graph-db:table-functor 'tb-ind 1)
+      (graph-db:table-functor 'tb-ok 1)
+      (is (tb-set-equal '((a) (b)) (select () (?x) (tb-ok ?x))))
+      (<- (tb-ok2 ?x) (tb-q ?x) (once (tb-ok2 ?x)))
+      (graph-db:table-functor 'tb-ok2 1)
+      (finishes (select () (?x) (tb-ok2 ?x)))
+      (<- (tb-ok3 ?x) (tb-q ?x) (if (tb-ok3 ?x) (true)))
+      (graph-db:table-functor 'tb-ok3 1)
+      (finishes (select () (?x) (tb-ok3 ?x))))))

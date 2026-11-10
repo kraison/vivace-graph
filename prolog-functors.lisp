@@ -322,9 +322,9 @@ Catcher unifies with it.  An uninstantiated BALL is an instantiation_error."
   "catch(Goal, Catcher, Recovery): prove GOAL; if it throws a ball that unifies
 with CATCHER, undo GOAL's bindings and prove RECOVERY instead.  A ball that does
 not unify propagates to an outer catch.  Errors raised by the CONTINUATION after
-GOAL succeeds are not caught here (only GOAL is protected).  Resource and
-permission errors are NOT catchable -- they must abort the query so a bounded,
-untrusted query cannot swallow its own enforcement."
+GOAL succeeds are not caught here (only GOAL is protected).  Resource,
+permission and unstratified errors are NOT catchable -- they must abort the
+query so a bounded, untrusted query cannot swallow its own enforcement."
   (let ((marker (list :catch))
         (entry (fill-pointer *trail*))
         (caught nil))
@@ -334,7 +334,8 @@ untrusted query cannot swallow its own enforcement."
              (lambda (c)
                (when (and (member marker *active-catches* :test #'eq)
                           (not (typep c 'prolog-resource-error))
-                          (not (typep c 'prolog-permission-error)))
+                          (not (typep c 'prolog-permission-error))
+                          (not (typep c 'prolog-unstratified-error)))
                  (let ((ball (or (prolog-error-ball c)
                                  (iso-ball (list :system-error (princ-to-string c))))))
                    (undo-bindings entry)
@@ -364,12 +365,16 @@ no solution -- not when Test succeeds but Then fails.  This is the runtime
 (meta-call) counterpart of the IF compiler macro; the two must agree."
   (when *prolog-trace* (format t "TRACE: IF/3(~A ~A ~A)~%" ?test ?then ?else))
   (let ((old-trail (fill-pointer *trail*))
+        (floor *negation-floor*)
         (cond-met nil))
     (block done
-      (call/1 ?test #'(lambda ()
-                        (setf cond-met t)
-                        (call/1 ?then cont)
-                        (return-from done))))
+      ;; Test is read as closed (tabling design D4); Then is not.
+      (with-negation-floor ()
+        (call/1 ?test #'(lambda ()
+                          (setf cond-met t)
+                          (let ((*negation-floor* floor))
+                            (call/1 ?then cont))
+                          (return-from done)))))
     (unless cond-met
       (undo-bindings old-trail)
       (call/1 ?else cont))))
@@ -386,14 +391,17 @@ Runtime (meta-call) counterpart of the FORALL compiler macro."
   (let ((old-trail (fill-pointer *trail*))
         (ok t))
     (block done
-      (call/1 cond
-              #'(lambda ()
-                  (let ((inner-trail (fill-pointer *trail*))
-                        (act nil))
-                    (block inner
-                      (call/1 action #'(lambda () (setf act t) (return-from inner))))
-                    (undo-bindings inner-trail)
-                    (unless act (setf ok nil) (return-from done))))))
+      ;; Cond and Action are read as closed (tabling design D4).
+      (with-negation-floor ()
+        (call/1 cond
+                #'(lambda ()
+                    (let ((inner-trail (fill-pointer *trail*))
+                          (act nil))
+                      (block inner
+                        (call/1 action
+                                #'(lambda () (setf act t) (return-from inner))))
+                      (undo-bindings inner-trail)
+                      (unless act (setf ok nil) (return-from done)))))))
     (undo-bindings old-trail)
     (when ok (funcall cont))))
 
@@ -421,7 +429,9 @@ Runtime (meta-call) counterpart of the FORALL compiler macro."
   "Prolog negation.  Does not retract, simply negates in the context of the
 query."
   (with-undo-bindings
-    (call/1 relation #'(lambda () (return-from not/1 nil)))
+    ;; RELATION is read as closed (tabling design D4).
+    (with-negation-floor ()
+      (call/1 relation #'(lambda () (return-from not/1 nil))))
     (funcall cont)))
 
 (def-global-prolog-functor or/2 (goal1 goal2 cont)
@@ -468,7 +478,9 @@ resolves bound variables to their values so the snapshot survives the undo --
 DEREF-COPY renames variables apart and would drop the bindings."
   (let ((acc nil)
         (old-trail (fill-pointer *trail*)))
-    (%solve goal (lambda () (push (deref-exp template) acc)))
+    ;; GOAL is read as closed (tabling design D4): findall, bagof, setof.
+    (with-negation-floor ()
+      (%solve goal (lambda () (push (deref-exp template) acc))))
     (undo-bindings old-trail)
     (nreverse acc)))
 

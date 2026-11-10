@@ -557,6 +557,7 @@
            #:prolog-error-ball
            #:prolog-throw
            #:prolog-resource-error
+           #:prolog-unstratified-error
            ;; cost-boundedness classification (GH #285)
            #:declare-functor-cost-unbounded #:functor-cost-unbounded-p
            #:cost-unbounded-predicate-names #:prolog-cost-unbounded-error

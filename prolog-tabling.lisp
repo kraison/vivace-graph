@@ -144,6 +144,25 @@ the table below.  Returns whether TBL completed."
       (%lower-leader parent (tbl-leader tbl)))
     completed))
 
+(defun %open-dependency (tbl)
+  "The end of TBL's LEADER chain: the lowest table TBL's answers so far
+depend on, TBL itself when it has no leader."
+  (let ((at tbl) (steps 0))
+    (loop while (and (tbl-leader at)
+                     (not (eq (tbl-leader at) at))
+                     (< (incf steps) 1000))
+          do (setf at (tbl-leader at)))
+    at))
+
+(defun %check-floor (tbl functor)
+  "Refuse to consume the incomplete TBL under a negation floor when the
+table it depends on is open at or below the floor (design D4)."
+  (when (plusp *negation-floor*)
+    (let ((dependency (%open-dependency tbl)))
+      (when (and (member dependency *table-stack* :test #'eq)
+                 (<= (tbl-index dependency) *negation-floor*))
+        (%unstratified (functor-name functor))))))
+
 (defun %call-tabled (functor args cont)
   "A call of the tabled FUNCTOR with ARGS: the variant's table found or
 made, evaluated when it is new or stale, then consumed into CONT (the
@@ -159,8 +178,10 @@ four paths of design D3)."
           ((tbl-complete tbl))
           ((member tbl *table-stack* :test #'eq)
            ;; A looping consumer: the answers so far, the rest next round.
+           (%check-floor tbl functor)
            (%lower-leader top tbl))
           ((= (tbl-round tbl) *round*)
+           (%check-floor tbl functor)
            (%lower-leader top (tbl-leader tbl)))
           (t (%evaluate-tbl tbl functor args)))
     (%consume-tbl tbl args cont)))
