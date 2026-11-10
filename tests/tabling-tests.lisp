@@ -161,9 +161,12 @@ tables form one component with one leader (design D3)."
                         (select (:max-inferences 20000) (?n)
                           (tb-odd ?n))))
       (flet ((tb-run-sel () (select (:max-inferences 20000) (?n) (tb-even ?n))))
-        (is (= 1 (+ (length (tb-table-events "TB-EVEN/1" #'tb-run-sel :leader))
-                    (length (tb-table-events "TB-ODD/1" #'tb-run-sel :leader)))))
-        (is (plusp (length (tb-table-events "TB-ODD/1" #'tb-run-sel :follower))))
+        (is (= 1 (+ (length (tb-table-events "TB-EVEN/1" #'tb-run-sel
+                                             :leader))
+                    (length (tb-table-events "TB-ODD/1" #'tb-run-sel
+                                             :leader)))))
+        (is (plusp (length (tb-table-events "TB-ODD/1" #'tb-run-sel
+                                            :follower))))
         (is (plusp (length (tb-table-events "TB-EVEN/1" #'tb-run-sel
                                             :consume))))))))
 
@@ -459,7 +462,8 @@ the events (design D7)."
       (tb-ring-facts)
       (tb-right-path)
       (graph-db:table-functor 'tb-path 2)
-      (flet ((tb-run-sel () (select (:max-inferences 5000) (?x) (tb-path a ?x))))
+      (flet ((tb-run-sel ()
+               (select (:max-inferences 5000) (?x) (tb-path a ?x))))
         (let ((events (tb-table-events "TB-PATH/2" #'tb-run-sel)))
           (is (find :leader events :key #'first))
           (is (find :consume events :key #'first)))
@@ -479,3 +483,94 @@ the events (design D7)."
                            :test #'string=)))
             (is (plusp (getf row :tables))))
           (is (search "tables" (get-output-stream-string out))))))))
+
+;;; The whole-branch review's findings (2026-11-10).
+
+(test tb-stale-dependency-does-not-complete-early
+  "A table read in path 4 whose leader chain ends at an open ancestor
+keeps the reader incomplete; a stale INDEX must not make the reader its
+own leader (review finding 1): tb-z depends on tb-x, which depends on
+tb-a through tb-y."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-a 1) (tb-b 1) (tb-y 1) (tb-x 1) (tb-z 1))
+      (<- (tb-a ?n) (tb-b ?n))
+      (<- (tb-a ?n) (tb-z ?n))
+      (<- (tb-a 1))
+      (<- (tb-b ?n) (tb-y ?n))
+      (<- (tb-y ?n) (tb-x ?n))
+      (<- (tb-y ?n) (tb-a ?n))
+      (<- (tb-x ?n) (tb-y ?n))
+      (<- (tb-z two) (tb-x ?m) (= ?m 1))
+      (dolist (f '(tb-a tb-b tb-y tb-x tb-z))
+        (graph-db:table-functor f 1))
+      (is (tb-set-equal '((1) (two))
+                        (select (:max-inferences 20000) (?n) (tb-a ?n)))))))
+
+(test tb-path-4-consumes-a-follower-once-per-round
+  "A follower called twice in one pass is evaluated once and consumed
+the second time (design D3 path 4); under a floor that second read is
+refused when the chain ends at an open ancestor (review finding 5a)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-succ 2) (tb-p 1) (tb-q 1) (tb-np4 1) (tb-nq4 1))
+      (tb-succ-facts 10)
+      (<- (tb-p 0))
+      (<- (tb-p ?n) (tb-q ?m) (tb-q ?k) (= ?m ?k) (tb-succ ?m ?n))
+      (<- (tb-q ?n) (tb-p ?n))
+      (graph-db:table-functor 'tb-p 1)
+      (graph-db:table-functor 'tb-q 1)
+      (flet ((tb-run-sel ()
+               (select (:max-inferences 50000) (?n) (tb-p ?n))))
+        (is (= 11 (length (tb-run-sel))))
+        ;; One evaluation of tb-q per pass of tb-p (an answer a pass, so
+        ;; 12 passes); the second call consumes once per answer so far.
+        (let ((followers (tb-table-events "TB-Q/1" #'tb-run-sel :follower))
+              (consumes (tb-table-events "TB-Q/1" #'tb-run-sel :consume)))
+          (is (= 12 (length followers)))
+          (is (< (length followers) (length consumes)))))
+      (<- (tb-nq4 ?n) (tb-np4 ?n))
+      (<- (tb-nq4 1))
+      (<- (tb-np4 ?n) (tb-nq4 ?m) (not (tb-nq4 ?m)))
+      (graph-db:table-functor 'tb-np4 1)
+      (graph-db:table-functor 'tb-nq4 1)
+      (signals graph-db:prolog-unstratified-error
+        (select (:max-inferences 5000) (?n) (tb-np4 ?n))))))
+
+(test tb-then-branch-is-not-under-the-floor
+  "if with an else arm lifts the floor for Then, in the compiler macro
+and in if/3 (review finding 5b)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-q 1) (tb-ok4 1) (tb-ok5 1))
+      (<- (tb-q a)) (<- (tb-q b))
+      (<- (tb-ok4 ?x) (tb-q ?x) (if (tb-q ?x) (tb-ok4 ?x) (true)))
+      (graph-db:table-functor 'tb-ok4 1)
+      (finishes (select (:max-inferences 5000) (?x) (tb-ok4 ?x)))
+      (<- (tb-ok5 ?x) (tb-q ?x) (= ?t (tb-q ?x)) (if ?t (tb-ok5 ?x) (true)))
+      (graph-db:table-functor 'tb-ok5 1)
+      (finishes (select (:max-inferences 5000) (?x) (tb-ok5 ?x))))))
+
+(test tb-runtime-constructs-set-the-floor
+  "not/1, forall/2, if/3 and the findall family reached through a
+variable goal set the floor as the compiler macros do (review finding
+6)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-s 1) (tb-np2 1) (tb-np3 1) (tb-np5 1)
+                       (tb-np6 1))
+      (<- (tb-s a))
+      (<- (tb-np2 ?x) (tb-s ?x) (= ?g (tb-np2 ?x)) (not ?g))
+      (<- (tb-np3 ?x) (tb-s ?x) (= ?g (tb-np3 ?x)) (forall ?g (true)))
+      (<- (tb-np5 ?x) (tb-s ?x) (bagof ?y (tb-np5 ?y) ?l))
+      (<- (tb-np6 ?x) (tb-s ?x) (= ?t (tb-np6 ?x)) (if ?t (fail) (true)))
+      (dolist (f '(tb-np2 tb-np3 tb-np5 tb-np6))
+        (graph-db:table-functor f 1))
+      (signals graph-db:prolog-unstratified-error
+        (select (:max-inferences 5000) (?x) (tb-np2 ?x)))
+      (signals graph-db:prolog-unstratified-error
+        (select (:max-inferences 5000) (?x) (tb-np3 ?x)))
+      (signals graph-db:prolog-unstratified-error
+        (select (:max-inferences 5000) (?x) (tb-np5 ?x)))
+      (signals graph-db:prolog-unstratified-error
+        (select (:max-inferences 5000) (?x) (tb-np6 ?x))))))

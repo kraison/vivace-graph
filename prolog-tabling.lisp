@@ -53,11 +53,13 @@ evaluates; LEADER the lowest open table it depends on, or NIL."
   complete created-at (round 0) (index 0) leader)
 
 (defun %lower-leader (tbl to)
-  "TBL depends on TO, an open table: its LEADER becomes the lower of
-the two by stack INDEX.  A TO at or above TBL is TBL itself (D3)."
-  (when (and tbl to)
-    (let ((to (if (<= (tbl-index to) (tbl-index tbl)) to tbl))
-          (leader (tbl-leader tbl)))
+  "TBL depends on TO: when TO is on the stack (so its INDEX is live and
+at or below TBL's), TBL's LEADER becomes the lower of the two by INDEX.
+A TO off the stack is complete or dropped and records nothing; an
+off-stack INDEX is stale and must not be compared (D3; the review's
+finding 1 of 2026-11-10)."
+  (when (and tbl to (member to *table-stack* :test #'eq))
+    (let ((leader (tbl-leader tbl)))
       (when (or (null leader) (< (tbl-index to) (tbl-index leader)))
         (setf (tbl-leader tbl) to)))))
 
@@ -105,24 +107,29 @@ delivered too); bindings undone between answers."
 
 (defun %complete-from (tbl)
   "TBL and every incomplete table created inside its extent (a greater
-CREATED-AT) are complete (design D3)."
+CREATED-AT) are complete (design D3).  A table still on the stack is
+mid-evaluation and is never marked from below it."
   (let ((from (tbl-created-at tbl)))
     (maphash (lambda (key other)
                (declare (ignore key))
-               (when (>= (tbl-created-at other) from)
+               (when (and (>= (tbl-created-at other) from)
+                          (or (eq other tbl)
+                              (not (member other *table-stack*
+                                           :test #'eq))))
                  (setf (tbl-complete other) t)))
              *tables*)))
 
 (defun %drop-from (tbl)
-  "TBL and every incomplete table created after it leave *TABLES*: an
-evaluation left by a non-local exit built them half (design D5)."
-  (let ((from (tbl-created-at tbl)))
-    (remhash (tbl-key tbl) *tables*)
-    (maphash (lambda (key other)
-               (when (and (not (tbl-complete other))
-                          (> (tbl-created-at other) from))
-                 (remhash key *tables*)))
-             *tables*)))
+  "TBL and every incomplete table not on the stack leave *TABLES*: an
+evaluation left by a non-local exit built them half, and one that
+survived could still name TBL as its leader (design D5).  The
+ancestors still evaluating keep their answers, all consequences."
+  (remhash (tbl-key tbl) *tables*)
+  (maphash (lambda (key other)
+             (when (and (not (tbl-complete other))
+                        (not (member other *table-stack* :test #'eq)))
+               (remhash key *tables*)))
+           *tables*))
 
 (defun %evaluate-tbl (tbl functor args)
   "Evaluate TBL per design D3: passes of the dispatcher with TBL on the
@@ -144,8 +151,12 @@ Returns whether TBL completed, and the number of passes."
                (%run-tbl tbl functor args)
                (setf leader (tbl-leader tbl))
                (cond ((null leader)
-                      ;; Nothing read was open: one pass is the fixpoint.
-                      (%complete-from tbl)
+                      ;; Nothing read was open: one pass is the fixpoint,
+                      ;; and every table created inside completed on its
+                      ;; own (else it would have lowered LEADER), so no
+                      ;; walk of *TABLES* is needed: a lookup-shaped use
+                      ;; with many variants stays linear.
+                      (setf (tbl-complete tbl) t)
                       (setf completed t)
                       (return))
                      ((not (eq leader tbl))
@@ -218,8 +229,10 @@ four paths of design D3)."
              (%lower-leader top tbl)
              (%table-port functor tbl :consume nil))
             ((= (tbl-round tbl) *round*)
+             ;; Evaluated this round: the top depends on what it depends
+             ;; on, the end of its chain, if that is still open.
              (%check-floor tbl functor)
-             (%lower-leader top (tbl-leader tbl))
+             (%lower-leader top (%open-dependency tbl))
              (%table-port functor tbl :consume nil))
             (t (evaluate))))
     (%consume-tbl tbl args cont)))

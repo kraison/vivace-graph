@@ -1102,8 +1102,8 @@ goal recurses runs in constant stack as the old single function did
 
 (defun %add-compiled-clause (functor clause)
   "Under FUNCTOR's lock: CLAUSE compiled, appended, a new clause set
-published in one slot write, and the dispatcher installed as FN unless
-FN already is it (design D2, D5)."
+published in one slot write, and FN reinstalled through
+%INSTALL-FUNCTOR-FN (design D2, D5)."
   (%clause-arity functor clause)
   (let ((fn (%compile-clause-fn functor clause)))
     (setf (functor-clauses functor)

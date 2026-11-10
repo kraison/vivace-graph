@@ -254,9 +254,13 @@ The call paths:
    call site in the component's next round.
 4. **Incomplete table not on the stack:** if its `round` is `*round*`
    it was evaluated in this round; lower the top table's `leader` to
-   its `leader` (it depends on what that table depended on) and consume.
-   Otherwise re-evaluate it as in path 2 (it may now complete on its
-   own if what it depended on has completed), then consume.
+   the *end of its leader chain* when that end is still on the stack
+   (it depends on what that table depended on; an off-stack end is
+   complete or dropped and records nothing, and an off-stack table's
+   `index` is stale and is never compared: the review's finding 1,
+   2026-11-10) and consume. Otherwise re-evaluate it as in path 2 (it
+   may now complete on its own if what it depended on has completed),
+   then consume.
 
 Consumption always reads the vector by index up to its length at each
 step, so a consumer running during evaluation also delivers answers
@@ -342,10 +346,12 @@ true)` spelled with three-argument `if`, and `p(a) :- findall(Y, p(Y),
   `catch/3` outside the table, an error, the budget) leaves tables
   half-built. Every evaluation, leader or follower, is wrapped in
   `unwind-protect`: on an abnormal exit the table being evaluated and
-  every incomplete table with a greater `created-at` are removed from
-  `*tables*`, so a later call in the same query (after `catch/3`
-  recovered) starts afresh instead of reading a half-built table or
-  completing it later from a stale `round`. The builder check's program
+  every incomplete table not on the stack are removed from `*tables*`
+  (the ancestors still evaluating keep their answers, all
+  consequences; an older incomplete table that survived could name
+  the dropped one as its leader), so a later call in the same query
+  (after `catch/3` recovered) starts afresh instead of reading a
+  half-built table or completing it later from a stale `round`. The builder check's program
   (`q` with a throwing middle clause, `p` catching it in one clause and
   calling `q` plain in another) is the test: `q`'s table must end
   `{1, 2}`, not `{1}`.
