@@ -132,6 +132,8 @@
                (:file "prologc" :depends-on ("functor"))
                (:file "prolog-tabling" :depends-on ("prologc"))
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
+               (:file "prolog-graph-predicates"
+                :depends-on ("prolog-functors" "prolog-tabling"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
                       ("schema" "edge" "vertex" "views" "transactions"
@@ -728,6 +730,7 @@ cl-temporal-extent."
                (:file "tracer-explain-tests")
                (:file "tabling-tests")
                (:file "aggregation-tests")
+               (:file "graph-predicate-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")

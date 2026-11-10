@@ -1708,7 +1708,9 @@ test functors are the only exceptions."
            (set-difference
             (set-difference (registered-functors) classified
                             :test #'string=)
-            '("slow-true/1" "refuse-loudly/1")
+            '("slow-true/1" "refuse-loudly/1"
+              ;; this file's own edge type (GH #123)
+              "rl5-link/2" "rl5-link/3")
             :test #'string=)))
     (is (null unclassified)
         "functors with no entry in *STANDING-QUERY-FUNCTOR-CLASSES*: ~S"
@@ -2976,3 +2978,50 @@ so one claim is derived."
            (report (graph-db.rules:run-rule g r)))
       (is (= 1 (graph-db.rules:rule-report-derived report)))
       (is (= 1 (length (derived g 'rt-claim "busy-hosts")))))))
+
+;;; reachable/3 and k-hop/4 in a rule body (GH #123, design D9)
+
+(graph-db:def-edge rl5-link () () :graph-db-rules-test)
+
+(defun rl5-link-web-to-db (g)
+  "An rl5-link edge from h1's \"runs web\" claim to its \"runs db\" claim."
+  (let* ((runs (claims-touching g 'rt-claim :host "h1" :role :subject
+                                :relation "runs"))
+         (web (find "web" runs :key #'claim-object-key :test #'string=))
+         (db (find "db" runs :key #'claim-object-key :test #'string=)))
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rl5-link :graph g :from web :to db))))
+
+(defparameter *rl5-linked-head*
+  "(claim ?c rt-claim \"host\" ?h \"linked\" \"app\" ?a2)")
+(defparameter *rl5-reachable-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (reachable ?p ?q rl5-link)
+   (claim ?q rt-claim \"host\" ?h2 \"runs\" \"app\" ?a2)")
+(defparameter *rl5-k-hop-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (k-hop ?p 1 ?q rl5-link)
+   (claim ?q rt-claim \"host\" ?h2 \"runs\" \"app\" ?a2)")
+
+(test rl5-reachable-in-a-rule-body
+  "A rule body may close over an edge type with reachable: one claim
+reached, one derived."
+  (with-rules-graph (g)
+    (seed g)
+    (rl5-link-web-to-db g)
+    (let* ((r (write-rule g :name "linked" :version "1" :family "rt-claim"
+                            :head *rl5-linked-head*
+                            :body *rl5-reachable-body*))
+           (report (graph-db.rules:run-rule g r)))
+      (is (= 1 (graph-db.rules:rule-report-derived report))))))
+
+(test rl5-k-hop-in-a-rule-body
+  "A rule body may step with k-hop: one claim at one hop, one derived."
+  (with-rules-graph (g)
+    (seed g)
+    (rl5-link-web-to-db g)
+    (let* ((r (write-rule g :name "hop-linked" :version "1"
+                            :family "rt-claim"
+                            :head *rl5-linked-head* :body *rl5-k-hop-body*))
+           (report (graph-db.rules:run-rule g r)))
+      (is (= 1 (graph-db.rules:rule-report-derived report))))))

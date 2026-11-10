@@ -1343,8 +1343,11 @@ thing under test."
     (sort names #'string<)))
 
 (defparameter *reviewed-functor-inventory*
-  '("/=/2"
+  '("%closure-args/2"
+    "/=/2"
     "aggregate-all/3"
+    "k-hop/4"
+    "reachable/3"
     "</2"
     "<=/2"
     "=/2"
