@@ -2,8 +2,12 @@
 
 **Issue:** GH #123, bullets 2 and 3; unit 5 of the Prolog Engine 5.0
 scope (`2026-11-09-prolog-engine-5.0-scope.md`). **Status:** proposed
-2026-11-10; builder check pending; the calls are the author's, Kevin's
-review pending. **Depends on:** unit 4 (#122, tabling, on
+2026-11-10, revised the same day after a builder check (its findings
+are settled below: the template is read inside the goal's compile walk
+through an internal step goal, the guard admits a literal spec grammar
+only, `reachable/3` needs a bound start and type, the bench loads the
+algorithms system instead of depending on it, and the rules lane gets
+its classes); the calls are the author's, Kevin's review pending. **Depends on:** unit 4 (#122, tabling, on
 `experiment` at 4d2fd2c).
 
 ## Intent
@@ -99,9 +103,30 @@ unit 4, run where the application's schema is.
   binds it. `table-functor` declares a user functor tabled; its
   clauses are `<-` clauses; the manual says to write the
   left-recursive form for closure.
-- `outgoing-edges/4 (from type edge to)` enumerates with any of
-  `from`/`to` bound and TYPE a bound symbol; every arm requires the
-  symbol, so an unbound TYPE fails (prolog-functors.lisp:757-811).
+- `outgoing-edges/4 (from type edge to)` enumerates with `from` or
+  `to` a bound vertex and TYPE a bound symbol; with both vertices bound
+  and TYPE unbound it matches an edge of any type; with `from` and `to`
+  both unbound its last arm hands the variable to `map-edges`, which
+  errors rather than enumerates (prolog-functors.lisp:757-811).
+- A compile-time `=` between a fresh variable and a term is an alias
+  in the compiler's `bindings` with no run-time binding
+  (`compile-unify-variable`): only code compiled inside the same
+  `compile-body` walk sees it. `once` and `if` thread their tail through
+  the walk with the internal `%commit` goal for that reason; a closing
+  lambda handed in from outside the walk does not.
+- The guard validates every list as a goal and every bare symbol as a
+  variable, a schema name or a control word (`%guard-term`,
+  `%guard-symbol`); it has no "ordinary term" category. The control
+  words come from the compiler-macro property, so an internal helper
+  macro (`%commit`, unit 4's `%unfloor`) is admissible in text unless
+  it is on `*prolog-excluded-predicates*`; `%commit` is, `%unfloor` is
+  not yet.
+- The rules lane's `every-registered-functor-has-a-standing-query-class`
+  (tests/rules/forward-tests.lisp) walks `*user-functors*` too, so a
+  new functor needs a class in `rules/standing.lisp`, and rule text
+  goes through the same guard.
+- `graph-db/test` load-depends on `graph-db/perf-test`, so a dependency
+  the bench system gains is loaded into the main suite's image.
 - The functor inventory is pinned by `prolog-functor-inventory-is-pinned`
   (tests/gui/gui-tests.lisp:1534); its message classifies a new
   functor: one that can be handed a goal in an ordinary argument goes
@@ -125,39 +150,59 @@ unbound or non-numeric `?e` on a solution signals `prolog-error` with a
 whatever `+` gives.
 
 **Static form, a compiler macro** `aggregate-all` (prologc.lisp, beside
-`not` and `forall`): when SPEC is a symbol or a list headed by one of
-the eight words and GOAL is `static-goal-p`, the expansion compiles
-GOAL under an opaque barrier (as `not` does, with `*functor*` bound to
-the barrier and the cut flag nil) with a continuation that, for
-`count`, increments a counter, else pushes `(deref-exp template)` onto
-an accumulator, then returns nil so GOAL backtracks; the whole runs
-under `with-negation-floor` (it reads GOAL's tables as closed, unit 4
-D4); bindings are undone to the trail mark; the result is computed and
-unified with `?result`, and the rest of the body compiles after it
-with the clause's own cut scope (the `%commit`-style threading `if`
-uses is not needed: nothing of GOAL's bindings survives). An
-unrecognised SPEC or a non-static GOAL makes the macro return `:pass`,
-so the runtime functor takes the call.
+`not` and `forall`): when SPEC is a spec term (below) and GOAL is
+`static-goal-p`, the expansion compiles `(and GOAL (%aggregate-step
+ACC TEMPLATE))` under an opaque barrier (as `not` does: `*functor*`
+bound to the barrier, the cut flag nil) and under `with-negation-floor`
+(it reads GOAL's tables as closed, unit 4 D4). `%aggregate-step` is an
+internal compiler macro, a sibling of `%commit`: compiled *inside*
+GOAL's walk, it emits `(compile-arg TEMPLATE bindings)` so a
+compile-time alias made by a `=` in GOAL (the builder check's `(and
+(ag-v ?x) (= ?y 1))`) reaches the template, then for `count`
+increments the accumulator and otherwise pushes `(deref-exp ...)` of
+the compiled template, and returns nil so GOAL backtracks. Bindings
+are undone to the trail mark; the result is computed and unified with
+`?result`, and the rest of the body compiles after it with the
+clause's own cut scope. A non-static GOAL makes the macro return
+`:pass`, so the runtime functor takes the call; a SPEC that is not a
+spec term signals `prolog-error` at compile time (a domain error, not
+a pass: the runtime functor would signal the same). The internal
+macros `%aggregate-step` and unit 4's `%unfloor` join `%commit` on
+`*prolog-excluded-predicates*`: the control-word table is derived from
+the compiler-macro property, so an internal helper is admissible in
+text unless excluded.
+
+**Spec terms, in Lisp and in text.** A spec is the symbol `count` or a
+list whose head is one of `count`, `sum`, `min`, `max`, `bag`, `set`,
+matched by `symbol-name` (text arrives in the scratch package, Lisp
+callers write `cl:count` or `cl:min`), with the arities above; the
+template of `bag` and `set` is a variable or a list of variables and
+literals, the expression of `sum`/`min`/`max` a variable. The guard
+gains a spec grammar for argument 1 of `aggregate-all` (a literal spec
+term, never a variable; the words canonicalised to `graph-db`'s
+symbols), beside the positional goal rule for argument 2: a bare word
+that is not one of the six is refused naming the position. A variable
+SPEC is therefore unreachable from text, which is what makes the
+runtime functor unreachable from text and keeps the whitelist
+reasoning true; from Lisp a variable SPEC reaches the runtime functor,
+which validates it.
 
 **Dynamic form, a global functor** `aggregate-all/3` (prolog-functors
 .lisp, after `setof/3`): the same result over `(%findall-list template
 goal)`, where the template is the spec's term (or `t` for count); the
-spec is dereferenced and validated the same way; an unknown spec
-signals `prolog-error` with a `(:domain-error :aggregate-spec ...)`
-ball. It is excluded from free text (`*prolog-excluded-predicates*`
-gains `"AGGREGATE-ALL"`), which never applies to the static form: the
-guard's check at :550 runs on the goal's name, so the exclusion must be
-keyed off the goal position being static. **Guard rule:**
-`*prolog-goal-argument-control*` entries may name the goal positions:
-`("AGGREGATE-ALL" 2)` means argument 2 must be a parenthesised goal and
-the other arguments are ordinary terms; a bare name keeps today's
-"every argument" meaning. `aggregate-all` goes there, not on the
-excluded list, because with the goal static the compile-time path is
-the only one taken and the runtime functor is never reached from free
-text; the inventory test's classification text gains this third case.
-The runtime functor is still registered (the dynamic form from Lisp),
-so the whitelist contains it; the position rule, not the exclusion, is
-what keeps a variable goal out.
+spec is dereferenced and validated by the same grammar; an unknown
+spec signals `prolog-error` with a `(:domain-error :aggregate-spec
+...)` ball. **Guard rule:** `*prolog-goal-argument-control*` entries
+may name positions: `("AGGREGATE-ALL" :spec 1 :goal 2)` means argument
+1 is a literal spec term, argument 2 a parenthesised static goal, and
+argument 3 an ordinary term (a variable or a literal); a bare name
+keeps today's "every argument is a goal" meaning. `aggregate-all` goes
+there, not on the excluded list: with SPEC literal and GOAL static the
+compile-time path is the only one taken from text, so the runtime
+functor is registered (the whitelist contains it, the dynamic form
+works from Lisp) and still never meta-calls text. The inventory test's
+classification message gains this third case. The same grammar admits
+`aggregate-all` in rule bodies (D9).
 
 **Effects:** none. `aggregate-all` is a read; under `:effects nil` it
 runs; `(sum ?e)` does no `eval`, only `+`.
@@ -170,7 +215,8 @@ Two clauses, asserted at load time in the `graph-db` package by a new
 `table-functor` and `outgoing-edges/4`), then tabled:
 
 ```lisp
-(<- (reachable ?a ?b ?type) (outgoing-edges ?a ?type ?e ?b))
+(<- (reachable ?a ?b ?type) (%closure-args ?a ?type)
+                            (outgoing-edges ?a ?type ?e ?b))
 (<- (reachable ?a ?c ?type) (reachable ?a ?b ?type)
                             (outgoing-edges ?b ?type ?e ?c))
 (table-functor 'reachable 3)
@@ -179,12 +225,19 @@ Two clauses, asserted at load time in the `graph-db` package by a new
 Left-recursive (unit 4 D8: one table per start, constant stack). A
 `select` in any package resolves `reachable` to this functor through
 `make-functor-symbol`'s fallback to `graph-db`, as it resolves `is-a`.
-TYPE must be bound to an edge-type symbol: `outgoing-edges/4` fails on
-an unbound one, so `reachable` with TYPE unbound fails rather than
-errs; the manual says so. `?from` bound is the intended shape; both
-unbound builds the full closure (one table) and both bound checks
-membership of the start's closure (the start's table). Reflexivity:
-`?from` itself is reachable only through a cycle back to it.
+**Both the start and the type must be bound:** `?from` to a vertex,
+TYPE to an edge-type symbol. `outgoing-edges/4` would error on an
+unbound start and would match any type with both vertices bound and
+TYPE unbound, so the first clause's first goal is an internal check
+functor, `%closure-args/2 (from type)`, that succeeds when both are
+bound as required and otherwise signals `prolog-error` with an
+instantiation ball naming `reachable/3`; it is on the reviewed
+inventory and the rules lane's `:pure` class. One table per start:
+the closure from one vertex, each reachable vertex once; a bound `?to`
+checks membership of that closure. A closure over every start is
+`(is-a ?a TYPE-OF-START) (reachable ?a ?b TYPE)`, one table per start,
+which is what the 36-row test and the bench do. Reflexivity: `?from`
+itself is reachable only through a cycle back to it.
 
 The functor is a *user* functor homed in `graph-db`: `reset-functor`
 and `delete-functor` on it are possible and unsupported; the inventory
@@ -210,9 +263,15 @@ cost-unbounded flag.
 
 ### D4. `shortest-path/4` and the rest of bullet 3
 
-Stays in `graph-db/algorithms`, unchanged. This unit: adds
-`:graph-db/algorithms` to `graph-db/perf-test`'s dependencies so the
-bench measures `shortest-path/4` beside the Lisp BFS row; adds a line
+Stays in `graph-db/algorithms`, unchanged. This unit: the bench
+measures `shortest-path/4` beside the Lisp BFS row *when the
+algorithms system is loaded* (the case records the row only when
+`shortest-path/4` is registered, as the chain case does for
+`table-functor`; the measurement runs quickload `graph-db/algorithms`
+first). `graph-db/perf-test` gains no dependency: `graph-db/test`
+load-depends on it, and a dependency there would register the eight
+algorithm functors in the main suite's image past both inventory
+tripwires. Adds a line
 to Chapter 6's built-in table pointing at Chapter 14 for the algorithm
 predicates; and notes in Chapter 14 that `reachable/2` (both bound, a
 Dijkstra check) and `reachable/3` (enumerating, tabled, one edge type)
@@ -252,6 +311,21 @@ the four ports.
 Nothing implementation-specific: a compiler macro, two global functors,
 two clauses, an `equalp` hash. ECL and CCL in their sessions.
 
+### D9. The rules lane and explain
+
+`rules/standing.lisp` classes: `reachable/3` and `k-hop/4` are
+`:store-read`, `%closure-args/2` is `:pure`, `aggregate-all/3` is
+`:meta` like `findall/3`; the standing-query classifier learns that
+`aggregate-all`'s second argument is a goal and walks it as it walks
+`not`'s. Rule text passes through the same guard, so a rule body may
+use `aggregate-all` with a literal spec and a static goal, `reachable`
+and `k-hop`; the forward-rules tests gain one rule using each.
+`explain-goals` gets an `aggregate-all` branch: the goal's goals are
+explained one level in as `not`'s are, and only `?result` is bound
+after it (the generic branch would mark every variable of GOAL bound).
+`%static-goal-functors` descends into `aggregate-all`'s goal so a
+cost-unbounded functor inside it is refused up front as elsewhere.
+
 ## Tests
 
 `tests/aggregation-tests.lisp`, suite `aggregation-suite`, names
@@ -273,6 +347,13 @@ two existing copies stay).
   `?x` unbound; the body after it sees `?n`.
 - `ag-non-number-signals`: `(sum ?x)` over a symbol fact signals
   `prolog-error` with a type-error ball, catchable by `catch/3`.
+- `ag-template-bound-inside-the-goal`: `(aggregate-all (bag (?x ?y))
+  (and (ag-v ?x) (= ?y 1)) ?l)` gives `((3 1) (1 1) (2 1))` and
+  `(aggregate-all (sum ?s) (and (ag-v ?x) (= ?s ?x)) ?t)` gives 6: the
+  compile-time alias reaches the template (builder check).
+- `ag-spec-words-match-by-name`: `cl:count`, `cl:min`, `cl:max`,
+  `cl:set` and a `graph-db/test::bag` all work; `(aggregate-all
+  (nonsense ?x) ...)` signals `prolog-error` at compile time.
 - `ag-dynamic-goal`: `(= ?g (ag-v ?x)) (aggregate-all count ?g ?n)`
   gives 3 through the runtime functor; `(aggregate-all (nonsense ?x)
   ...)` signals `prolog-error`.
@@ -287,15 +368,20 @@ two existing copies stay).
   predicate inside a recursive one works.
 - `ag-guard-admits-static-and-refuses-dynamic` (in the query suite or
   the gui suite, where `run-guarded-prolog` lives): `(aggregate-all
-  count (is-a ?x g-person) ?n)` as text answers; `(aggregate-all count
-  ?g ?n)` is refused naming the goal position; `(findall ...)` stays
-  refused.
+  count (is-a ?x g-person) ?n)`, `(aggregate-all (sum ?a) ...)` and
+  `(aggregate-all (bag (?x ?a)) ...)` as text answer; `(aggregate-all
+  count ?g ?n)` is refused naming the goal position; `(aggregate-all ?s
+  ...)` and `(aggregate-all (nonsense ?x) ...)` are refused naming the
+  spec position; `(%aggregate-step ...)`, `(%unfloor ...)` and
+  `(findall ...)` are refused.
 - `gp-reachable-closure-on-a-cycle`: six-ring of `g-knows` persons:
-  from one, six rows, each once; `(reachable ?a ?b g-knows)` both
-  unbound, 36 rows; a bound target that is reachable succeeds once, an
-  unreachable one (a seventh person) fails.
-- `gp-reachable-needs-a-bound-type`: `(reachable ?a ?x ?t)` returns no
-  row and signals nothing.
+  from one, six rows, each once; `(is-a ?a g-person) (reachable ?a ?b
+  g-knows)`, 36 rows; a bound target that is reachable succeeds once,
+  an unreachable one (a seventh person) fails.
+- `gp-reachable-needs-a-bound-start-and-type`: `(reachable ?a ?x
+  g-knows)` with `?a` unbound and `(reachable ?v ?x ?t)` with `?t`
+  unbound (both vertices bound too) each signal `prolog-error` with an
+  instantiation ball naming `reachable/3`, catchable by `catch/3`.
 - `gp-reachable-composes`: `(not (reachable ?a ?b g-knows))` in a
   select over two persons; `(aggregate-all count (reachable ?a ?x
   g-knows) ?n)` gives 6; `explain-goals` on `(reachable ?a ?x g-knows)`
@@ -307,12 +393,22 @@ two existing copies stay).
 - `gp-k-hop-arguments`: K unbound or negative or `from` unbound signals
   `prolog-error`; TYPE unbound fails.
 - `gp-inventory`: the gui suite's tripwire updated: `reachable/3`,
-  `k-hop/4` on the reviewed list, `aggregate-all/3` on the positional
-  goal-argument list.
+  `k-hop/4` and `%closure-args/2` on the reviewed list,
+  `aggregate-all/3` on the positional list, `%aggregate-step` and
+  `%unfloor` on the excluded list.
+- `rl-` (tests/rules): the standing-query class test passes with the
+  three new functors; one rule each using `aggregate-all`, `reachable`
+  and `k-hop` in its body derives through `run-rules`.
+- `explain`: `explain-goals` over `(aggregate-all count (is-a ?x
+  g-person) ?n) (node-slot-value ?x name ?m)` marks `?x` unbound in the
+  second goal's row and names the inner goal's path.
 - Mutation checks: the static macro's floor removed (`ag-reads-tables-
-  as-closed` fails); the visited set in `k-hop` removed (the distinct
-  assertion fails); `:pass` on a non-static goal removed (the dynamic
-  test fails to compile the query).
+  as-closed` fails); the `%aggregate-step` threading replaced by a
+  closing lambda (`ag-template-bound-inside-the-goal` fails); the
+  visited set in `k-hop` removed (the distinct assertion fails);
+  `:pass` on a non-static goal removed (the dynamic test fails to
+  compile the query); `%closure-args` removed from the first clause
+  (the instantiation test fails).
 
 ## Measurement
 
@@ -350,8 +446,9 @@ not wait on it.
 
 ## Left to the builder
 
-- The exact shape of the positional goal-argument entries and how the
-  guard's `:550` loop reads them.
+- The exact shape of the positional entries and how the guard's `:550`
+  loop reads them; where the spec grammar lives (the guard, with the
+  macro and the functor sharing one validator in prologc.lisp).
 - Whether the static macro's accumulator is a list or a vector, and how
   `count` avoids consing.
 - The `with-dropped-functors` helper's home and the two existing copies'
