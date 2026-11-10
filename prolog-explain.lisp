@@ -40,26 +40,32 @@ none is registered."
 
 (defun %explain-user-path (functor args bound)
   "An asserted functor's path and (K . N): the clauses its first-argument
-index leaves for this call (design D3)."
+index leaves for this call (design D3); \", tabled\" appended when the
+functor is tabled (tabling design D7, GH #122)."
   (let* ((f (lookup-functor functor))
          (set (functor-clause-set f))
          (n (length (clause-set-fns set)))
          (every (format nil "every clause: ~D" n)))
-    (cond ((or (null args) (not *clause-indexing*) (not (first bound)))
-           (values every (cons n n)))
-          ((variable-p (first args))
-           (values (format nil "first-argument index: by value at run ~
+    (multiple-value-bind (path kn)
+        (cond ((or (null args) (not *clause-indexing*) (not (first bound)))
+               (values every (cons n n)))
+              ((variable-p (first args))
+               (values (format nil "first-argument index: by value at run ~
 time, ~D clauses" n)
-                   (cons nil n)))
-          (t (multiple-value-bind (bucket all-p)
-                 (%candidates set (first args) t)
-               (if all-p
-                   (values every (cons n n))
-                   (let ((k (+ (length bucket)
-                               (length (clause-set-vars set)))))
-                     (values (format nil "first-argument index: ~D of ~D ~
-clauses" k n)
-                             (cons k n)))))))))
+                       (cons nil n)))
+              (t (multiple-value-bind (bucket all-p)
+                     (%candidates set (first args) t)
+                   (if all-p
+                       (values every (cons n n))
+                       (let ((k (+ (length bucket)
+                                   (length (clause-set-vars set)))))
+                         (values (format nil "first-argument index: ~D of ~
+~D clauses" k n)
+                                 (cons k n)))))))
+      (values (if (functor-tabled f)
+                  (concatenate 'string path ", tabled")
+                  path)
+              kn))))
 
 (defun %explain-predicate (goal bound rows graph)
   (let* ((head (first goal))
@@ -202,7 +208,7 @@ here)" type)))
   (or (gethash functor table)
       (setf (gethash functor table)
             (list :functor functor :calls 0 :exits 0 :redos 0 :fails 0
-                  :clauses 0 :seconds 0.0 :open '()))))
+                  :clauses 0 :tables 0 :seconds 0.0 :open '()))))
 
 (defun profile-goals (vars goals &key (graph *graph*) stream limit
                                       max-inferences timeout)
@@ -232,7 +238,8 @@ rows are also printed."
                             (incf (getf r :seconds)
                                   (/ (- (get-internal-real-time) start)
                                      (float internal-time-units-per-second))))))
-                 (:clause (incf (getf r :clauses)))))))
+                 (:clause (incf (getf r :clauses)))
+                 (:table (incf (getf r :tables)))))))
       (handler-case
           (let ((*graph* graph)
                 (form `(select (:effects nil :snapshot t :limit ,limit
@@ -257,8 +264,8 @@ rows are also printed."
       (when stream
         (dolist (r rows)
           (format stream "~&~A: ~D calls, ~D exits, ~D redos, ~D fails, ~
-~D clauses, ~,3F s~%"
+~D clauses, ~D tables, ~,3F s~%"
                   (symbol-name (getf r :functor)) (getf r :calls)
                   (getf r :exits) (getf r :redos) (getf r :fails)
-                  (getf r :clauses) (getf r :seconds))))
+                  (getf r :clauses) (getf r :tables) (getf r :seconds))))
       (values solutions rows err))))

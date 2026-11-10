@@ -438,6 +438,24 @@ TRACE-PROLOG sets it.")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 
+;; Tabling (GH #122; docs/superpowers/specs/2026-11-10-tabling-design.md).
+;; Bound fresh by SELECT and ?-, the two query roots (design D6).
+(defvar *tables* nil
+  "The current query's variant tables: an EQUAL hash from %VARIANT-KEY
+to TBL, or NIL outside a query (design D2).")
+(defvar *table-stack* nil
+  "The tables whose evaluation is open, innermost first (design D3).")
+(defvar *round* 0
+  "The fixpoint round the open component is in (design D3).")
+(defvar *answers-added* 0
+  "Answers added to any table in the current round; a round that adds
+none completes the component (design D3).")
+(defvar *negation-floor* 0
+  "The table-stack depth a read-as-closed construct was entered at; a
+dependency on a table below it is unstratified (design D4).")
+(defvar *table-serial* 0
+  "The last CREATED-AT handed to a table of the current query (D2).")
+
 #+sbcl
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))
 #+sbcl

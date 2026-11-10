@@ -166,3 +166,25 @@ GH #255.)
   under `trace-prolog` to a null stream: 1,099/s (runs 1 and 2: 1,266,
   1,408), so tracing roughly halves this query's throughput when it is
   on and costs nothing when it is off.
+- **Unit 4, tabling, the chain case's before** (#122):
+  `results/prolog-before-u4-chain-odm-1798080.report`, same host, SBCL
+  and generation, 2026-11-10, third of three runs, taken before any
+  tabling code. The new `bench-tabled-chain` case runs the ring's
+  recursive `pbp-path/2` down a 200-node chain, which has no cycle, so
+  the untabled recursion finishes: `chain-closure-untabled` 0.085 s,
+  199 solutions (runs 1 and 2: 0.083, 0.084). The case adds a
+  `chain-closure-tabled` row on an engine with `table-functor`; the
+  ring row stays the termination check, this one is the per-call cost
+  of a table against a plain recursion.
+- **Unit 4, tabling, after** (#122):
+  `results/prolog-after-u4-odm-d5eaa6e.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `pbp-path/2` tabled by
+  the bench. `recursive-ring-closure` completes: 200 solutions in
+  0.444 s (runs 1 and 2: 0.487, 0.545) where the before exhausted the
+  control stack in 0.09 s with none; the right-recursive rule
+  evaluates one table per node inside its caller's, which is where the
+  time goes. `chain-closure-tabled` 0.108 s (0.112, 0.115) against
+  `chain-closure-untabled` 0.080 s (0.097, 0.090): the tabling tax on
+  an acyclic query, about a third. The spine row is deferred to unit 5
+  (#122: a bare bench image cannot open the application's store
+  without its schema classes).

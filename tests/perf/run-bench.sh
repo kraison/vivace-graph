@@ -24,7 +24,7 @@ case "$1" in
   bench-clause-assert | bench-clause-assert-10k \
   | bench-guarded-shape-repeat | bench-recursive-ring \
   | bench-change-feed-cursor | bench-graph-predicates \
-  | bench-traced-k-hop)
+  | bench-traced-k-hop | bench-tabled-chain)
     CALL="(graph-db/perf-test::run-prolog-bench :scale :small :only 'graph-db/perf-test::$1)" ;;
   *)
     echo "unknown FUNCTION: $1" >&2

@@ -61,14 +61,20 @@ strings: \"NAME/N\" for one arity, \"NAME/\" for every arity.")
 (defun %print-port (port functor args depth)
   "One trace line per port to *TRACE-OUTPUT* (tracer design D2, GH
 #124): [DEPTH], two spaces per level, the port, the functor, and the
-arguments dereferenced; a :CLAUSE event as POS/N, 1-based."
+arguments dereferenced; a :CLAUSE event as POS/N, 1-based; a :TABLE
+event as its path word and count (tabling design D7, GH #122)."
   (when (%traced-p functor)
     (let ((*print-length* 8) (*print-level* 3) (*print-pretty* nil))
       (format *trace-output* "~&[~D] ~v@{  ~}~A ~A" depth depth
               (symbol-name port) (symbol-name functor))
-      (if (eq port :clause)
-          (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args))
-          (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args)))
+      (case port
+        (:clause
+         (format *trace-output* " ~D/~D~%" (1+ (first args)) (second args)))
+        ;; (:complete n), (:leader passes), (:follower n), (:consume n).
+        (:table
+         (format *trace-output* " ~(~A~) ~D~%" (first args) (second args)))
+        (t
+         (format *trace-output* " (~{~S~^ ~})~%" (mapcar #'deref-exp args))))
       (finish-output *trace-output*))))
 
 (defun trace-prolog (&rest names)
@@ -130,6 +136,22 @@ inference budget (*INFERENCE-BUDGET* / the :MAX-INFERENCES select option) or its
 wall-clock deadline (*QUERY-DEADLINE* / the :TIMEOUT option).  A subclass of
 PROLOG-ERROR, so it aborts the query but is catchable; it lets a runaway or
 cyclic recursion fail cleanly instead of crashing the Lisp control stack."))
+
+(define-condition prolog-unstratified-error (prolog-error)
+  ((functor :initarg :functor :reader prolog-unstratified-error-functor))
+  (:documentation "Signaled when a tabled predicate is read as closed (not,
+forall, if with an else arm, findall, bagof, setof) inside its own
+recursive component (tabling design D4, GH #122).  A PROLOG-ERROR that
+catch/3 declines, like the resource and permission errors: the program
+is unstratified and no recovery branch may derive from the half table."))
+
+(defun %unstratified (functor)
+  "Signal PROLOG-UNSTRATIFIED-ERROR for the functor symbol FUNCTOR."
+  (error 'prolog-unstratified-error
+         :functor functor
+         :reason (format nil "tabled ~A is read as closed inside its own ~
+recursive component (unstratified)" functor)
+         :ball (permission-error-ball :negate :procedure functor)))
 
 (defvar *active-catches* nil
   "Markers of the catch/3 frames currently protecting their Goal (not their
@@ -639,6 +661,21 @@ head is a non-variable symbol.  A bare variable (meta-call) is not static."
        (symbolp (first goal))
        (not (variable-p (first goal)))))
 
+(defmacro with-negation-floor (() &body body)
+  "BODY reads the tables it reaches as closed: *NEGATION-FLOOR* is the
+table stack's depth here, and a tabled call inside that depends on a
+table at or below it is refused (tabling design D4, GH #122)."
+  `(let ((*negation-floor* (length *table-stack*)))
+     ,@body))
+
+(def-prolog-compiler-macro %unfloor (goal body cont bindings)
+  "Internal: (%unfloor SAVED) compiles the remaining body with
+*NEGATION-FLOOR* back to the Lisp variable SAVED, for a construct whose
+continuation runs inside its test's extent (if with an else arm)."
+  (destructuring-bind (saved) (args goal)
+    `(let ((*negation-floor* ,saved))
+       ,(compile-body body cont bindings))))
+
 (def-prolog-compiler-macro %commit (goal body cont bindings)
   "Internal control-macro helper -- not for use in user queries.
 (%commit BARRIER OUTER) compiles the remaining body under OUTER's cut scope (so
@@ -674,7 +711,8 @@ rest of the body does not depend on G's bindings)."
                                        bindings))))
           `(let ((,trail (fill-pointer *trail*))
                  (,found nil))
-             (block ,barrier ,g-code)
+             ;; G is read as closed (tabling design D4).
+             (with-negation-floor () (block ,barrier ,g-code))
              (undo-bindings ,trail)
              (unless ,found ,rest-code))))))
 
@@ -707,6 +745,7 @@ barrier; a cut in Then or Else cuts the enclosing clause."
         (destructuring-bind (test then &optional else) args
           (let ((barrier (prolog-gensym "IF"))
                 (trail (prolog-gensym "TRAIL"))
+                (floor (prolog-gensym "FLOOR"))
                 (outer *functor*)
                 (outer-flag *clause-cut-flag*))
             ;; The Test->commit->Then->tail path is one walk so Test's bindings
@@ -719,18 +758,23 @@ barrier; a cut in Then or Else cuts the enclosing clause."
                        (list* test (list '%commit barrier outer outer-flag)
                               then body)
                        cont bindings)))
-                `(let ((,trail (fill-pointer *trail*)))
+                `(let ((,trail (fill-pointer *trail*))
+                       (,floor *negation-floor*))
                    ;; BLOCK yields NIL when Test succeeded (return-from in
                    ;; %commit), or :TEST-FAILED when it fell through -- the
-                   ;; latter is the only case in which Else runs.
-                   (if (block ,barrier
-                         ,(let ((*functor* barrier) (*clause-cut-flag* nil))
-                            (compile-body
-                             (list* test
-                                    (list '%commit barrier outer outer-flag)
-                                    then body)
-                             cont bindings))
-                         :test-failed)
+                   ;; latter is the only case in which Else runs.  With an
+                   ;; else arm Test is read as closed (tabling design D4):
+                   ;; the floor covers Test and %unfloor lifts it for Then.
+                   (if (with-negation-floor ()
+                         (block ,barrier
+                           ,(let ((*functor* barrier) (*clause-cut-flag* nil))
+                              (compile-body
+                               (list* test
+                                      (list '%commit barrier outer outer-flag)
+                                      (list '%unfloor floor)
+                                      then body)
+                               cont bindings))
+                           :test-failed))
                        (progn
                          (undo-bindings ,trail)
                          ,(compile-body (cons else body) cont bindings))))))))))
@@ -829,9 +873,13 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
 ;         exp))
 
 (defun deref-copy (exp)
+  "EXP with every unbound variable replaced by a fresh one, the same
+fresh variable per occurrence, and bound variables followed.  (Before
+GH #122 the walk discarded its dereference and copied a bound variable
+as a fresh unbound one; its one caller pre-dereferenced.)"
   (let ((var-alist nil))
     (labels ((walk (exp)
-               (deref-exp exp)
+               (var-deref exp)
                (cond ((consp exp)
                       (reuse-cons (walk (first exp))
                                   (walk (rest exp))
@@ -863,9 +911,24 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
            (deref-equal (rest x) (rest y)))))
 
 (defmethod prolog-compile-null ((functor functor))
-  (let ((*functor* (functor-name functor)))
-    (set-functor-fn *functor*
-                    #'(lambda (&rest args) (declare (ignore args)) nil))))
+  (%install-functor-fn functor))
+
+(defun %null-functor-fn (&rest args)
+  "The FN of a functor with no clauses: every call fails."
+  (declare (ignore args))
+  nil)
+
+(defun %install-functor-fn (functor)
+  "FUNCTOR's FN from its state: the tabled entry when TABLED (built once,
+kept in ENTRY), else the dispatcher when one exists, else the null
+function.  Every site that sets FN goes through here (GH #122, D1)."
+  (setf (functor-fn functor)
+        (cond ((functor-tabled functor)
+               (or (functor-entry functor)
+                   (setf (functor-entry functor)
+                         (%make-tabled-entry functor))))
+              ((functor-dispatcher functor))
+              (t #'%null-functor-fn))))
 
 (defun %compile-clause-fn (functor clause)
   "CLAUSE as its own closure of (CELL ARG1 .. ARGN CONT) (design D1,
@@ -1039,8 +1102,8 @@ goal recurses runs in constant stack as the old single function did
 
 (defun %add-compiled-clause (functor clause)
   "Under FUNCTOR's lock: CLAUSE compiled, appended, a new clause set
-published in one slot write, and the dispatcher installed as FN unless
-FN already is it (design D2, D5)."
+published in one slot write, and FN reinstalled through
+%INSTALL-FUNCTOR-FN (design D2, D5)."
   (%clause-arity functor clause)
   (let ((fn (%compile-clause-fn functor clause)))
     (setf (functor-clauses functor)
@@ -1050,8 +1113,9 @@ FN already is it (design D2, D5)."
     (unless (functor-dispatcher functor)
       (setf (functor-dispatcher functor)
             (%make-dispatcher functor (functor-arity functor))))
-    (unless (eq (functor-fn functor) (functor-dispatcher functor))
-      (set-functor-fn (functor-name functor) (functor-dispatcher functor)))
+    ;; Every assert reinstalls FN: a SET-FUNCTOR-FN stand-in answers
+    ;; only until the next assert (clause indexing design D2).
+    (%install-functor-fn functor)
     functor))
 
 (defun compile-body (body cont bindings)
@@ -1116,6 +1180,13 @@ FN already is it (design D2, D5)."
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
+            ;; Tabling: fresh tables per query (GH #122, D6).
+            (*tables* (make-hash-table :test 'equal))
+            (*table-stack* nil)
+            (*round* 0)
+            (*answers-added* 0)
+            (*negation-floor* 0)
+            (*table-serial* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
             (catch 'top-level-prove
@@ -1416,6 +1487,13 @@ SELECT-FIRST for common shorthands."
             (*select-count-only* ,(cdr (assoc :count options)))
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
+            ;; Tabling: fresh tables per query (GH #122, D6).
+            (*tables* (make-hash-table :test 'equal))
+            (*table-stack* nil)
+            (*round* 0)
+            (*answers-added* 0)
+            (*negation-floor* 0)
+            (*table-serial* 0)
             (functor (make-functor :name *functor* :clauses nil)))
        ;; A resource-bounded query must not carry a goal the rails
        ;; cannot bound (GH #285).  Static over the goal list; checked

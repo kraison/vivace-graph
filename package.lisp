@@ -557,6 +557,7 @@
            #:prolog-error-ball
            #:prolog-throw
            #:prolog-resource-error
+           #:prolog-unstratified-error
            ;; cost-boundedness classification (GH #285)
            #:declare-functor-cost-unbounded #:functor-cost-unbounded-p
            #:cost-unbounded-predicate-names #:prolog-cost-unbounded-error
@@ -590,6 +591,7 @@
            #:*clause-body-rewriters*
            #:trace-prolog
            #:untrace-prolog
+           #:table-functor #:untable-functor #:functor-tabled-p
            #:make-node-table
            #:node-equal
 

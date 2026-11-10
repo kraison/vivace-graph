@@ -62,14 +62,17 @@ in this file read their functors from this package."
     (graph-db::add-clause clause)))
 
 (defun pbp-assert-path-clauses ()
-  "Assert the two pbp-path clauses once per image.  The guard is
-LOOKUP-FUNCTOR on the functor symbol, so a second bench call does not
-double the clauses and the recursive case keeps the same shape."
+  "Assert the two pbp-path clauses once per image and table the functor
+(GH #122).  The guard is LOOKUP-FUNCTOR on the functor symbol, so a
+second bench call does not double the clauses and the recursive case
+keeps the same shape."
   (let ((sym (find-symbol "PBP-PATH/2" (find-package '#:graph-db/perf-test))))
     (unless (and sym (graph-db::lookup-functor sym))
       (let ((*package* (find-package '#:graph-db/perf-test)))
         (graph-db::<- (pbp-path ?a ?b) (p-knows ?a ?b))
-        (graph-db::<- (pbp-path ?a ?c) (p-knows ?a ?b) (pbp-path ?b ?c))))))
+        (graph-db::<- (pbp-path ?a ?c) (p-knows ?a ?b) (pbp-path ?b ?c))))
+    ;; Outside the guard: BENCH-TABLED-CHAIN untables it for one row.
+    (pbp-set-path-tabled t)))
 
 (defun pbp-ring (n &key chords)
   "N p-node vertices in the current graph, joined in a ring by p-knows
@@ -83,6 +86,18 @@ edges.  With CHORDS, also an edge from every tenth node I to node
         (when (and chords (zerop (mod i 10)))
           (make-p-knows :from (lookup-vertex (aref ids i))
                         :to (lookup-vertex (aref ids (mod (* 3 i) n)))))))
+    ids))
+
+(defun pbp-chain (n)
+  "N p-node vertices in the current graph, joined in a chain by p-knows
+edges from node I to I+1.  No closing edge: an untabled recursion over
+it terminates, so the chain is the tabled/untabled comparison the ring
+cannot give (GH #122).  Returns the vector of ids."
+  (let ((ids (insert-p-nodes n :batch 1000)))
+    (with-transaction ()
+      (dotimes (i (1- n))
+        (make-p-knows :from (lookup-vertex (aref ids i))
+                      :to (lookup-vertex (aref ids (1+ i))))))
     ids))
 
 (defun pbp-bfs (start goal)
@@ -132,12 +147,13 @@ The loop shortest_path/4 will wrap (GH #45)."
 
 (defun pbp-ring-closure ()
   "The recursive case from *PBP-START* over the ring (GH #122).  Before
-tabling the ring recurses until the inference bound (:BOUND) or, first
-on SBCL's default stack, until the control stack is gone
+tabling the ring recursed until the inference bound (:BOUND) or, first
+on SBCL's default stack, until the control stack was gone
 \(:STACK-EXHAUSTED, the deferred trampoline question of #45); either is
-caught here so the run goes on.  After tabling it records :COMPLETE and
-the solution count.  Runs last in RUN-PROLOG-BENCH: an overflow is
-unwound, but what it was inside is not the next case's business."
+caught here so the run goes on.  Tabled (PBP-ASSERT-PATH-CLAUSES) it
+records :COMPLETE and the solution count.  Runs last in
+RUN-PROLOG-BENCH: an overflow is unwound, but what it was inside is not
+the next case's business."
   (let ((outcome :complete) (solutions 0))
     (timed-seconds ("recursive-ring-closure")
       (handler-case
@@ -206,14 +222,54 @@ call compiles the shape afresh."
 
 (defun bench-recursive-ring ()
   "Unit 4 (GH #122): a recursive path query around a ring of N nodes.
-The ring closes on itself, so an untabled recursion never finishes; the
-case records its outcome and returns whether or not the bound is hit."
+The ring closes on itself, so an untabled recursion never finishes;
+tabled, the closure completes.  The case records its outcome either way."
   (let ((n (scale 200)))
     (pbp-assert-path-clauses)
     (with-perf-graph (g)
       (let* ((ids (pbp-ring n))
              (*pbp-start* (lookup-vertex (aref ids 0))))
         (pbp-ring-closure)))))
+
+(defun pbp-set-path-tabled (flag)
+  "Table or untable pbp-path/2 when the engine has tabling; a no-op on
+an engine without it, so the before-tabling report still runs."
+  (let ((*package* (find-package '#:graph-db/perf-test)))
+    (cond ((not (fboundp 'graph-db::table-functor)) nil)
+          (flag (funcall 'graph-db::table-functor 'pbp-path 2))
+          (t (funcall 'graph-db::untable-functor 'pbp-path 2)))))
+
+(defun pbp-chain-closure (label)
+  "Time the recursive closure from *PBP-START* down the chain under
+LABEL and record its solution count on the same row."
+  (let* ((solutions 0)
+         (seconds
+           (timed-seconds (label)
+             (setf solutions
+                   (length (graph-db:select (:max-inferences 2000000) (?x)
+                             (lisp ?a *pbp-start*)
+                             (pbp-path ?a ?x)))))))
+    (record label :seconds (float-3 seconds) :solutions solutions)))
+
+(defun bench-tabled-chain ()
+  "Unit 4 (GH #122): the recursive path closure down a chain of N nodes,
+untabled and, when the engine has TABLE-FUNCTOR, tabled.  The chain
+has no cycle, so both finish and the two rows compare the per-call
+cost of a table against a plain recursion.  Leaves pbp-path/2 tabled,
+as PBP-ASSERT-PATH-CLAUSES had it."
+  (let ((n (scale 200)))
+    (pbp-assert-path-clauses)
+    (with-perf-graph (g)
+      (let* ((ids (pbp-chain n))
+             (*pbp-start* (lookup-vertex (aref ids 0))))
+        (unwind-protect
+             (progn
+               (pbp-set-path-tabled nil)
+               (pbp-chain-closure "chain-closure-untabled")
+               (when (fboundp 'graph-db::table-functor)
+                 (pbp-set-path-tabled t)
+                 (pbp-chain-closure "chain-closure-tabled")))
+          (pbp-set-path-tabled t))))))
 
 (defun bench-change-feed-cursor ()
   "Unit 7 (GH #392): a change-feed cursor over claims touched after an
@@ -307,6 +363,7 @@ Binds what RUN-PERF binds (benchmarks.lisp).  Returns T."
                  (bench-change-feed-cursor)
                  (bench-graph-predicates)
                  (bench-traced-k-hop)
+                 (bench-tabled-chain)
                  ;; last: see PBP-RING-CLOSURE
                  (bench-recursive-ring)))
            (write-perf-report output :tag tag))
