@@ -727,6 +727,7 @@ cl-temporal-extent."
                (:file "clause-indexing-tests")
                (:file "tracer-explain-tests")
                (:file "tabling-tests")
+               (:file "aggregation-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")
