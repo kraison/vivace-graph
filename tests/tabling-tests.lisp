@@ -341,3 +341,92 @@ table; once and two-argument if only prune (design D4)."
       (<- (tb-ok3 ?x) (tb-q ?x) (if (tb-ok3 ?x) (true)))
       (graph-db:table-functor 'tb-ok3 1)
       (finishes (select () (?x) (tb-ok3 ?x))))))
+
+;;; Non-local exits, cuts across tables, the budget, dynamic calls
+;;; (design D5).
+
+(defvar *tb-throw-armed* nil
+  "TB-THROW-ONCE returns true once after this is set.")
+
+(defun tb-throw-once ()
+  "True the first time after *TB-THROW-ARMED* was set, then NIL."
+  (prog1 *tb-throw-armed* (setf *tb-throw-armed* nil)))
+
+(test tb-abandoned-tables-are-dropped
+  "A throw out of a table's evaluation, caught outside it, drops the
+half table; a plain call later in the query evaluates afresh and the
+table ends {1, 2}, not {1} (design D5)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-q5 1) (tb-p5 1))
+      (<- (tb-q5 1))
+      (<- (tb-q5 ?x) (lisp ?f (tb-throw-once)) (= ?f t) (throw oops))
+      (<- (tb-q5 2))
+      (<- (tb-p5 ?x) (catch (tb-q5 ?x) oops (= ?x caught)))
+      (<- (tb-p5 ?x) (tb-q5 ?x))
+      (graph-db:table-functor 'tb-q5 1)
+      (graph-db:table-functor 'tb-p5 1)
+      (setf *tb-throw-armed* t)
+      (is (tb-set-equal '((1) (caught) (2))
+                        (select () (?x) (tb-p5 ?x)))))))
+
+(test tb-budget-trips-inside-a-round
+  "The inference budget trips inside a tabled evaluation and the query
+signals PROLOG-RESOURCE-ERROR (design D3, D5)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-edge50 2) (tb-path50 2))
+      (dotimes (i 50)
+        (let ((graph-db::*functor* nil))
+          (graph-db::add-clause
+           (list (list 'tb-edge50 i (mod (1+ i) 50))))))
+      (<- (tb-path50 ?x ?y) (tb-edge50 ?x ?y))
+      (<- (tb-path50 ?x ?z) (tb-edge50 ?x ?y) (tb-path50 ?y ?z))
+      (graph-db:table-functor 'tb-path50 2)
+      (signals graph-db:prolog-resource-error
+        (select (:max-inferences 100) (?x) (tb-path50 0 ?x)))
+      (is (= 50 (length (select (:max-inferences 100000) (?x)
+                          (tb-path50 0 ?x))))))))
+
+(test tb-cut-and-once-across-a-table
+  "once and :limit across a tabled call stop early and leave the table
+whole; a cut inside a tabled clause prunes that evaluation, and a
+clause a later round's cut skips keeps its earlier answers (design D5)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-edge 2) (tb-path 2) (tb-s 1) (tb-c 1) (tb-k 1))
+      (tb-ring-facts)
+      (tb-right-path)
+      (graph-db:table-functor 'tb-path 2)
+      (let ((rows (select (:max-inferences 5000) (?x ?y)
+                    (once (tb-path a ?x)) (tb-path a ?y))))
+        (is (= 6 (length rows)))
+        (is (= 1 (length (remove-duplicates (mapcar #'first rows))))))
+      (is (= 2 (length (select (:limit 2 :max-inferences 5000) (?x)
+                         (tb-path a ?x)))))
+      (<- (tb-s a)) (<- (tb-s b)) (<- (tb-s c))
+      (<- (tb-c ?x) (tb-s ?x) !)
+      (<- (tb-c z))
+      (graph-db:table-functor 'tb-c 1)
+      (is (equal '((a a)) (select () (?x ?y) (tb-c ?x) (tb-c ?y))))
+      ;; Round 1 stores seed; round 2's cut skips the seed clause.
+      (<- (tb-k ?x) (tb-k ?y) (= ?x hit) !)
+      (<- (tb-k seed))
+      (graph-db:table-functor 'tb-k 1)
+      (is (tb-set-equal '((seed) (hit))
+                        (select (:max-inferences 5000) (?x) (tb-k ?x)))))))
+
+(test tb-dynamic-call-is-tabled
+  "A goal built at run time and met through call/1 reaches the tabled
+entry (design D1, D6)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (tb-with-functors ((tb-edge 2) (tb-path 2))
+      (tb-ring-facts)
+      (tb-right-path)
+      (graph-db:table-functor 'tb-path 2)
+      (is (tb-set-equal *tb-ring*
+                        (select (:max-inferences 5000) (?x)
+                          (= ?g (tb-path a ?x)) (call ?g))))
+      ;; task 6: the :table port
+      (skip "task 6 fires the :table port"))))

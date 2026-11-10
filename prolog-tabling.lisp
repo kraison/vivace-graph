@@ -113,33 +113,50 @@ CREATED-AT) are complete (design D3)."
                  (setf (tbl-complete other) t)))
              *tables*)))
 
+(defun %drop-from (tbl)
+  "TBL and every incomplete table created after it leave *TABLES*: an
+evaluation left by a non-local exit built them half (design D5)."
+  (let ((from (tbl-created-at tbl)))
+    (remhash (tbl-key tbl) *tables*)
+    (maphash (lambda (key other)
+               (when (and (not (tbl-complete other))
+                          (> (tbl-created-at other) from))
+                 (remhash key *tables*)))
+             *tables*)))
+
 (defun %evaluate-tbl (tbl functor args)
   "Evaluate TBL per design D3: passes of the dispatcher with TBL on the
 stack; a table that depends on nothing below itself leads, iterating
 while a pass adds an answer anywhere, then completes its component; one
 that depends on an ancestor stays incomplete and hands its leader to
-the table below.  Returns whether TBL completed."
+the table below.  A non-local exit drops the half tables (D5).
+Returns whether TBL completed."
   (let ((parent (first *table-stack*))
-        (completed nil))
-    (let ((*table-stack* (cons tbl *table-stack*)))
-      (setf (tbl-index tbl) (length *table-stack*))
-      (loop
-        (let ((before *answers-added*)
-              (leader nil))
-          (%run-tbl tbl functor args)
-          (setf leader (tbl-leader tbl))
-          (cond ((null leader)
-                 ;; Nothing read was open: one pass is the fixpoint.
-                 (%complete-from tbl)
-                 (setf completed t)
-                 (return))
-                ((not (eq leader tbl))
-                 (return))
-                ((= before *answers-added*)
-                 (%complete-from tbl)
-                 (setf completed t)
-                 (return))
-                (t (incf *round*))))))
+        (completed nil)
+        (returned nil))
+    (unwind-protect
+         (let ((*table-stack* (cons tbl *table-stack*)))
+           (setf (tbl-index tbl) (length *table-stack*))
+           (loop
+             (let ((before *answers-added*)
+                   (leader nil))
+               (%run-tbl tbl functor args)
+               (setf leader (tbl-leader tbl))
+               (cond ((null leader)
+                      ;; Nothing read was open: one pass is the fixpoint.
+                      (%complete-from tbl)
+                      (setf completed t)
+                      (return))
+                     ((not (eq leader tbl))
+                      (return))
+                     ((= before *answers-added*)
+                      (%complete-from tbl)
+                      (setf completed t)
+                      (return))
+                     (t (incf *round*)))))
+           (setf returned t))
+      (unless returned
+        (%drop-from tbl)))
     (unless completed
       (%lower-leader parent (tbl-leader tbl)))
     completed))
