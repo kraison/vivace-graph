@@ -227,3 +227,42 @@ are per expansion (Review Focus 2)."
                                   (and (ag-v ?x)
                                        (not (aggregate-all count (ag-v ?y) 0)))
                                   ?n)))))))
+
+;;; The whole-branch review's findings (2026-11-10).
+
+(test ag-result-compares
+  "A = on the result after a static aggregate compares the value
+(review finding 1): the body is compiled with the result's variables
+bound."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-dropped-functors ((ag-v 1) (ag-w 2))
+      (ag-facts)
+      (is (null (select () (?y)
+                  (aggregate-all count (ag-v ?x) ?n) (= ?n 99) (= ?y yes))))
+      (is (equal '((3))
+                 (select () (?z) (aggregate-all count (ag-v ?x) ?n) (= ?n ?z))))
+      (is (equal '((yes))
+                 (select () (?y)
+                   (aggregate-all count (ag-v ?x) ?n) (= ?n 3) (= ?y yes)))))))
+
+(test ag-min-over-one-non-number-signals
+  "min and max over exactly one non-numeric solution still signal the
+type error (review finding 3)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-dropped-functors ((ag-s 1))
+      (<- (ag-s foo))
+      (is (eq :type-error
+              (handler-case
+                  (progn (select () (?n) (aggregate-all (min ?x) (ag-s ?x) ?n))
+                         :no-error)
+                (graph-db:prolog-error (e)
+                  (first (second (graph-db:prolog-error-ball e)))))))
+      (is (eq :type-error
+              (handler-case
+                  (progn (select () (?n)
+                           (aggregate-all (max ?x ?w) (ag-s ?x) ?n))
+                         :no-error)
+                (graph-db:prolog-error (e)
+                  (first (second (graph-db:prolog-error-ball e))))))))))

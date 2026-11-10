@@ -822,6 +822,9 @@ of count, (sum e), (min e), (max e), (bag t), (set t), (min e w), (max e w)"
   "The aggregate of KIND over ITEMS, the collected templates in solution
 order: (values RESULT OK), OK nil when min or max has nothing to pick."
   (flet ((extreme (less key)
+           ;; Every item checked first: REDUCE over one item never
+           ;; calls the key (the review's finding 3).
+           (mapc key items)
            (if items
                (values (reduce (lambda (a b)
                                  (if (funcall less (funcall key b)
@@ -861,7 +864,11 @@ runtime functor (design D1)."
                    (trail (prolog-gensym "TRAIL"))
                    (value (prolog-gensym "VALUE"))
                    (ok (prolog-gensym "OK"))
-                   (rest-code (compile-body body cont bindings))
+                   ;; The body sees RESULT's variables as bound, else a
+                   ;; later = on them compiles to a no-op alias (the
+                   ;; review's finding 1).
+                   (rest-code (compile-body body cont
+                                           (bind-variables-in result bindings)))
                    (g-code (let ((*functor* barrier) (*clause-cut-flag* nil))
                              (compile-body
                               (list inner

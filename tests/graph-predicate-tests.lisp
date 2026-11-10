@@ -185,3 +185,26 @@ an unbound type fails quietly (design D3)."
                 (gp-ball-formal
                  (lambda () (select () (?x) (k-hop ?a 1 ?x g-knows))))))
         (is (null (select () (?x) (lisp ?a *gp-a*) (k-hop ?a 1 ?x ?t))))))))
+
+;;; The whole-branch review's findings (2026-11-10).
+
+(test gp-k-hop-stops-at-an-empty-frontier
+  "K far past the graph's reach answers at once: the expansion stops
+when a level is empty (review finding 2)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((chain (gp-persons '("x" "y" "z"))))
+      (gp-link (list (cons (first chain) (second chain))
+                     (cons (second chain) (third chain))))
+      (let ((*gp-a* (first chain)))
+        (is (null (select () (?x) (lisp ?a *gp-a*)
+                    (k-hop ?a 1000000000000 ?x g-knows))))))))
+
+(test gp-reachable-clauses-reload-once
+  "Loading prolog-graph-predicates.lisp again leaves reachable/3 with
+its two clauses, tabled (review finding 4)."
+  (load (asdf:system-relative-pathname
+         :graph-db "prolog-graph-predicates.lisp"))
+  (let ((f (lookup-functor (make-functor-symbol 'graph-db::reachable 3))))
+    (is (= 2 (length (graph-db::functor-clauses f))))
+    (is-true (graph-db:functor-tabled-p 'graph-db::reachable 3))))

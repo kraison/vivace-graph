@@ -46,6 +46,9 @@ integer, not ~S" k)
              (setf (gethash (id from) seen) t)
              (dotimes (level k)
                (declare (ignorable level))
+               ;; An empty level stays empty: stop, so the cost is the
+               ;; visited set's, not K's (the review's finding 2).
+               (when (null frontier) (return))
                (let ((next '()))
                  (dolist (v frontier)
                    (map-edges (lambda (edge)
@@ -64,8 +67,11 @@ integer, not ~S" k)
 ;;; reachable/3: two clauses in the GRAPH-DB package, left-recursive
 ;;; (one table per start, constant stack: tabling design D8), tabled
 ;;; at load.  A query in any package resolves the name here, as it
-;;; resolves is-a.
+;;; resolves is-a.  A reload resets the functor first, so the clauses
+;;; are never doubled (the review's finding 4).
 (let ((*package* (find-package '#:graph-db)))
+  (let ((existing (lookup-functor (make-functor-symbol 'reachable 3))))
+    (when existing (reset-functor existing)))
   (<- (reachable ?a ?b ?type) (%closure-args ?a ?type)
                               (outgoing-edges ?a ?type ?e ?b))
   (<- (reachable ?a ?c ?type) (reachable ?a ?b ?type)
