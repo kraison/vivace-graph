@@ -3025,3 +3025,22 @@ reached, one derived."
                             :head *rl5-linked-head* :body *rl5-k-hop-body*))
            (report (graph-db.rules:run-rule g r)))
       (is (= 1 (graph-db.rules:rule-report-derived report))))))
+
+;;; The compiled query cache in the rules lane (GH #376, design D5)
+
+(test cq-rules-rounds-use-the-cache
+  "A rule run twice compiles its body's shape once and runs it
+compiled the second time, deriving the same claims."
+  (with-rules-graph (g)
+    (seed g)
+    (graph-db:clear-query-cache)
+    (let* ((r (write-web-hosts g))
+           (first (graph-db.rules:run-rule g r))
+           (second (graph-db.rules:run-rule g r))
+           (stats (graph-db:query-cache-stats)))
+      (is (= 2 (graph-db.rules:rule-report-derived first)))
+      (is (= 2 (graph-db.rules:rule-report-kept second)))
+      (is (= 0 (graph-db.rules:rule-report-swept second)))
+      (is (plusp (getf stats :compiles)))
+      (is (plusp (getf stats :hits)))
+      (is (= 2 (length (derived g 'rt-claim "web-hosts")))))))
