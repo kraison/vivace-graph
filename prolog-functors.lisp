@@ -570,6 +570,19 @@ order and duplicates."
 order of terms with duplicates removed."
   (%solve-aggregate template goal result cont t))
 
+(def-global-prolog-functor aggregate-all/3 (spec goal result cont)
+  "(aggregate-all Spec Goal Result): count, (sum E), (min E), (max E),
+(bag T), (set T), (min E W) or (max E W) over every solution of GOAL,
+binding nothing of GOAL's; min and max fail over no solution.  The
+runtime form; a static GOAL compiles inline (GH #123, design D1)."
+  (multiple-value-bind (kind template) (%aggregate-spec (deref-exp spec))
+    (multiple-value-bind (value ok)
+        (%aggregate-result kind (%findall-list template (var-deref goal)))
+      (when ok
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify result value) (funcall cont))
+          (undo-bindings old-trail))))))
+
 (def-global-prolog-functor show-prolog-vars/2 (var-names vars cont)
   (if (null vars)
       (format t "~&Yes")

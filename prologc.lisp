@@ -779,6 +779,126 @@ barrier; a cut in Then or Else cuts the enclosing clause."
                          (undo-bindings ,trail)
                          ,(compile-body (cons else body) cont bindings))))))))))
 
+;;; aggregate-all/3 (GH #123, aggregation design D1).  The validator and
+;;; the result function serve the compiler macro and the runtime functor.
+
+(defun %aggregate-spec (spec)
+  "SPEC's kind and template: (values KIND TEMPLATE) with KIND one of
+:COUNT :SUM :MIN :MAX :BAG :SET :MIN-W :MAX-W and TEMPLATE the term
+collected per solution (T for count, (E W) for the witness forms).
+Words match by name from any package.  Anything else signals
+PROLOG-ERROR with a domain-error ball."
+  (let* ((head (if (consp spec) (first spec) spec))
+         (name (and (symbolp head) (not (var-p head)) (symbol-name head)))
+         (n (if (consp spec) (length (rest spec)) 0)))
+    (flet ((word-p (w) (and name (string= name w))))
+      (cond ((and (word-p "COUNT") (= n 0)) (values :count t))
+            ((and (= n 1) (word-p "SUM")) (values :sum (second spec)))
+            ((and (= n 1) (word-p "MIN")) (values :min (second spec)))
+            ((and (= n 1) (word-p "MAX")) (values :max (second spec)))
+            ((and (= n 1) (word-p "BAG")) (values :bag (second spec)))
+            ((and (= n 1) (word-p "SET")) (values :set (second spec)))
+            ((and (= n 2) (word-p "MIN"))
+             (values :min-w (list (second spec) (third spec))))
+            ((and (= n 2) (word-p "MAX"))
+             (values :max-w (list (second spec) (third spec))))
+            (t (error 'prolog-error
+                      :reason (format nil "unknown aggregate spec ~S; one ~
+of count, (sum e), (min e), (max e), (bag t), (set t), (min e w), (max e w)"
+                                      spec)
+                      :ball (iso-ball (list :domain-error :aggregate-spec
+                                            spec))))))))
+
+(defun %aggregate-number (x)
+  "X dereferenced as a number, else PROLOG-ERROR with a type-error ball."
+  (let ((x (var-deref x)))
+    (if (numberp x)
+        x
+        (error 'prolog-error
+               :reason (format nil "aggregate over a non-number ~S" x)
+               :ball (type-error-ball :number x)))))
+
+(defun %aggregate-result (kind items)
+  "The aggregate of KIND over ITEMS, the collected templates in solution
+order: (values RESULT OK), OK nil when min or max has nothing to pick."
+  (flet ((extreme (less key)
+           ;; Every item checked first: REDUCE over one item never
+           ;; calls the key (the review's finding 3).
+           (mapc key items)
+           (if items
+               (values (reduce (lambda (a b)
+                                 (if (funcall less (funcall key b)
+                                              (funcall key a))
+                                     b
+                                     a))
+                               items)
+                       t)
+               (values nil nil))))
+    (ecase kind
+      (:count (values (length items) t))
+      (:sum (values (reduce #'+ items :key #'%aggregate-number) t))
+      (:min (extreme #'< #'%aggregate-number))
+      (:max (extreme #'> #'%aggregate-number))
+      (:bag (values items t))
+      (:set (values (%sort-unique items) t))
+      (:min-w (extreme #'< (lambda (i) (%aggregate-number (first i)))))
+      (:max-w (extreme #'> (lambda (i) (%aggregate-number (first i))))))))
+
+(def-prolog-compiler-macro aggregate-all (goal body cont bindings)
+  "(aggregate-all SPEC GOAL RESULT) with GOAL static: GOAL under an
+opaque barrier and the negation floor, every solution collected through
+an internal %AGGREGATE-STEP goal compiled inside GOAL's walk (so a
+compile-time alias reaches the template), bindings undone, the result
+unified with RESULT, then the body.  A non-static GOAL passes to the
+runtime functor (design D1)."
+  (let ((args (args goal)))
+    ;; A variable SPEC is the runtime functor's to validate.
+    (if (or (/= 3 (length args))
+            (variable-p (first args))
+            (not (static-goal-p (second args))))
+        :pass
+        (destructuring-bind (spec inner result) args
+          (multiple-value-bind (kind template) (%aggregate-spec spec)
+            (let* ((barrier (prolog-gensym "AGG"))
+                   (acc (prolog-gensym "ACC"))
+                   (trail (prolog-gensym "TRAIL"))
+                   (value (prolog-gensym "VALUE"))
+                   (ok (prolog-gensym "OK"))
+                   ;; The body sees RESULT's variables as bound, else a
+                   ;; later = on them compiles to a no-op alias (the
+                   ;; review's finding 1).
+                   (rest-code (compile-body body cont
+                                           (bind-variables-in result bindings)))
+                   (g-code (let ((*functor* barrier) (*clause-cut-flag* nil))
+                             (compile-body
+                              (list inner
+                                    (list '%aggregate-step acc kind template))
+                              cont bindings))))
+              `(let ((,trail (fill-pointer *trail*))
+                     (,acc ,(if (eq kind :count) '(list 0) nil)))
+                 (with-negation-floor () (block ,barrier ,g-code))
+                 (undo-bindings ,trail)
+                 (multiple-value-bind (,value ,ok)
+                     ,(if (eq kind :count)
+                          `(values (car ,acc) t)
+                          `(%aggregate-result ,kind (nreverse ,acc)))
+                   (when ,ok
+                     (when (unify ,(compile-arg result bindings) ,value)
+                       ,rest-code)
+                     (undo-bindings ,trail))))))))))
+
+(def-prolog-compiler-macro %aggregate-step (goal body cont bindings)
+  "Internal: (%aggregate-step ACC KIND TEMPLATE) at the end of an
+aggregate's goal counts a solution into the Lisp variable ACC or pushes
+the template's snapshot, and returns NIL so the goal backtracks.
+Compiled inside the goal's walk, hence BINDINGS (design D1)."
+  (declare (ignore body cont))
+  (destructuring-bind (acc kind template) (args goal)
+    (if (eq kind :count)
+        `(progn (incf (car ,acc)) nil)
+        `(progn (push (deref-exp ,(compile-arg template bindings)) ,acc)
+                nil))))
+
 (def-prolog-compiler-macro forall (goal body cont bindings)
   "(forall Cond Action): succeed (continuing the body) iff Action succeeds for
 every solution of Cond.  Compiled as (not (and Cond (not Action))), which reuses
@@ -1376,11 +1496,15 @@ compile-time path (GH #285, #279)."
     (labels ((walk (goal)
                (when (and (consp goal) (symbolp (first goal)))
                  (let ((head (first goal)))
-                   (if (member head '(and or not if when unless))
-                       (mapc #'walk (rest goal))
-                       (push (make-functor-symbol head
-                                                  (length (rest goal)))
-                             acc))))))
+                   (cond ((member head '(and or not if when unless))
+                          (mapc #'walk (rest goal)))
+                         ;; (aggregate-all spec GOAL result): the goal.
+                         ((and (string= (symbol-name head) "AGGREGATE-ALL")
+                               (= 3 (length (rest goal))))
+                          (walk (third goal)))
+                         (t (push (make-functor-symbol head
+                                                       (length (rest goal)))
+                                  acc)))))))
       (mapc #'walk goals))
     acc))
 

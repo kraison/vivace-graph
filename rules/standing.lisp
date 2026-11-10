@@ -42,6 +42,10 @@
     ;; the query's solutions
     ("unique/1" . :meta)
     ("findall/3" . :meta) ("bagof/3" . :meta) ("setof/3" . :meta)
+    ("aggregate-all/3" . :meta)
+    ;; the graph predicates (GH #123): reads of the edge indexes
+    ("reachable/3" . :store-read) ("k-hop/4" . :store-read)
+    ("%closure-args/2" . :test)
     ("call/1" . :meta) ("catch/3" . :meta) ("throw/1" . :meta)
     ("map-query/5" . :meta) ("select/2" . :meta)
     ("show-prolog-vars/2" . :meta)

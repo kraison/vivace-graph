@@ -987,6 +987,24 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 | ~(<edge-name> ?from ?to ?weight)~           | Also unifies ~?weight~ with the edge's weight.                  |
 | ~(outgoing-edges ?vertex ?edge-var)~        | Finds all outgoing edges from ~?vertex~.                        |
 | ~(incoming-edges ?vertex ?edge-var)~        | Finds all incoming edges.                                       |
+| ~(reachable ?from ?to edge-type)~           | Every vertex reachable from the bound ~?from~ by one or more ~edge-type~ edges, each once; tabled, so it terminates on a cycle (GH #123). |
+| ~(k-hop ?from k ?to edge-type)~             | The distinct vertices at distance exactly ~k~ from ~?from~ along ~edge-type~ edges; ~k~ = 0 is ~?from~. |
+
+~reachable~ and ~k-hop~ need a bound start and a bound edge type: an
+unbound start or type signals an instantiation error (~k-hop~ fails
+quietly on an unbound type). Weighted shortest paths, distances,
+components and rankings are the ~graph-db/algorithms~ predicates of
+Chapter 14 (~shortest-path/4~, ~distance/3~, ~reachable/2~, ...).
+
+*Example:* everyone Bob can reach through ~follows~, and how many.
+#+BEGIN_SRC lisp
+  (select-flat (?x)
+    (is-a ?bob user) (node-slot-value ?bob username "bob")
+    (reachable ?bob ?x follows))
+  (select-flat (?n)
+    (is-a ?bob user) (node-slot-value ?bob username "bob")
+    (aggregate-all count (reachable ?bob ?x follows) ?n))
+#+END_SRC
 
 *Example:* Find all users who follow Bob.
 #+BEGIN_SRC lisp
@@ -1019,6 +1037,14 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 | ~(lisp ?var lisp-expression)~           | Evaluates the Lisp expression and unifies the result with ~?var~.        |
 | ~(or goal1 goal2 ... )~                 | Succeeds if /any/ of the goals succeed.                                  |
 | ~(not goal)~                            | Succeeds if the nested ~goal~ fails.                                     |
+| ~(aggregate-all spec goal ?result)~     | ~spec~ is ~count~, ~(sum ?e)~, ~(min ?e)~, ~(max ?e)~, ~(bag ?t)~, ~(set ?t)~, ~(min ?e ?w)~ or ~(max ?e ?w)~: the aggregate over every solution of ~goal~, which binds nothing. ~count~, ~sum~, ~bag~ and ~set~ always succeed (0, 0, nil, nil over none); ~min~ and ~max~ fail over none; the witness forms bind ~(e w)~ (GH #123). |
+
+A written-out ~goal~ compiles inline (no meta-call, so it is admitted
+in guarded text and under ~:effects nil~); a goal or spec in a
+variable goes through the runtime functor, like ~findall~. An
+aggregate reads its goal's tables as closed, so over a tabled
+predicate's own recursive component it is refused like ~not~ (the
+tabled predicates section).
 
 *Example:* Use the powerful `lisp` predicate to find posts with more than 10 characters.
 #+BEGIN_SRC lisp
@@ -1185,6 +1211,11 @@ Tables live for one query: ~select~ and ~?-~ bind them fresh and drop
 them on exit, so a clause asserted between two queries is seen by the
 second, and a ~:write~ effect inside a query (~retract~) is not seen by
 a table that query already built. Threads never share a table.
+
+The engine's own tabled predicate is ~reachable/3~ (the built-in
+tables above): two left-recursive clauses over ~outgoing-edges/4~,
+one table per start, which is the shape to copy for a closure of your
+own.
 
 Measured on odm (SBCL 2.6.6, third of three runs,
 ~tests/perf/results/prolog-after-u4-odm-d5eaa6e.report~): the 200-node
@@ -2783,6 +2814,10 @@ so every caller gets the guard, not only this surface):
   the runtime functor behind it meta-calls whatever the variable holds.
   Writing the goal out in full keeps all of them on the compile-time
   path. ~(not (node-slot-value ?p name "Alice"))~ is fine.
+  ~aggregate-all~ is admitted by position (GH #123): its spec must be
+  a literal (~count~, ~(sum ?e)~, ...) and its goal written out, so
+  ~(aggregate-all count (is-a ?i item) ?n)~ answers and
+  ~(aggregate-all ?s ?g ?n)~ is refused naming the position.
 
 All three lists name *engine* predicates, so they are matched two ways,
 independently. By **home**: only against registry entries homed in
@@ -3922,6 +3957,15 @@ The native algorithms are also exposed as Prolog functors, so analysis composes 
 #+END_SRC
 
 The predicates are ~shortest-path/4~ (From To Path Cost), ~distance/3~, ~reachable/2~, ~connected-component/2~, ~degree/2~, ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~. They are pure reads, so they run even under a read-only ~:effects nil~ query. (As with any functor, a query written in a package other than ~graph-db~ must import the predicate's ~name/arity~ symbol — see Chapter 7.)
+
+~reachable/2~ here and the engine's ~reachable/3~ (Chapter 6) are
+different predicates: ~reachable/2~ is a yes/no Dijkstra check between
+two bound vertices over every edge type; ~reachable/3~ enumerates the
+closure from a bound start over one edge type through a per-query
+table, composes with other goals, and is admitted in guarded text.
+On the unit 5 bench (GH #123, odm) ~shortest-path/4~ answers 100
+pairs at 961/s where a hand-written Lisp breadth-first search ran at
+224 to 1,064/s.
 
 *** Caveats
 

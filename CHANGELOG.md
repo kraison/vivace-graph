@@ -16,6 +16,22 @@ storage formats (#60).
 
 ### Added
 
+- **`aggregate-all/3`, `reachable/3`, `k-hop/4`** (#123): `aggregate-all`
+  with `count`, `(sum ?e)`, `(min ?e)`, `(max ?e)`, `(bag ?t)`,
+  `(set ?t)` and the witness forms `(min ?e ?w)`, `(max ?e ?w)` over a
+  goal's solutions; a written-out goal compiles inline and is admitted
+  in guarded query text and rule bodies by position (a literal spec, a
+  static goal), a goal or spec in a variable runs through the runtime
+  functor like `findall`. `reachable/3` is the engine's tabled closure
+  over one edge type from a bound start (one table per query and
+  start; an unbound start or type is an instantiation error); `k-hop/4`
+  the distinct vertices at distance exactly K. On the bench the
+  three-hop query went from 1,064/s as a chain of edge goals to
+  33,333/s as `k-hop`; `shortest-path/4` (`graph-db/algorithms`,
+  unchanged) measured at 961/s beside a Lisp BFS. The internal `%unfloor`
+  and `%aggregate-step` compiler macros are excluded from free text;
+  `explain-goals` explains an aggregate's goal one level in;
+  `tests/rules/run-test.sh` loads its own checkout.
 - **Tabled predicates: `table-functor`, `untable-functor`,
   `functor-tabled-p`** (#122): a declared user functor's calls are
   memoised per query in variant tables and evaluated to a fixpoint by

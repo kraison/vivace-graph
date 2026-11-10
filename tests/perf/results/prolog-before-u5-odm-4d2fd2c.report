@@ -1,0 +1,14 @@
+;;;; graph-db perf report
+;;;; tag=before-u5-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; k-hop-3-select                         OPS 100  SECONDS 0.094  OPS/S 1064  
+;; shortest-path-lisp-bfs                 OPS 100  SECONDS 0.15  OPS/S 667  
+;; reachable-closure-handwritten          OPS 100  SECONDS 0.769  OPS/S 130  
+;; aggregate-count-findall                OPS 100  SECONDS 0.002  OPS/S 50000  
+
+(:PERF-REPORT :TAG "before-u5-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION
+ 5 :HOST "odm" :ENTRIES
+ (("k-hop-3-select" :OPS 100 :SECONDS 0.094 :OPS/S 1064)
+  ("shortest-path-lisp-bfs" :OPS 100 :SECONDS 0.15 :OPS/S 667)
+  ("reachable-closure-handwritten" :OPS 100 :SECONDS 0.769 :OPS/S 130)
+  ("aggregate-count-findall" :OPS 100 :SECONDS 0.002 :OPS/S 50000)))

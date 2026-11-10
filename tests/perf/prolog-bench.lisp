@@ -30,6 +30,9 @@
 (defvar *pbp-start* nil
   "The start vertex a path or hop query reads through (lisp ...).")
 
+(defvar *pbp-goal* nil
+  "The target vertex a shortest-path query reads through (lisp ...).")
+
 (defmacro with-perf-prolog-graph ((g) &body body)
   "A fresh on-disk graph holding PBP-CLAIM claims."
   (let ((d (gensym "DIR")))
@@ -311,6 +314,31 @@ costs when it is on; the untraced rows are the before-and-after."
                      (p-knows ?s ?b) (p-knows ?b ?c) (p-knows ?c ?d)))))
           (graph-db:untrace-prolog))))))
 
+(defun pbp-assert-lpath-clauses ()
+  "pbp-lpath/2: the left-recursive tabled closure a reader writes by
+hand today (GH #123, unit 5's before), once per image."
+  (let ((sym (find-symbol "PBP-LPATH/2" (find-package '#:graph-db/perf-test))))
+    (unless (and sym (graph-db::lookup-functor sym))
+      (let ((*package* (find-package '#:graph-db/perf-test)))
+        (graph-db::<- (pbp-lpath ?a ?b) (p-knows ?a ?b))
+        (graph-db::<- (pbp-lpath ?a ?c) (pbp-lpath ?a ?b) (p-knows ?b ?c))
+        (graph-db::table-functor 'pbp-lpath 2)))))
+
+(defun pbp-registered-p (name arity &key user)
+  "True when the engine registers NAME/ARITY: a global functor, or
+with USER a user functor (reachable/3 is asserted, not defined)."
+  (let ((sym (find-symbol (format nil "~A/~D" name arity) :graph-db)))
+    (and sym
+         (if user
+             (graph-db::lookup-functor sym)
+             (nth-value 1 (gethash sym graph-db::*prolog-global-functors*))))))
+
+(defun pbp-compile-select (form)
+  "FORM, a select, compiled once under the perf package; a function of
+no arguments.  For rows whose predicate may not exist in this image."
+  (let ((*package* (find-package '#:graph-db/perf-test)))
+    (compile nil `(lambda () ,form))))
+
 (defun bench-graph-predicates ()
   "Unit 5 (GH #123): a ring with chords.  A hand-written three-hop select
 from varying starts (the query k_hop/4 will replace), and a Lisp
@@ -334,7 +362,54 @@ will wrap).  Starts and pairs are looked up before the timers start."
                 (p-knows ?s ?b) (p-knows ?b ?c) (p-knows ?c ?d)))))
         (timed-ops ("shortest-path-lisp-bfs" kb)
           (dolist (p pairs)
-            (pbp-bfs (car p) (cdr p))))))))
+            (pbp-bfs (car p) (cdr p))))
+        ;; Unit 5's before rows: the closure and the count a reader
+        ;; writes by hand (GH #123).
+        (pbp-assert-lpath-clauses)
+        (timed-ops ("reachable-closure-handwritten" k)
+          (dolist (s starts)
+            (let ((*pbp-start* s))
+              (graph-db:select (:max-inferences 200000) (?x)
+                (lisp ?a *pbp-start*) (pbp-lpath ?a ?x)))))
+        (timed-ops ("aggregate-count-findall" k)
+          (dolist (s starts)
+            (let ((*pbp-start* s))
+              (graph-db:select-flat (?n) (lisp ?s *pbp-start*)
+                (findall ?c (and (p-knows ?s ?b) (p-knows ?b ?c)) ?l)
+                (lisp ?n (length '?l))))))
+        ;; The after rows, each when its predicate exists in this image.
+        (when (pbp-registered-p "K-HOP" 4)
+          (let ((run (pbp-compile-select
+                      '(graph-db:select-flat (?d) (lisp ?s *pbp-start*)
+                        (k-hop ?s 3 ?d p-knows)))))
+            (timed-ops ("k-hop-3-predicate" k)
+              (dolist (s starts)
+                (let ((*pbp-start* s)) (funcall run))))))
+        (when (pbp-registered-p "REACHABLE" 3 :user t)
+          (let ((run (pbp-compile-select
+                      '(graph-db:select (:max-inferences 200000) (?x)
+                        (lisp ?a *pbp-start*) (reachable ?a ?x p-knows)))))
+            (timed-ops ("reachable-predicate" k)
+              (dolist (s starts)
+                (let ((*pbp-start* s)) (funcall run))))))
+        (when (pbp-registered-p "AGGREGATE-ALL" 3)
+          (let ((run (pbp-compile-select
+                      '(graph-db:select-flat (?n) (lisp ?s *pbp-start*)
+                        (aggregate-all count
+                                       (and (p-knows ?s ?b) (p-knows ?b ?c))
+                                       ?n)))))
+            (timed-ops ("aggregate-count-predicate" k)
+              (dolist (s starts)
+                (let ((*pbp-start* s)) (funcall run))))))
+        (when (pbp-registered-p "SHORTEST-PATH" 4)
+          (let ((run (pbp-compile-select
+                      '(graph-db:select (:flat nil) (?p ?c)
+                        (lisp ?a *pbp-start*) (lisp ?b *pbp-goal*)
+                        (shortest-path ?a ?b ?p ?c)))))
+            (timed-ops ("shortest-path-predicate" kb)
+              (dolist (p pairs)
+                (let ((*pbp-start* (car p)) (*pbp-goal* (cdr p)))
+                  (funcall run))))))))))
 
 (defun run-prolog-bench (&key (scale *perf-scale*) (tag "prolog")
                               (output (report-pathname tag))

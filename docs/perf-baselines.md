@@ -188,3 +188,32 @@ GH #255.)
   an acyclic query, about a third. The spine row is deferred to unit 5
   (#122: a bare bench image cannot open the application's store
   without its schema classes).
+- **Unit 5, aggregation and graph predicates, the before** (#123):
+  `results/prolog-before-u5-odm-4d2fd2c.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, engine at the unit 4
+  merge. `bench-graph-predicates` gains two hand-written rows:
+  `reachable-closure-handwritten`, a left-recursive tabled `pbp-lpath/2`
+  closure from 100 starts over the 200-node chords ring, 130/s (runs 1
+  and 2: 147, 128), and `aggregate-count-findall`, `findall` plus a
+  `lisp` length over each start's two-hop neighbourhood, 50,000/s (a
+  neighbourhood of one to four paths). The existing rows on this
+  engine: `k-hop-3-select` 1,064/s (1,266, 1,163; the unit 3 report
+  read 2,273/s on the pre-tabling engine, so the after is read against
+  this run, not that one) and `shortest-path-lisp-bfs` 667/s (800,
+  654). The case records `k-hop-3-predicate`, `reachable-predicate`,
+  `aggregate-count-predicate` and `shortest-path-predicate` when the
+  predicates exist in the image.
+- **Unit 5, aggregation and graph predicates, after** (#123):
+  `results/prolog-after-u5-odm-faacd94.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `graph-db/algorithms`
+  loaded. `k-hop-3-predicate` 33,333/s (runs 1 and 2: 20,000, 25,000)
+  against `k-hop-3-select` 1,064/s: distinct nodes at distance 3
+  against one row per walk, so the work differs, but this is the query
+  a reader writes either way. `shortest-path-predicate` 961/s (1,020,
+  752) against `shortest-path-lisp-bfs` 224/s (1,064, 238; the BFS row
+  is noisy on this host). `reachable-predicate` 244/s (216, 220)
+  against the hand-written closure's 245/s: the same tabled shape made
+  a predicate. `aggregate-count-predicate` 50,000/s (33,322, 33,333)
+  against `findall` plus `lisp` at 50,000/s: a one-to-four-path
+  neighbourhood either way. The spine row stays deferred (#123: the
+  predicate reaches the application's image with the release).

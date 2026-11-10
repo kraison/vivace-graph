@@ -179,6 +179,20 @@ a table file in the same scratch directory; tear both down afterwards."
 
 (defparameter *integration-graph-name* :graph-db-integration-test)
 
+(defun %drop-functor (name arity)
+  "Remove the user functor NAME/ARITY if it is registered."
+  (let ((f (lookup-functor (make-functor-symbol name arity))))
+    (when f (delete-functor f))))
+
+(defmacro with-dropped-functors ((&rest name-arities) &body body)
+  "BODY with each (NAME ARITY) user functor dropped before and after:
+asserted functors are image-global.  The CI- and TB- copies in the
+clause-indexing and tabling suites predate it (GH #123)."
+  `(progn
+     ,@(loop for (n a) in name-arities collect `(%drop-functor ',n ,a))
+     (unwind-protect (progn ,@body)
+       ,@(loop for (n a) in name-arities collect `(%drop-functor ',n ,a)))))
+
 (defmacro with-test-graph ((g) &body body)
   (let ((dir (gensym "DIR")))
     `(with-temp-directory (,dir)
