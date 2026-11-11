@@ -85,7 +85,13 @@ In spacetime/claim-query.lisp:
   page as `claims-by-producer` does, second value T past the cut. The
   scan starts at AFTER's key inclusive and drops the equal instant by
   value, so a cursor read back from the feed never repeats its row.
-  An unregistered CLAIM-CLASS signals `unknown-claim-family`.
+  `map-index` runs `:start` through the canonicalizer, which reads a
+  stored sexp, so the start bound is a synthetic open extent at AFTER
+  (`extent->sexp` of `%open-transaction-extent`), whose touched key is
+  AFTER's; the canonicalizer's domain stays "a stored extent sexp".
+  An unregistered CLAIM-CLASS signals `unknown-claim-family`; a graph
+  whose schema does not declare the family signals the index's own
+  `query-precondition-error`, as `claims-by-producer` does.
 
 Exported from `graph-db.spacetime` with the other readers.
 
@@ -97,24 +103,43 @@ Exported from `graph-db.spacetime` with the other readers.
   and succeeds when that instant is after ?after (`%instant-arg`; an
   unbound or NIL ?after fails, a malformed one signals as the instant
   comparisons do).
-- ?c unbound, ?after bound: a generator. For each store in scope, own
-  store first (`*claim-scope*`, GH #332), for the family ?family names
-  when bound (a parent class name, `%family-or-ill-typed`) else every
-  registered family, `claims-touched-after` from ?after, in that
-  order; a foreign store lacking the family contributes nothing, as
-  `%scope-lookup`. Candidates pass `%exclude-producers`, and this run's
-  own derivation (`%derived-all`) touched after ?after follows, so a
-  fixpoint round reads the same facts whichever goal generates
-  (GH #333). Each solution binds ?c and ?t.
+- ?c unbound, ?after bound: a generator over `claims-touched-after`
+  from ?after in every store in scope (`*claim-scope*`, GH #332). With
+  ?family bound (a parent class name, `%family-or-ill-typed`) it reads
+  that family under `%scope-lookup`'s store rule: the own store
+  signals when its schema lacks the family, a foreign store contributes
+  nothing. With ?family unbound it reads every registered family and
+  skips, on every store, a family that store does not declare: the
+  reader named no family, so no family can be ill-typed for it, and an
+  image hosting two tenants' families under two graph names must not
+  refuse one tenant's feed over the other's schema. The per-store,
+  per-family lists are merged into **one ascending sequence by touched
+  instant**, ties in scope order then family order, because a feed
+  that advances its cursor to the largest ?t of a page must never skip
+  an older-but-after-cursor row of a second store. Candidates pass
+  `%exclude-producers`, and this run's own derivation (`%derived-all`)
+  touched after ?after follows last, so a fixpoint round reads the same
+  facts whichever goal generates (GH #333). Each solution binds ?c and
+  ?t.
 - ?c unbound, ?after unbound: no solutions, which is what the unfused
   pair answers. Never a cost-unbounded refusal: the index is the route.
 
 Writable by hand from text and from Lisp, as `claim-after/9` is;
 refused as a rule premise by `compile-rule` with the sibling message
 ("write claim-touched-at and the comparison, the compiler fuses them");
-standing class `:withheld`. `explain-goals` reports it: "that claim"
-with ?c bound, else "touched-at index of FAMILY from the cursor" or
-"touched-at index of every family from the cursor".
+standing class `:withheld`. `explain-goals` reports the hand-written
+goal, as it does `claim-after/9` (the explainers do not run the
+rewriters): "that claim" with ?c bound, else "touched-at index of
+FAMILY from the cursor" or "touched-at index of every family from the
+cursor".
+
+`compile-rule` also refuses a rule body in which a `claim-touched-at`
+goal's claim variable is bound by no `claim/7` or `claim-absent/7`
+premise of the body ("claim-touched-at reads a premise's claim: bind ?c
+with claim/7 first"). Today such a pair is a dead filter that yields
+nothing; after D4 it would be shape 2, a generator the reads and strata
+analysis never counted. The rules lane orders generators first, so
+this is exactly the condition under which shape 2 would fuse there.
 
 ### D4. The rewrite
 
@@ -142,7 +167,10 @@ arm would equal the pair), a goal between the three, the pair inside
 shape 1 is sound because ?c is fresh: the conjunction's solution set is
 the same, and D3's exclusion and derivation rules keep it so inside a
 fixpoint round. Solution order changes to ascending touched instant,
-the order a feed wants; docs/rules.md "Solution order" says so.
+the order a feed wants; docs/rules.md "Solution order" says so, and
+`*clause-body-rewriters*`' docstring, which promises the same order
+today, is amended to "the same solutions; the order only where the
+rewriter's own documentation says so".
 
 A lifted literal (unit 6) arrives as a variable bound by
 `%bind-literals`, the first goal, so a cached shape fuses the same way.
@@ -177,7 +205,9 @@ docs/perf-baselines.md's unit entry.
   `def-claim-classes`; a retraction and a re-open move the row; the
   pre-axis and `:unbounded` cases; an open transaction's own write),
   tests/rules for D3 and D4 (both shapes take the index, proven by
-  counting `%namespace-route` calls through a `notinline` swap as the
-  #451 cost tests do; exclusion under `*claim-exclude-producers*`; two
-  stores in scope; the unbound-cursor case; the rule-body refusal; the
-  explain row; the guarded text, compiled on its second call).
+  `counting-lookups` (tests/rules/suite.lisp): zero `%scope-lookup`
+  calls where the namespace route pays one per key; exclusion under
+  `*claim-exclude-producers*`; two stores in scope in one ascending
+  sequence; an own store lacking a family with ?family unbound; the
+  unbound-cursor case; both rule-body refusals; the explain row; the
+  guarded text, compiled on its second call).
