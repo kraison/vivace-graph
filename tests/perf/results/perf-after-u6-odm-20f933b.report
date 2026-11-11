@@ -1,0 +1,33 @@
+;;;; graph-db perf report
+;;;; tag=after-u6-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; guarded-shape-repeat                   OPS 500  SECONDS 0.267  OPS/S 1873  
+;; guarded-goals-repeat-interpreted       OPS 500  SECONDS 0.063  OPS/S 7936  
+;; guarded-goals-repeat-compiled          OPS 500  SECONDS 0.042  OPS/S 11904  
+;; claim-writes-unlinked                  OPS 4000  SECONDS 4.205  OPS/S 951  
+;; claim-sweep-backfill                   SECONDS 21.482  
+;; claim-sweep-backfill-linked            EDGES 8000  
+;; claim-writes-linked                    OPS 4000  SECONDS 12.658  OPS/S 316  
+;; two-hop-related                        OPS 200  SECONDS 0.214  OPS/S 935  
+;; two-hop-node-claims                    OPS 200  SECONDS 0.042  OPS/S 4762  
+;; two-hop-claim-endpoint                 OPS 200  SECONDS 0.031  OPS/S 6451  
+;; two-hop-claims-touching                OPS 200  SECONDS 0.059  OPS/S 3390  
+;; two-hop-speedup-lisp                   RATIO 1.405  
+;; two-hop-speedup-prolog                 RATIO 0.276  
+;; rules-rerun                            OPS 20  SECONDS 11.367  OPS/S 2  
+
+(:PERF-REPORT :TAG "after-u6-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 5
+ :HOST "odm" :ENTRIES
+ (("guarded-shape-repeat" :OPS 500 :SECONDS 0.267 :OPS/S 1873)
+  ("guarded-goals-repeat-interpreted" :OPS 500 :SECONDS 0.063 :OPS/S 7936)
+  ("guarded-goals-repeat-compiled" :OPS 500 :SECONDS 0.042 :OPS/S 11904)
+  ("claim-writes-unlinked" :OPS 4000 :SECONDS 4.205 :OPS/S 951)
+  ("claim-sweep-backfill" :SECONDS 21.482)
+  ("claim-sweep-backfill-linked" :EDGES 8000)
+  ("claim-writes-linked" :OPS 4000 :SECONDS 12.658 :OPS/S 316)
+  ("two-hop-related" :OPS 200 :SECONDS 0.214 :OPS/S 935)
+  ("two-hop-node-claims" :OPS 200 :SECONDS 0.042 :OPS/S 4762)
+  ("two-hop-claim-endpoint" :OPS 200 :SECONDS 0.031 :OPS/S 6451)
+  ("two-hop-claims-touching" :OPS 200 :SECONDS 0.059 :OPS/S 3390)
+  ("two-hop-speedup-lisp" :RATIO 1.405) ("two-hop-speedup-prolog" :RATIO 0.276)
+  ("rules-rerun" :OPS 20 :SECONDS 11.367 :OPS/S 2)))

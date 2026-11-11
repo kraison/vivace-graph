@@ -343,24 +343,26 @@ prolog's :DATA format still converts them; :RAW does not)."
          (*package* package)
          (cap (clamp-row-cap limit))
          (run (lambda (cb)
-                ;; the select form is EVAL'd (null lexenv), so pass the
-                ;; callback through a special the form references
-                ;; rather than a lexical.
-                ;; Interpret the SELECT lambda, do not compile it: a
-                ;; native compile per request was ~94% of a small
-                ;; query's time, and interpreted solving still beats
-                ;; compile + compiled solving up to ~20 ms of work,
-                ;; the budget's neighbourhood (GH #373).
-                (let ((*pattern-query-callback* cb)
-                      #+sbcl (sb-ext:*evaluator-mode* :interpret))
-                  (eval `(select (:effects nil :snapshot t
-                                  :limit ,cap
-                                  :skip ,(when (integerp skip) skip)
-                                  :max-inferences
-                                  ,*query-default-max-inferences*
-                                  :timeout ,*query-default-timeout*
-                                  :callback *pattern-query-callback*)
-                                 ,vars ,@goals))))))
+                ;; The shape's form is one for every call that shares
+                ;; it: variables renamed, literals in *QUERY-LITERALS*,
+                ;; limit, skip, budgets and the callback read from
+                ;; specials (GH #376, design D1, D2).  Interpreted:
+                ;; a native compile per request was ~94% of a small
+                ;; query's time (GH #373); the cache compiles a shape
+                ;; once it repeats.
+                (multiple-value-bind (shape literals)
+                    (%canonical-query vars goals)
+                  (let ((*pattern-query-callback* cb)
+                        (*query-literals* literals)
+                        (*query-run-limit* cap)
+                        (*query-run-skip* (when (integerp skip) skip))
+                        #+sbcl (sb-ext:*evaluator-mode* :interpret))
+                    (let ((fn (%cached-query-function shape
+                                                      (length literals))))
+                      (if fn
+                          (funcall fn)
+                          (eval (%cached-query-form shape
+                                                    (length literals))))))))))
     (if (eq format :raw)
         (progn (funcall run callback) nil)
         (emit-query-results vars format run))))

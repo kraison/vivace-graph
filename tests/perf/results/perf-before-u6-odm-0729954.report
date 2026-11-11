@@ -1,0 +1,29 @@
+;;;; graph-db perf report
+;;;; tag=before-u6-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; guarded-shape-repeat                   OPS 500  SECONDS 0.249  OPS/S 2008  
+;; claim-writes-unlinked                  OPS 4000  SECONDS 4.122  OPS/S 970  
+;; claim-sweep-backfill                   SECONDS 22.334  
+;; claim-sweep-backfill-linked            EDGES 8000  
+;; claim-writes-linked                    OPS 4000  SECONDS 13.245  OPS/S 302  
+;; two-hop-related                        OPS 200  SECONDS 0.238  OPS/S 840  
+;; two-hop-node-claims                    OPS 200  SECONDS 0.05  OPS/S 4000  
+;; two-hop-claim-endpoint                 OPS 200  SECONDS 0.029  OPS/S 6896  
+;; two-hop-claims-touching                OPS 200  SECONDS 0.056  OPS/S 3571  
+;; two-hop-speedup-lisp                   RATIO 1.12  
+;; two-hop-speedup-prolog                 RATIO 0.235  
+;; rules-rerun                            OPS 20  SECONDS 12.096  OPS/S 2  
+
+(:PERF-REPORT :TAG "before-u6-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION
+ 5 :HOST "odm" :ENTRIES
+ (("guarded-shape-repeat" :OPS 500 :SECONDS 0.249 :OPS/S 2008)
+  ("claim-writes-unlinked" :OPS 4000 :SECONDS 4.122 :OPS/S 970)
+  ("claim-sweep-backfill" :SECONDS 22.334)
+  ("claim-sweep-backfill-linked" :EDGES 8000)
+  ("claim-writes-linked" :OPS 4000 :SECONDS 13.245 :OPS/S 302)
+  ("two-hop-related" :OPS 200 :SECONDS 0.238 :OPS/S 840)
+  ("two-hop-node-claims" :OPS 200 :SECONDS 0.05 :OPS/S 4000)
+  ("two-hop-claim-endpoint" :OPS 200 :SECONDS 0.029 :OPS/S 6896)
+  ("two-hop-claims-touching" :OPS 200 :SECONDS 0.056 :OPS/S 3571)
+  ("two-hop-speedup-lisp" :RATIO 1.12) ("two-hop-speedup-prolog" :RATIO 0.235)
+  ("rules-rerun" :OPS 20 :SECONDS 12.096 :OPS/S 2)))

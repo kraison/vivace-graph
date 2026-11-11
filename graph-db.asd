@@ -208,6 +208,7 @@ web-free.  docs/guarded-query.md; GH #322."
   :pathname "query/"
   :serial t
   :components ((:file "package")
+               (:file "compiled-cache")
                (:file "dsl")
                (:file "guard"))
   :in-order-to ((test-op (test-op :graph-db/query-test))))
@@ -222,7 +223,8 @@ directly, web-free (GH #322)."
   :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/query/"
   :serial t
-  :components ((:file "package") (:file "suite") (:file "guard-tests"))
+  :components ((:file "package") (:file "suite") (:file "guard-tests")
+               (:file "compiled-cache-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/query-test
                                        :run-query-tests)

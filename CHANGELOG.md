@@ -16,6 +16,20 @@ storage formats (#60).
 
 ### Added
 
+- **The compiled query cache** (#376): `run-query-goals` canonicalises
+  a query's shape (variables renamed, string, number and character
+  literals lifted into a run-time vector) and keeps a bounded,
+  thread-safe per-image cache of compiled `select` functions keyed on
+  the shape and a functor generation; a shape runs interpreted on its
+  first sight and compiled from its second. Limits, offsets, budgets
+  and the callback are read at run time, so one entry serves every
+  call. The generation moves on `<-`, `reset-functor`, `table-functor`,
+  `untable-functor`, the deletion of a functor with clauses and an edge
+  type's install. `clear-query-cache`, `query-cache-stats`,
+  `*compiled-query-cache-size*` and `*compile-query-after*` are
+  exported; `run-perf-only` runs one perf case under `run-perf`'s
+  bindings. The guarded runner, the JSON DSL and `graph-db/rules`'
+  `%solutions` all go through it.
 - **`aggregate-all/3`, `reachable/3`, `k-hop/4`** (#123): `aggregate-all`
   with `count`, `(sum ?e)`, `(min ?e)`, `(max ?e)`, `(bag ?t)`,
   `(set ?t)` and the witness forms `(min ?e ?w)`, `(max ?e ?w)` over a

@@ -101,6 +101,14 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   start; `(k-hop ?from k ?x type)` the distinct nodes at distance k.
   Weighted paths are `graph-db/algorithms`' `shortest-path/4` (GH #123,
   manual Chapters 6 and 14).
+- **A repeated query shape runs compiled; vary the literals, not the
+  shape.** `run-query-goals` lifts strings and numbers out of a guarded
+  or DSL query and caches the compiled `select` per shape, so a
+  consumer's template with a changing key compiles once; a fresh shape
+  per call (a different goal order, a symbol where a string was)
+  interprets every time. `<-`, `reset-functor`, `table-functor` and an
+  edge type's install move the generation and retire the old entries;
+  `query-cache-stats` says what is cached (GH #376, manual Chapter 6).
 - **Pass `:collect-p t` only when you use the list,** since it builds one
   cons per edge.
 - **Key a hash table by an id, with `:test 'equalp`.** An id is a 16-byte

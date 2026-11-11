@@ -217,3 +217,26 @@ GH #255.)
   against `findall` plus `lisp` at 50,000/s: a one-to-four-path
   neighbourhood either way. The spine row stays deferred (#123: the
   predicate reaches the application's image with the release).
+- **Unit 6, the compiled query cache, the before** (#376):
+  `results/perf-before-u6-odm-0729954.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, engine at the unit 5
+  merge, the three cases in one image through the new `run-perf-only`.
+  `guarded-shape-repeat` 2,008/s (runs 1 and 2: 1,520, 1,634);
+  `two-hop-related` (the consumer's guarded two-hop read from
+  `bench-claim-linking`) 840/s (966, 847); the new `rules-rerun` case
+  (one rule over 2,000 base claims, `run-rule` 20 times) 12.1 s for
+  the 20 runs, 0.60 s per run (12.2, 12.6). Each run of a rule
+  interprets its body's `select` afresh today.
+- **Unit 6, the compiled query cache, after** (#376):
+  `results/perf-after-u6-odm-20f933b.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs. Where the cache applies
+  it is 1.5×: the new `guarded-goals-repeat` pair (goals guarded once,
+  500 runs) 11,904/s compiled (runs 1 and 2: 12,499, 13,513) against
+  7,936/s interpreted (8,196, 9,090). The three plan cases barely
+  move, because the select is a small part of each: `guarded-shape-
+  repeat` 1,873/s (2,347, 2,358) against 2,008 before, noise, since a
+  guarded call is 0.55 ms of which the guard's own per-request setup
+  is 0.35 ms and the select 0.08 ms compiled (the probe on #376; the
+  guard's cost is #489); `two-hop-related` 935/s (905, 893) against
+  840; `rules-rerun` 11.4 s for 20 runs (11.4, 11.3) against 12.1,
+  the rest of a run being its sweep and writes.

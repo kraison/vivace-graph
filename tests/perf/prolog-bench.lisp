@@ -221,7 +221,28 @@ call compiles the shape afresh."
       (pbp-guarded-lookup g 0)
       (timed-ops ("guarded-shape-repeat" k)
         (dotimes (i k)
-          (pbp-guarded-lookup g (mod i n)))))))
+          (pbp-guarded-lookup g (mod i n))))
+      ;; The select alone: goals guarded once (GH #383), run K times
+      ;; with the cache off (every run interpreted) and on (compiled
+      ;; from the second run).  The guard's own per-request setup is
+      ;; most of a guarded call (the probe on #376) and neither row
+      ;; carries it.
+      (when (fboundp 'graph-db::clear-query-cache)
+        (multiple-value-bind (vars goals)
+            (graph-db.query:guard-query-text
+             (format nil "(claim ?c pbp-claim \"pbp-things\" ~S \"rel\" ~
+?ons ?o)" (pbp-key 1))
+             g)
+          (flet ((run-k ()
+                   (dotimes (i k)
+                     (graph-db.query:run-guarded-goals vars goals g
+                                                       :limit 10))))
+            (funcall 'graph-db::clear-query-cache)
+            (progv '(graph-db::*compile-query-after*)
+                (list most-positive-fixnum)
+              (timed-ops ("guarded-goals-repeat-interpreted" k) (run-k)))
+            (funcall 'graph-db::clear-query-cache)
+            (timed-ops ("guarded-goals-repeat-compiled" k) (run-k))))))))
 
 (defun bench-recursive-ring ()
   "Unit 4 (GH #122): a recursive path query around a ring of N nodes.

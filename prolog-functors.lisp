@@ -1228,6 +1228,8 @@ symbols are interned in NAME's own package.  Skipped, with a warning
 naming NAME, when that package is COMMON-LISP or KEYWORD -- neither
 tolerates new symbols (GH #172)."
   (let ((pkg (%schema-symbol-package name)))
+    ;; The compiled query cache keys on this (GH #376, design D3).
+    (incf *functor-generation*)
     (if (member pkg (list (find-package :common-lisp)
                           (find-package :keyword)))
         (warn "Skipping edge functor install for ~S: its package ~A ~

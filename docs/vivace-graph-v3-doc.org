@@ -1320,6 +1320,48 @@ SELECT/2: 3 calls, 3 exits, 3 redos, 3 fails, 0 clauses, 0.000 s
 Both have text entries in ~graph-db.query~, ~explain-text~ and
 ~profile-text~, that go through the guard first (docs/guarded-query.md).
 
+*** The compiled query cache
+
+Every client query, the guarded Prolog runner, the JSON pattern DSL
+and a rule's body alike, reaches ~select~ through ~run-query-goals~,
+which used to ~eval~ a fresh ~select~ form per request under the
+interpreter (a native compile cost 18 to 20 ms, most of a small
+query's time: GH #373). Since GH #376 the runner canonicalises the
+form first and keeps a per-image cache of compiled shapes:
+
+- *the shape*: the variables renamed by first appearance and every
+  atom that is not a symbol (a string, a number, a node a Lisp caller
+  binds with ~=~) in a goal argument lifted into a vector the query
+  reads at run time, so ~(find-by-slot ?s thing key "t-3")~ and
+  ~... "t-4"~ are one shape (an ~aggregate-all~ spec word and the
+  expression of a ~lisp~ goal stay in place);
+- *the cache*: a shape runs interpreted the first time it is seen and
+  is compiled on its second lookup (~*compile-query-after*~, 2), then
+  runs compiled; ~*compiled-query-cache-size*~ (256) entries, the least
+  recently used evicted; one lock, the compile outside it;
+- *what moves it*: the key carries ~graph-db::*functor-generation*~,
+  which moves when a user functor's content changes, an assert with
+  ~<-~, ~reset-functor~, ~table-functor~, ~untable-functor~, the
+  deletion of a functor with clauses, or an edge type's functors being
+  installed, so an entry compiled before is never found again and ages
+  out; a query's own transient functor never moves it. A compiled form
+  looks every functor up at run time, so the generation is hygiene, not
+  correctness;
+- *per call*: ~:limit~, ~:offset~, the budgets and the row callback are
+  read from specials when the query runs, so one entry serves every
+  page and budget of a shape, and a budget trips inside a compiled run
+  as it does interpreted.
+
+~(clear-query-cache)~ empties it; ~(query-cache-stats)~ reports
+~(:entries n :compiled n :hits n :misses n :compiles n :evictions n)~.
+A size of zero turns the cache off. A workload that asserts with ~<-~
+between its queries keeps every shape cold, since each assert is a new
+generation and no shape reaches its second hit; assert first, then
+query.
+On the unit 6 bench (odm, GH #376) the repeated guarded shape, the
+consumer's two-hop read and a rule run twenty times are measured
+before and after; the rows are in ~docs/perf-baselines.md~.
+
 *** Pattern Matching Graph Structures
 
 The most iconic graph query is finding "friends of a friend." Let's find users who are followed by people Alice follows, but who are not Alice herself and are not already followed by Alice.

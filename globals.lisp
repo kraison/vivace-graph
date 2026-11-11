@@ -456,6 +456,19 @@ dependency on a table below it is unstratified (design D4).")
 (defvar *table-serial* 0
   "The last CREATED-AT handed to a table of the current query (D2).")
 
+;; The compiled query cache (GH #376;
+;; docs/superpowers/specs/2026-11-10-compiled-query-cache-design.md).
+(defvar *query-literals* #()
+  "The literals lifted out of the running query's shape, a simple
+vector %BIND-LITERALS reads by index (design D1).")
+(defvar *query-run-limit* nil
+  "The row cap of the running RUN-QUERY-GOALS call (design D2).")
+(defvar *query-run-skip* nil
+  "The rows the running RUN-QUERY-GOALS call skips first (design D2).")
+(defvar *functor-generation* 0
+  "Moves when a user functor's content changes; part of the compiled
+query cache's key (design D3).")
+
 #+sbcl
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))
 #+sbcl
