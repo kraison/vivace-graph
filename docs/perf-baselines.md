@@ -240,3 +240,10 @@ GH #255.)
   guard's cost is #489); `two-hop-related` 935/s (905, 893) against
   840; `rules-rerun` 11.4 s for 20 runs (11.4, 11.3) against 12.1,
   the rest of a run being its sweep and writes.
+- **Unit 7, the touched-at index, the before** (#392):
+  `results/perf-before-u7-odm-bc44486.report`, same host, SBCL and
+  generation, 2026-11-11, third of three runs, engine at the unit 6
+  merge, `bench-change-feed-cursor` alone through `run-perf-only`:
+  the claim-first feed text over 20,000 claims with the cursor past
+  95 % of them, 5.98 s (runs 1 and 2: 7.02, 6.16) for its 1,000 rows.
+  The goal enumerates the namespace key by key and filters by instant.
