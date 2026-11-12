@@ -32,6 +32,16 @@ storage formats (#60).
   signals an error when htpasswd fails or when the username or password
   would corrupt the file. Passwords still travel as request parameters.
 
+### Removed
+
+- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
+  lists and walks directories with UIOP, which ships with ASDF, so
+  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
+  (`replay`'s `txn-dir`) takes the directory with or without a trailing
+  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
+  programs with UIOP. `visualize :render` hands Graphviz the paths as
+  arguments, so a path containing a space, a quote or a `;` now renders.
+
 ### Added
 
 - **The compiled query cache** (#376): `run-query-goals` canonicalises

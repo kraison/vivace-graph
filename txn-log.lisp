@@ -117,7 +117,12 @@ the cut and report success (GH #127, the #146 chain).  A legacy file
                            (lambda (file)
                              (cl-ppcre:scan "^snap-"
                                             (file-namestring file)))
-                           (cl-fad:list-directory dir))
+                           ;; DIR is REPLAY's public TXN-DIR, so
+                           ;; "/x/txn-log" must list txn-log/, not
+                           ;; /x/: some UIOPs merge a non-directory
+                           ;; pathname as given (GH #461).
+                           (uiop:directory-files
+                            (uiop:ensure-directory-pathname dir)))
                           '> :key 'file-write-date)))
     (dolist (file candidates)
       (ecase (%snapshot-completeness file)

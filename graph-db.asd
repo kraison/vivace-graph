@@ -26,7 +26,8 @@
                #+(or ccl lispworks) :closer-mop
                #+(or ccl lispworks) :trivial-timeout
                :cl-store
-               :cl-fad
+               ;; No :cl-fad: directory listing and walking is UIOP's, which
+               ;; ships with ASDF (GH #461).
                :local-time
                :ieee-floats
                :cl-json
