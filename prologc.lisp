@@ -957,7 +957,9 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defvar *clause-body-rewriters* '()
   "Functions (GOALS) -> GOALS applied in list order -- PUSHNEW puts the
 most recently registered first -- to a clause body before it compiles.
-A rewriter returns an equivalent body: same solutions, same order.
+A rewriter returns an equivalent body: the same solutions in the same
+order, except where the rewriter's own documentation says otherwise
+(#392: order, and one shape that answered nothing before).
 Subsystems register (rules/facts.lisp, #451); core registers none.")
 
 (defun %rewrite-clause-body (goals)

@@ -16,6 +16,28 @@ storage formats (#60).
 
 ### Added
 
+- **The touched-at index** (#392): every claim family carries an
+  ordered index on its transaction extent, keyed by the instant the
+  record last changed (`extent-sexp-touched-key`: the retraction when
+  closed, else the recording), maintained by the general index's own
+  update path at creation, `retract-claim` and a re-open.
+  `claims-touched-after` reads it from a cursor in ascending touched
+  order, both arities, retracted claims included, with
+  `:limit`/`:offset`; `claim-touched-at` is the instant itself. In
+  Prolog, `claim-touched-after/4` generates over every store in scope,
+  merged into one ascending sequence, every family when none is named;
+  the compiler fuses the change feed's existing text --
+  `(claim ...) (claim-touched-at ?c ?t) (instant> ?t cursor)`, or the
+  pair alone -- into it, so no reader changes a line; the pair alone,
+  which answered nothing before, now generates. The fused feed
+  answers in touched order rather than key order (`docs/rules.md`,
+  "Solution order"); `*clause-body-rewriters*` now promises the
+  solutions, and the order only where a rewriter's documentation says
+  so. `compile-rule` refuses the functor in a rule body and a
+  `claim-touched-at` goal no premise binds; standing text may not name
+  it. On the bench the claim-first feed over 20,000 claims with the
+  cursor past 95 % of them went from 5.98 s to 0.047 s for its 1,000
+  rows (`docs/perf-baselines.md`).
 - **The compiled query cache** (#376): `run-query-goals` canonicalises
   a query's shape (variables renamed, string, number and character
   literals lifted into a run-time vector) and keeps a bounded,
