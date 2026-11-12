@@ -2371,6 +2371,11 @@ The REST API is protected by a username and password authentication system. It u
 
 *Important:* Authentication credentials are *not* sent via standard HTTP Basic Auth headers. Instead, they must be included as `username` and `password` fields in the JSON body of *every single request*.
 
+**** What runs, and which entries are accepted
+~add-rest-user~ and ~delete-rest-user~ run ~*htpasswd-bin*~ (default ~/usr/bin/htpasswd~; it must be Apache httpd 2.4's, whose ~-i~ flag reads the password from stdin), and every login runs ~openssl passwd~ from ~PATH~. Both run from argument lists, never through a shell, and the password reaches them on stdin, so it never appears on a command line where ~ps~ would show it (#461).
+
+A login checks entries of the form ~$alg$salt$hash~ for the algorithms ~openssl passwd~ takes as a flag: ~apr1~ (htpasswd's default), ~1~, ~5~ and ~6~. Any other entry, including a bcrypt one written by ~htpasswd -B~, refuses every password. The computed and stored hashes are compared exactly, case included, and the comparison takes the same time wherever they differ. A missing password, or one containing a newline, carriage return or NUL, is refused. ~add-rest-user~ signals an error for such a password, for a username that is empty or contains a colon or a line break, and when htpasswd exits non-zero.
+
 **** Creating a User
 To add a new user, call the ~add-rest-user~ function from your Lisp environment. This will create or update the password file (named ~rpasswd~ by default in the current directory).
 
@@ -7476,7 +7481,10 @@ This chapter provides a categorized reference for the most important exported sy
   Stops the REST API server.
 
 - ~add-rest-user (username password)~ ::
-  Creates a new user account for authenticating with the REST API.
+  Creates a new user account for authenticating with the REST API, via ~htpasswd -i~ (httpd 2.4). Signals an error when htpasswd fails or an argument cannot be stored.
+
+- ~delete-rest-user (username)~ ::
+  Removes a user account with ~htpasswd -D~. Signals ~uiop:subprocess-error~ when htpasswd fails.
 
 **** Concurrency & Locking (Advanced)
 - ~make-rw-lock ()~ ::

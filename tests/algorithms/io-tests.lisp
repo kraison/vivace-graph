@@ -123,3 +123,30 @@ dso-lex lexer did (no rule matched => silent NIL)."
       ;; weight must be a Graphviz-valid number, not Lisp's "1.0d0"
       (is (search "label=\"1.0\"" dot))
       (is (not (search "d0" dot))))))
+
+(defun %graphviz-dot-p ()
+  "True when Graphviz's dot is on PATH."
+  (ignore-errors
+   (eql 0 (nth-value 2 (uiop:run-program '("dot" "-V")
+                                         :ignore-error-status t)))))
+
+(test visualize-renders-a-path-with-shell-syntax-in-it
+  "VISUALIZE hands Graphviz the paths as arguments, not a shell command
+line, so a directory named with a space, a quote and a ; renders (GH
+#461); the shell string split it and left the quote open."
+  (if (not (%graphviz-dot-p))
+      (skip "no Graphviz dot on PATH")
+      (with-populated-graph (g h '("A" "B") '(("A" "B")))
+        (with-temp-directory (dir)
+          (let* ((odd (merge-pathnames "it's a; dir/" dir))
+                 (file (uiop:native-namestring
+                        (merge-pathnames "g.dot" odd))))
+            (ensure-directories-exist odd)
+            (let ((out (visualize :graph g :file file :render t
+                                  :format "svg"
+                                  :label-fn (lambda (v)
+                                              (slot-value v 'name)))))
+              (is (string= (uiop:native-namestring
+                            (merge-pathnames "g.svg" odd))
+                           out))
+              (is-true (probe-file out))))))))

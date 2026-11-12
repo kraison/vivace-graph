@@ -14,6 +14,34 @@ between releases; cutting a release renames it to the new version and dates it.
 This section carries a **MAJOR** change: the spatial contract and two
 storage formats (#60).
 
+### Security
+
+- **A REST login no longer hands the password to `/bin/sh`** (#461).
+  `auth-rest-user` spliced the request's password into an
+  `openssl passwd` command line and ran it through the shell before any
+  comparison, so anyone who knew one username could run commands as the
+  server's user by putting a `;` in the password, on all 13
+  `with-rest-auth` routes. openssl now runs from an argument list with
+  the password on stdin, and so does `htpasswd -i` for `add-rest-user`;
+  the password is no longer on a command line, where `ps` showed it. The
+  login no longer logs both hashes at warn level on every attempt. It
+  compares them exactly (`equalp` ignored case) and in constant time,
+  and refuses a missing password, which used to be hashed as the string
+  `"NIL"`. An entry it cannot check (bcrypt, `$6$rounds=`) is a refusal,
+  not an error. `add-rest-user` now needs htpasswd from httpd 2.4, and
+  signals an error when htpasswd fails or when the username or password
+  would corrupt the file. Passwords still travel as request parameters.
+
+### Removed
+
+- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
+  lists and walks directories with UIOP, which ships with ASDF, so
+  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
+  (`replay`'s `txn-dir`) takes the directory with or without a trailing
+  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
+  programs with UIOP. `visualize :render` hands Graphviz the paths as
+  arguments, so a path containing a space, a quote or a `;` now renders.
+
 ### Added
 
 - **The compiled query cache** (#376): `run-query-goals` canonicalises

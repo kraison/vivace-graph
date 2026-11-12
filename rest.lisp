@@ -95,53 +95,140 @@ its text, so an error body is never labelled ndjson."
   (setf (gethash (json:lisp-to-camel-case (string name)) *rest-queries*) fn)
   name)
 
+;;; ---------------------------------------------------------------------------
+;;; REST users: an htpasswd file, written by htpasswd and checked with
+;;; `openssl passwd`.  Both run from argument lists, with the password on
+;;; stdin, never through /bin/sh (GH #461).
+;;; ---------------------------------------------------------------------------
+
+(defun %one-line-string-p (string)
+  "True when STRING is a string that can travel as one line on a child's
+stdin and sit in one line of an htpasswd file: no newline, carriage
+return or NUL, each of which would split or cut it on the way."
+  (and (stringp string)
+       (notany (lambda (c)
+                 (member c (list #\Newline #\Return (code-char 0))))
+               string)))
+
+(defun %run-with-secret (command secret)
+  "Run COMMAND, a program and its arguments as a list of strings, with
+SECRET and a newline on its stdin; return (values STDOUT STDERR
+EXIT-CODE).  No shell reads COMMAND, so nothing in it is interpreted,
+and SECRET goes by pipe: not on a command line, where ps shows it, nor
+through the temporary file UIOP:RUN-PROGRAM spools a stream input to
+on most Lisps.  The outputs are read once stdin is closed, which suits
+the short replies of htpasswd and openssl, not a chatty program."
+  (let ((process (uiop:launch-program command :input :stream
+                                              :output :stream
+                                              :error-output :stream)))
+    (unwind-protect
+         (let ((in (uiop:process-info-input process)))
+           (write-string secret in)
+           (terpri in)
+           (close in)
+           (values (uiop:slurp-stream-string
+                    (uiop:process-info-output process))
+                   (uiop:slurp-stream-string
+                    (uiop:process-info-error-output process))
+                   (uiop:wait-process process)))
+      (uiop:close-streams process))))
+
+(defun %constant-time-string= (a b)
+  "STRING= on A and B that reads every character of two equal-length
+strings rather than stopping at the first difference, so the time a
+refused login takes does not say how much of the stored hash the
+attempt matched.  Unequal lengths return at once: a hash's length is
+public."
+  (and (= (length a) (length b))
+       (let ((acc 0))
+         (dotimes (i (length a) (zerop acc))
+           (setf acc (logior acc (logxor (char-code (char a i))
+                                         (char-code (char b i)))))))))
+
+(defun %rest-passwd-path ()
+  "*REST-PASSWD-FILE* as the native namestring htpasswd is handed,
+merged with *DEFAULT-PATHNAME-DEFAULTS* as AUTH-REST-USER's OPEN
+merges it, so the child writes the file this image reads."
+  (uiop:native-namestring (merge-pathnames *rest-passwd-file*)))
+
 (defun add-rest-user (username password)
-  (trivial-shell:shell-command
-   (format nil "~A -b ~A ~A ~A ~A"
-           *htpasswd-bin*
-           (if (probe-file *rest-passwd-file*) "" "-c")
-           *rest-passwd-file*
-           username
-           password)))
+  "Add USERNAME with PASSWORD to *REST-PASSWD-FILE*, creating the file if
+it is absent, with `htpasswd -i` (Apache httpd 2.4), which reads the
+password from stdin.  Signals an error, before running anything, for a
+USERNAME that is empty or holds a colon or a line break, or a PASSWORD
+with a line break (%ONE-LINE-STRING-P): either would corrupt the file
+or be cut short.  Signals an error if htpasswd fails; otherwise returns
+its (values STDOUT STDERR EXIT-CODE)."
+  (unless (and (%one-line-string-p username)
+               (plusp (length username))
+               (not (find #\: username)))
+    (error "ADD-REST-USER: ~S cannot be an htpasswd username." username))
+  (unless (%one-line-string-p password)
+    (error "ADD-REST-USER: the password must be a string with no newline, ~
+carriage return or NUL."))
+  (multiple-value-bind (out err exit-code)
+      (%run-with-secret (append (list *htpasswd-bin* "-i")
+                                (unless (probe-file *rest-passwd-file*)
+                                  (list "-c"))
+                                (list (%rest-passwd-path) username))
+                        password)
+    (unless (eql exit-code 0)
+      (error "ADD-REST-USER: ~A exited ~A: ~A" *htpasswd-bin* exit-code err))
+    (values out err exit-code)))
 
 (defun delete-rest-user (username)
-  (trivial-shell:shell-command
-   (format nil "~A -D ~A ~A"
-           *htpasswd-bin*
-           *rest-passwd-file*
-           username)))
+  "Remove USERNAME from *REST-PASSWD-FILE* with `htpasswd -D`.  Signals
+UIOP:SUBPROCESS-ERROR if htpasswd fails; otherwise returns its
+(values STDOUT STDERR EXIT-CODE)."
+  (uiop:run-program (list *htpasswd-bin* "-D" (%rest-passwd-path) username)
+                    :output :string :error-output :string))
+
+(defun %password-matches-p (password stored)
+  "True when PASSWORD hashes to STORED, an htpasswd entry of the form
+$ALG$SALT$HASH whose ALG `openssl passwd` takes as a flag: apr1
+(htpasswd's default), 1, 5 or 6.  Any other entry, a bcrypt $2y$ one
+included, is a refusal.  The two hashes are compared exactly -- case
+matters in them -- and in constant time."
+  (let ((fields (and (stringp stored) (cl-ppcre:split "\\$" stored))))
+    (when (and (= 4 (length fields))
+               (member (second fields) '("apr1" "1" "5" "6")
+                       :test #'string=))
+      (multiple-value-bind (out err exit-code)
+          (%run-with-secret (list "openssl" "passwd"
+                                  (format nil "-~A" (second fields))
+                                  "-salt" (third fields) "-stdin")
+                            password)
+        (declare (ignore err))
+        (and (eql exit-code 0)
+             (%constant-time-string=
+              (string-right-trim '(#\Space #\Tab #\Newline #\Return) out)
+              stored))))))
 
 (defun auth-rest-user (username password)
-  (with-open-file (stream *rest-passwd-file*)
-    (do ((line (read-line stream nil :eof)
-               (read-line stream nil :eof)))
-        ((eql line :eof))
-      (let ((pair (cl-ppcre:split "\\:" line)))
-        (when (equalp (first pair) username)
-          (destructuring-bind (_ hash salt enc)
-              (cl-ppcre:split "\\$" (second pair))
-            (declare (ignore _ enc))
-            (multiple-value-bind (out err exit-code)
-                (trivial-shell:shell-command
-                 (format nil "openssl passwd -~A -salt ~A ~A"
-                         hash salt password))
-              (declare (ignore exit-code err))
-              (setq out (cl-ppcre:regex-replace-all "\\s+$" out ""))
-              (log:warn "GOT ~A FOR ~A" out (second pair))
-              (return-from auth-rest-user
-                (equalp out (second pair))))))))))
+  "True when PASSWORD is USERNAME's in *REST-PASSWD-FILE*; the first
+entry whose name matches decides.  A non-string USERNAME, a PASSWORD
+that is not a one-line string (a missing request parameter arrives as
+NIL) or an entry %PASSWORD-MATCHES-P cannot read is a refusal.
+The password was once spliced into a shell command run before any
+comparison, so anyone who knew a username could run commands as the
+server with a ; in it (GH #461); now it reaches openssl on stdin."
+  (when (and (stringp username) (%one-line-string-p password))
+    (with-open-file (stream *rest-passwd-file*)
+      (do ((line (read-line stream nil :eof)
+                 (read-line stream nil :eof)))
+          ((eql line :eof))
+        (let ((pair (cl-ppcre:split "\\:" line)))
+          (when (equalp (first pair) username)
+            (return-from auth-rest-user
+              (%password-matches-p password (second pair)))))))))
 
 #|
-  ;; This only works with newer versions of htpasswd;  see openssl version above
-  (multiple-value-bind (out err exit-code)
-      (trivial-shell:shell-command
-       (format nil "~A -vb ~A ~A ~A"
-               *htpasswd-bin*
-               *rest-passwd-file*
-               username
-               password))
-    (declare (ignore out err))
-    (eq 0 exit-code)))
+  ;; Alternative to %PASSWORD-MATCHES-P that also verifies bcrypt entries,
+  ;; but needs htpasswd >= 2.4.5 for -v:
+  (eql 0 (nth-value 2 (%run-with-secret
+                       (list *htpasswd-bin* "-v" "-i" (%rest-passwd-path)
+                             username)
+                       password)))
 |#
 
 (defmacro with-rest-auth ((username password) &body body)
