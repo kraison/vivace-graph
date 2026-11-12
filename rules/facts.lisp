@@ -576,6 +576,66 @@ GOALS itself when nothing fuses (#451, spec §2)."
 
 (pushnew '%fuse-key-bounds *clause-body-rewriters*)
 
+;;; The cursor rewrite (#392, design D4): a (claim-touched-at ?c ?t)
+;;; (instant> ?t B) pair with ?c fresh compiles to CLAIM-TOUCHED-AFTER/4
+;;; -- ahead of a CLAIM/7 goal on ?c that then filters, or alone over
+;;; every family -- the comparison kept.  Solution order becomes
+;;; ascending touched instant (docs/rules.md, "Solution order").
+
+(defun %var-occurs-p (var form)
+  "VAR appears in FORM at any depth."
+  (cond ((eq form var) t)
+        ((consp form) (or (%var-occurs-p var (car form))
+                          (%var-occurs-p var (cdr form))))
+        (t nil)))
+
+(defun %cursor-bound-goal-p (goal var)
+  "(instant> VAR B) with B a string literal or a variable."
+  (and (%engine-functor-goal-p goal "INSTANT>" 2)
+       (eq (second goal) var)
+       (let ((b (third goal)))
+         (or (stringp b) (variable-p b)))))
+
+(defun %fuse-touched-cursor (goals)
+  "GOALS with each (claim-touched-at ?c ?t) (instant> ?t B) pair fused
+into CLAIM-TOUCHED-AFTER/4 by design D4's two shapes; the comparison
+stays.  Returns GOALS itself when nothing fuses (#392)."
+  (let ((out '()) (changed nil) (rest goals)
+        (functor (intern "CLAIM-TOUCHED-AFTER" (symbol-package 'claim/7))))
+    (flet ((fresh-in (goals var)
+             (notany (lambda (g) (%var-occurs-p var g)) goals)))
+      (loop while rest
+            do (let ((goal (pop rest)))
+                 (if (not (and (%engine-functor-goal-p
+                                goal "CLAIM-TOUCHED-AT" 2)
+                               (%named-variable-p (second goal))
+                               (%named-variable-p (third goal))
+                               (%cursor-bound-goal-p (first rest)
+                                                     (third goal))))
+                     (push goal out)
+                     (let ((c (second goal)) (at (third goal))
+                           (b (third (first rest))) (prev (first out)))
+                       (cond ((and prev
+                                   (%engine-functor-goal-p prev "CLAIM" 7)
+                                   (eq (second prev) c)
+                                   (fresh-in (rest out) c)
+                                   (not (and (variable-p b)
+                                             (%var-occurs-p b prev))))
+                              ;; Shape 1: generator, then the claim goal
+                              ;; as a filter, FAMILY as written there.
+                              (setf changed t)
+                              (pop out)
+                              (push (list functor c at b (third prev)) out)
+                              (push prev out))
+                             ((fresh-in out c)
+                              ;; Shape 2: every family.
+                              (setf changed t)
+                              (push (list functor c at b nil) out))
+                             (t (push goal out))))))))
+    (if changed (nreverse out) goals)))
+
+(pushnew '%fuse-touched-cursor *clause-body-rewriters*)
+
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
 %PROLOG-INDEX-BOUND folds into the same value (S1's deferred gate,

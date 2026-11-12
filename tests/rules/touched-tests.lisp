@@ -160,3 +160,138 @@ binds is a dead filter today and an unanalysed generator after D4."
                          "(claim ?c rt-claim \"host\" ?k \"runs\" "
                          "?ons ?o) (claim-touched-at ?c ?t) "
                          "(instant> ?t \"2020-01-01\")")))))))
+
+;;; ---------------------------------------------------------------------
+;;; The rewrite (design D4): the feed's own text takes the index.
+
+(defparameter *ttf-feed*
+  "(claim ?c rt-claim \"host\" ?k \"up\" ?ons ?o) (claim-touched-at ?c ?t) ~
+(instant> ?t ~S)"
+  "The claim-first feed text, the cursor spliced in by FORMAT.")
+
+(defun ttf-seed-feed (g &rest keys)
+  "Fifty keys under :HOST, then each of KEYS retracted one more second
+past the cursor, in order.  Returns the cursor."
+  (seed-keys g 50)
+  (let ((cursor (graph-db.spacetime::%st-now)))
+    (loop for key in keys
+          for n from 1
+          do (retract-claim (first (claims-touching g 'rt-claim :host key
+                                                    :role :subject))
+                            :at (local-time:timestamp+ cursor n :sec)))
+    cursor))
+
+(test ttf-the-claim-first-feed-pays-no-key-lookups
+  "Shape 1: the generator runs first and CLAIM/7 filters, so the feed
+pays no key lookup; the same goals with one between the pair stay a
+filter behind the namespace route, one lookup per key."
+  (with-rules-graph (g)
+    (let ((*cursor* (ttf-seed-feed g "k10" "k20")))
+      (counting-lookups (n)
+        (is (equal '("k10" "k20")
+                   (select-flat (?k)
+                     (lisp ?cur *cursor*)
+                     (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                     (claim-touched-at ?c ?t)
+                     (instant> ?t ?cur))))
+        (is (= 0 n)))
+      (counting-lookups (n)
+        (is (equal '("k10" "k20")
+                   (select-flat (?k)
+                     (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                     (claim-touched-at ?c ?t)
+                     (lisp ?cur *cursor*)
+                     (instant> ?t ?cur))))
+        (is (<= 50 n))))))
+
+(test ttf-the-pair-first-feed-pays-no-key-lookups
+  "Shape 2: the pair alone generates over every family; CLAIM/7 after
+it filters."
+  (with-rules-graph (g)
+    (let ((*cursor* (ttf-seed-feed g "k10" "k20")))
+      (counting-lookups (n)
+        (is (equal '("k10" "k20")
+                   (select-flat (?k)
+                     (lisp ?cur *cursor*)
+                     (claim-touched-at ?c ?t)
+                     (instant> ?t ?cur)
+                     (claim ?c rt-claim "host" ?k "up" ?ons ?o))))
+        (is (= 0 n))))))
+
+(test ttf-a-goal-between-leaves-the-pair-a-filter
+  "A goal between CLAIM/7 and the pair: nothing fuses, the subject
+index answers and the pair filters."
+  (with-rules-graph (g)
+    (seed-keys g 5)
+    (counting-lookups (n)
+      (is (= 1 (select-count (?c)
+                 (claim ?c rt-claim "host" "k01" ?r ?ons ?o)
+                 (claim-current ?c)
+                 (claim-touched-at ?c ?t)
+                 (instant> ?t "2020-01-01"))))
+      (is (= 1 n)))))
+
+(test ttf-fused-rows-come-in-touched-order
+  "The fused feed answers in ascending touched instant, not key order."
+  (with-rules-graph (g)
+    (let ((*cursor* (ttf-seed-feed g "k30" "k05")))
+      (let ((rows (select () (?k ?t)
+                    (lisp ?cur *cursor*)
+                    (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                    (claim-touched-at ?c ?t)
+                    (instant> ?t ?cur))))
+        (is (equal '("k30" "k05") (mapcar #'first rows)))
+        (is (every #'string< (mapcar #'second rows)
+                   (rest (mapcar #'second rows))))))))
+
+(test ttf-the-guarded-feed-is-fused-interpreted-and-compiled
+  "The guarded text fuses on its first (interpreted) call and on its
+second, which the compiled query cache compiles."
+  (with-rules-graph (g)
+    (let* ((*cursor* (ttf-seed-feed g "k10" "k20"))
+           (text (format nil *ttf-feed*
+                         (graph-db::%instant-string *cursor*))))
+      (graph-db:clear-query-cache)
+      (flet ((keys ()
+               (multiple-value-bind (columns rows)
+                   (graph-db.query:run-guarded-prolog text g :limit 1000)
+                 (let ((k (position "k" columns :test #'string=)))
+                   (mapcar (lambda (row) (nth k row)) rows)))))
+        (counting-lookups (n)
+          (is (equal '("k10" "k20") (keys)))
+          (is (= 0 n)))
+        (counting-lookups (n)
+          (is (equal '("k10" "k20") (keys)))
+          (is (= 0 n)))
+        (is (<= 1 (getf (graph-db:query-cache-stats) :compiled)))))))
+
+(test ttf-a-rule-with-the-feed-shape-derives-as-before
+  "A rule body in the feed's shape compiles, its premise binding ?c, and
+derives what it did before the rewrite: one subject per RUNS premise."
+  (with-rules-graph (g)
+    (write-rule g :name "touched" :version "1" :family "rt-claim"
+                  :head "(claim ?d rt-claim \"host\" ?k \"touched\" nil nil)"
+                  :body (concatenate
+                         'string
+                         "(claim ?c rt-claim \"host\" ?k \"runs\" ?ons ?o) "
+                         "(claim-touched-at ?c ?t) "
+                         "(instant> ?t \"2020-01-01\")"))
+    (seed g)
+    (is (= 2 (graph-db.rules:rule-report-derived
+              (graph-db.rules:run-rule g "touched"))))
+    (is (equal '("h1" "h2")
+               (sort (mapcar #'claim-subject-key
+                             (derived g 'rt-claim "touched"))
+                     #'string<)))))
+
+(test ttf-a-cursor-the-claim-goal-binds-is-not-fused
+  "B a variable of the CLAIM/7 goal: fused, the generator would run with
+it unbound and answer nothing; unfused, the pair reads the bound key as
+an instant and signals, as the text asks."
+  (with-rules-graph (g)
+    (seed-keys g 3)
+    (signals graph-db:query-precondition-error
+      (select-flat (?k)
+        (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+        (claim-touched-at ?c ?t)
+        (instant> ?t ?k)))))
