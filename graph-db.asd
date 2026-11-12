@@ -284,8 +284,9 @@ docs/rules.md; GH #304."
                ;; some Quicklisp dists (e.g. clack + a newer lack) and silently
                ;; leave the handler unregistered -> ":HUNCHENTOOT is unknown handler."
                :clack-handler-hunchentoot
-               :usocket
-               :trivial-shell)
+               ;; No :trivial-shell: rest.lisp runs htpasswd and openssl
+               ;; with UIOP, as argument lists, never through /bin/sh (GH #461).
+               :usocket)
   :serial t
   :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
@@ -509,8 +510,8 @@ and read-only neighborhood exploration."
 (defsystem graph-db/algorithms-io
   :name "VivaceGraph graph-algorithms IO"
   :description "Optional GML/Pajek import + Graphviz export for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number
-               :trivial-shell)
+  ;; Graphviz runs through UIOP:RUN-PROGRAM, not trivial-shell (GH #461).
+  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number)
   :pathname "algorithms/"
   :serial t
   :components ((:file "io")))
