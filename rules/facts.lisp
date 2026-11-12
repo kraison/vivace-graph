@@ -371,6 +371,20 @@ goal counted as bound and the row marked as decided by value."
 (register-access-path 'claim/7 #'%explain-claim-path)
 (register-access-path 'claim-after/9 #'%explain-claim-path)
 
+(defun %explain-touched-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM-TOUCHED-AFTER/4 goal (design D3): a
+bound ?C is the claim, a literal family names its index, anything else
+is every family's."
+  (declare (ignore graph))
+  (cond ((nth 0 bound) "that claim")
+        ((let ((f (nth 3 args)))
+           (and f (symbolp f) (not (variable-p f))))
+         (format nil "touched-at index of ~A from the cursor"
+                 (symbol-name (nth 3 args))))
+        (t "touched-at index of every family from the cursor")))
+
+(register-access-path 'claim-touched-after/4 #'%explain-touched-path)
+
 (defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
                     skey-after okey-after cont)
   "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
@@ -700,11 +714,85 @@ precedes the start.  One cursor for a change feed that must see both
 records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
   (let ((c (%claim-arg ?c)))
     (when c
-      (%yield (?at (or (%claim-retracted-at c)
-                       (let ((at (graph-db.spacetime:claim-recorded-at c)))
-                         (and (typep at 'local-time:timestamp)
-                              (%instant-string at)))))
+      ;; One definition with CLAIM-TOUCHED-AFTER/4 and the index: the
+      ;; functor answers claim-touched-at as an instant string (D3).
+      (%yield (?at (let ((at (graph-db.spacetime:claim-touched-at c)))
+                     (and at (%instant-string at))))
         (funcall cont)))))
+
+(defun %touched-candidates (after family)
+  "Every store's claims touched after AFTER: FAMILY's (a CLAIM-FAMILY)
+or, when FAMILY is NIL, every family registered in this image.  The
+own store's ill-typed family signals, a foreign store's is swallowed,
+as %SCOPE-LOOKUP reads them; FAMILY NIL swallows every store's, since
+the reader named no family (D3).  One ascending sequence by touched
+instant, stable, so ties keep scope order then family order."
+  (let* ((graphs (%scope-graphs))
+         (own (first graphs))
+         (families (if family
+                       (list family)
+                       (alexandria:hash-table-values
+                        graph-db.spacetime::*claim-families*)))
+         (lists '()))
+    ;; Scope order is the OUTER loop and family order the inner one,
+    ;; so a stable sort leaves ties in that order (D3).
+    (dolist (graph graphs)
+      (dolist (f families)
+        (let ((claims
+                (handler-case
+                    (graph-db.spacetime:claims-touched-after
+                     graph (graph-db.spacetime:claim-family-parent f) after)
+                  (query-precondition-error (c)
+                    (when (and family (eq graph own))
+                      (error c))))))
+          (push claims lists))))
+    (%exclude-producers
+     (stable-sort (loop for chunk in (nreverse lists) append chunk)
+                  #'local-time:timestamp<
+                  :key #'graph-db.spacetime:claim-touched-at))))
+
+(def-global-prolog-functor claim-touched-after/4
+    (?c ?t ?after ?family cont)
+  "?C's touched instant as an instant string, filtered when ?C is a
+bound claim, generated otherwise from CLAIM-TOUCHED-AFTER over every
+store in scope in ascending touched order -- every family when ?FAMILY
+is unbound (touched-at index design D3, GH #392).  The compiler writes
+it for the feed's text; it may be written by hand, except in a rule
+body, which COMPILE-RULE refuses."
+  (let ((c (%claim-arg ?c))
+        (unbound (%unbound-p ?c)))
+    (cond
+      ;; A bound claim filters: ?T is its touched instant, strictly
+      ;; after ?AFTER.  No touched instant, or no ?AFTER, fails.
+      (c
+       (let ((after (%instant-arg ?after)))
+         (when after
+           (let ((at (graph-db.spacetime:claim-touched-at c)))
+             (when (and at (local-time:timestamp> at after))
+               (%yield (?t (%instant-string at))
+                 (funcall cont)))))))
+      ;; An unbound ?C generates from the index; a free ?AFTER has no
+      ;; route, so it answers nothing (D3).  ?FAMILY unbound or NIL is
+      ;; every family.
+      (unbound
+       (let ((after (%instant-arg ?after)))
+         (when after
+           (let ((fv (%prolog-index-bound ?family)))
+             (let ((family (and fv (%family-or-ill-typed ?family))))
+               (dolist (claim
+                        (append
+                         (%touched-candidates after family)
+                         (loop for d in (%derived-all)
+                               for at =
+                               (graph-db.spacetime:claim-touched-at d)
+                               when (and (typep at 'local-time:timestamp)
+                                         (local-time:timestamp> at after))
+                                 collect d)))
+                 (%yield (?c claim)
+                   (%yield (?t (%instant-string
+                                (graph-db.spacetime:claim-touched-at
+                                 claim)))
+                     (funcall cont))))))))))))
 
 ;; INSTANT</2 and friends compare two instants -- strings in any RFC
 ;; 3339 spelling, or timestamps -- by value, where </2 on two strings is
