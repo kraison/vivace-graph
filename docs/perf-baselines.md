@@ -247,3 +247,10 @@ GH #255.)
   the claim-first feed text over 20,000 claims with the cursor past
   95 % of them, 5.98 s (runs 1 and 2: 7.02, 6.16) for its 1,000 rows.
   The goal enumerates the namespace key by key and filters by instant.
+- **Unit 7, the touched-at index, after** (#392):
+  `results/perf-after-u7-odm-b7de121.report`, same host, SBCL and
+  generation, 2026-11-12, third of three runs, the same bench and
+  text: 0.047 s (runs 1 and 2: 0.058, 0.046) for the same 1,000 rows,
+  about 125× the before. The pair fuses into `claim-touched-after/4`,
+  which reads the touched-at index from the cursor; the `claim/7` goal
+  filters each row by its bound-claim route.

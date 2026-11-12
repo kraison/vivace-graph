@@ -38,7 +38,7 @@ The subsystem's package is `graph-db.rules` (spec §3), but
 symbols -- `claim/7`, `claim-after/9`, `claim-current/1`,
 `claim-valid-at/2`,
 `claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
-`claim-retracted-at/2`, `claim-touched-at/2`,
+`claim-retracted-at/2`, `claim-touched-at/2`, `claim-touched-after/4`,
 `claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
 `claim-rule-version/2`, and `instant</2`, `instant>/2`, `instant<=/2`,
 `instant>=/2`, `instant=/2` -- are `graph-db` exports.
@@ -64,7 +64,7 @@ pathname and its `graph-db.rules` package are unchanged.
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
 (claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
-(claim-touched-at ?c ?at)
+(claim-touched-at ?c ?at)   (claim-touched-after ?c ?at after family)
 (claim-producer ?c ?p)      (claim-standing ?c ?s)
 (claim-relation ?c ?r)      (claim-rule-version ?c ?v)
 (instant< ?a ?b) (instant> ?a ?b) (instant<= ?a ?b) (instant>= ?a ?b)
@@ -84,6 +84,7 @@ pathname and its `graph-db.rules` package are unchanged.
 | `claim-recorded-at/2` | when the claim was recorded, as an instant string |
 | `claim-retracted-at/2` | when it was retracted, as an instant string, or NIL while open (GH #391) |
 | `claim-touched-at/2` | the later of the two: the one cursor a change feed needs |
+| `claim-touched-after/4` | `claim/7`'s claims touched after `after`, from the touched-at index in ascending touched order, every family when `family` is unbound; the compiler writes it for the feed's text (#392) |
 | `claim-producer/2` | the producer -- also a generator, below |
 | `claim-standing/2` | the standing, as a lowercase string |
 | `claim-relation/2` | the relation |
@@ -154,9 +155,10 @@ guard the schema's own canonical symbol is what reaches the goal.
   moves a claim's transaction record -- record, supersession,
   cross-producer outdating, retraction -- so a reader keeps one
   per-namespace cursor instead of a cursor plus a periodic full
-  re-read. Both goals still visit every claim of the namespace under
-  `max-inferences`; an index that makes the cursor goal proportional
-  to what changed is #392.
+  re-read. With `instant>/2` right after it, the compiler takes the
+  pair to the touched-at index (#392): the feed costs the claims
+  touched after the cursor, not the namespace's history -- "The
+  touched-at route" below.
 - `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2`,
   `instant=/2` compare two instants **by value**, each a string in any
   RFC 3339 spelling or a timestamp, so a client's `"2026-02-01"`
@@ -288,6 +290,43 @@ there it buys silence rather than a walk: that goal has no index to
 generate from and nothing to fall back to, so opting out of the refusal
 leaves the empty answer an unbudgeted query already gets.
 
+**The touched-at route (#392).** A change feed is the three-goal
+text `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-touched-at ?c ?t)
+(instant> ?t "<cursor>")`. Left as written it would be the vocabulary
+route filtered by instant -- the namespace's whole history for a
+cursor past most of it. So each claim family carries an ordered index
+on its transaction extent, keyed by the instant `claim-touched-at/2`
+answers (`claim-touched-at`, declared by `def-claim-classes`,
+maintained by the index's own update path at creation, retraction and
+re-open), and the compiler fuses the pair into `claim-touched-after/4`
+when the claim variable is fresh: right after a `claim/7` goal on it
+that no earlier goal names (`(claim-touched-after ?c ?t cursor f)
+(claim ...) (instant> ...)`, the generator first and the `claim/7`
+goal filtering by its bound-claim route), or on its own with nothing
+before it binding `?c` (every family). The comparison stays in the
+body, so a claim the index skips is one it would have rejected. Not
+fused, and so a filter paid for by the comparison: `?c` bound by an
+earlier goal, a goal between the three, the pair inside `or`, `not`,
+`if`, `once` or `forall`, `instant>=`, a cursor variable the `claim/7`
+goal itself binds. The generator reads every store in scope and merges
+them into one sequence ascending by touched instant, this run's own
+derivation last, under `*claim-exclude-producers*` as `claim/7`'s
+routes are. The cursor protocol: a reader advances its cursor to the
+last `?t` of a page it consumed in full; the comparison is strict, so
+that row is not repeated. The engine's own stamps never collide
+(`%st-now` is monotonic per image), so two rows share an instant only
+when a caller stamped them so with `retract-claim :at`; a reader that
+pages inside such a tie is the caller's to reason about. The functor
+may be written by hand, `(claim-touched-after ?c ?t after family)`,
+with `family` `nil` for every family; with `?c` bound it filters. A
+rule body may not name it, and may not write a `claim-touched-at` goal
+whose claim no `claim/7` or `claim-absent/7` premise binds --
+`compile-rule` refuses both, in those words -- since the rewrite would
+make it a generator the reads and strata analyses never counted.
+`explain-goals` reports a hand-written goal as "touched-at index of F
+from the cursor", "touched-at index of every family from the cursor"
+or "that claim".
+
 `claim/7` is deliberately **not** `declare-functor-cost-unbounded`'d.
 That classifies a whole functor, and `%excluded-predicate-p` would
 then withhold `claim` from free text entirely -- breaking the guarded
@@ -326,6 +365,16 @@ goal or cut between the two, a comparison inside `or`, `not`, `if`,
 A `select` is rewritten when its file compiles, so a file compiled
 before `graph-db/rules` loaded is not fused until recompiled; a guarded
 query is compiled per request and always is.
+
+The change-feed pair, `(claim-touched-at ?c ?t) (instant> ?t cursor)`,
+is the other fusion (#392, "The touched-at route"): it changes the
+order. The fused feed answers in **ascending touched instant** across
+the stores in scope -- ties in scope order, then family order -- with
+this run's own derivation last, in place of the key order the
+vocabulary route would have given; that is the order a feed wants, and
+the one its cursor protocol depends on. `*clause-body-rewriters*`
+promises the same solutions, and the order only where the rewriter's
+own documentation says so.
 
 `claim-after/9` may be written by hand:
 `(claim-after ?c family sns ?skey rel ons ?okey skey-after okey-after)`
