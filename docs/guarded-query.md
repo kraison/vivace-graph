@@ -1,7 +1,7 @@
 # graph-db/query: running untrusted query text safely
 
 `graph-db/query` (GH #322) is a web-free ASDF subsystem,
-`:depends-on (:graph-db/core)` only, holding the two reviewed ways to
+`:depends-on (:graph-db/core :cl-json)` only, holding the two reviewed ways to
 run query text an operator did not write: the JSON pattern DSL
 (package `graph-db`, `query/dsl.lisp`, GH #44/#278) and the free-text
 Prolog guard (package `graph-db.query`, `query/guard.lisp`, GH #279).
@@ -21,7 +21,8 @@ hands a language model a query tool depends on `graph-db/core` and
 (ql:quickload :graph-db/query)
 ```
 
-Pulls in `graph-db/core` and nothing web-facing. The exported guard
+Pulls in `graph-db/core`, cl-json for the DSL, and nothing web-facing.
+`graph-db/core` itself has no JSON dependency (GH #462). The exported guard
 API lives in `graph-db.query`. The DSL's exports (`compile-pattern-query`,
 `run-pattern-query`, `def-query`, and friends) stay in `graph-db`; the
 runner behind them, `run-query-goals`, is internal, and the exported way

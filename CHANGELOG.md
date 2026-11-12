@@ -159,6 +159,7 @@ storage formats (#60).
 
 ### Changed
 
+- **`graph-db/core` no longer depends on cl-json** (#462), nor, through it, does `graph-db/replication`.`graph-db/query` (the pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and `graph-db/gui` already did, so a consumer of `graph-db`, `graph-db/query` or `graph-db/gui` loads it as before.
 - **`trace-prolog` prints the four ports** (#124), one line per
   call, exit, redo and fail indented by depth, plus the clause a
   dispatcher tries; `(trace-prolog 'name)` traces every arity of one
