@@ -599,11 +599,22 @@ GOALS itself when nothing fuses (#451, spec §2)."
 (defun %fuse-touched-cursor (goals)
   "GOALS with each (claim-touched-at ?c ?t) (instant> ?t B) pair fused
 into CLAIM-TOUCHED-AFTER/4 by design D4's two shapes; the comparison
-stays.  Returns GOALS itself when nothing fuses (#392)."
+stays.  Shape 1 fuses only a CLAIM/7 goal with no key bound -- a
+vocabulary route or the walk -- since a key probe is already cheaper
+than the family's tail.  Returns GOALS itself when nothing fuses
+(#392)."
   (let ((out '()) (changed nil) (rest goals)
         (functor (intern "CLAIM-TOUCHED-AFTER" (symbol-package 'claim/7))))
-    (flet ((fresh-in (goals var)
-             (notany (lambda (g) (%var-occurs-p var g)) goals)))
+    (labels ((fresh-in (goals var)
+               (notany (lambda (g) (%var-occurs-p var g)) goals))
+             (key-free-p (claim-goal before)
+               ;; (claim ?c family sns skey rel ons okey): the keys
+               ;; are the fifth and eighth elements.
+               (let ((skey (fifth claim-goal)) (okey (eighth claim-goal)))
+                 (and (variable-p skey) (fresh-in before skey)
+                      (or (null okey)
+                          (and (variable-p okey)
+                               (fresh-in before okey)))))))
       (loop while rest
             do (let ((goal (pop rest)))
                  (if (not (and (%engine-functor-goal-p
@@ -619,6 +630,7 @@ stays.  Returns GOALS itself when nothing fuses (#392)."
                                    (%engine-functor-goal-p prev "CLAIM" 7)
                                    (eq (second prev) c)
                                    (fresh-in (rest out) c)
+                                   (key-free-p prev (rest out))
                                    (not (and (variable-p b)
                                              (%var-occurs-p b prev))))
                               ;; Shape 1: generator, then the claim goal

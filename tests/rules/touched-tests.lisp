@@ -295,3 +295,27 @@ an instant and signals, as the text asks."
         (claim ?c rt-claim "host" ?k "up" ?ons ?o)
         (claim-touched-at ?c ?t)
         (instant> ?t ?k)))))
+
+(test ttf-a-key-bound-claim-goal-is-not-fused
+  "A CLAIM/7 goal with its key bound already has a one-lookup route; the
+pair after it stays a filter rather than a scan of the family's tail
+(review of #392)."
+  (with-rules-graph (g)
+    (seed-keys g 5)
+    (counting-lookups (n)
+      (is (= 1 (select-count (?c)
+                 (claim ?c rt-claim "host" "k01" ?r ?ons ?o)
+                 (claim-touched-at ?c ?t)
+                 (instant> ?t "2020-01-01"))))
+      (is (= 1 n)))))
+
+(test tta-compile-rule-refuses-a-pair-before-its-premise
+  "The premise must bind ?c BEFORE the pair: written first, the pair
+would fuse as the every-family generator in round 0 (review of #392)."
+  (refuses "bind ?c with claim/7 first"
+           :name "r" :version "1" :family "rt-claim"
+           :head *tta-head*
+           :body (concatenate
+                  'string
+                  "(claim-touched-at ?c ?t) (instant> ?t \"2020-01-01\") "
+                  "(claim ?c rt-claim \"host\" ?k \"runs\" ?ons ?o)")))

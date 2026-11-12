@@ -28,7 +28,8 @@ storage formats (#60).
   merged into one ascending sequence, every family when none is named;
   the compiler fuses the change feed's existing text --
   `(claim ...) (claim-touched-at ?c ?t) (instant> ?t cursor)`, or the
-  pair alone -- into it, so no reader changes a line. The fused feed
+  pair alone -- into it, so no reader changes a line; the pair alone,
+  which answered nothing before, now generates. The fused feed
   answers in touched order rather than key order (`docs/rules.md`,
   "Solution order"); `*clause-body-rewriters*` now promises the
   solutions, and the order only where a rewriter's documentation says

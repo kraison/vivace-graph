@@ -467,17 +467,18 @@ CLAIM-TOUCHED-AT and the comparison (#392)."
 
 (defun %touched-at-without-premise-p (goals)
   "Some TOP-LEVEL CLAIM-TOUCHED-AT/2 goal of GOALS names a variable no
-top-level CLAIM/7 or CLAIM-ABSENT/7 goal binds: a dead filter today,
-and after D4 a generator the reads and strata analyses never counted
-(#392)."
-  (some (lambda (goal)
-          (and (%engine-goal-p goal "CLAIM-TOUCHED-AT" 2)
-               (%variable-p (second goal))
-               (not (some (lambda (premise)
-                            (and (%claim-read-goal-p premise)
-                                 (eq (second premise) (second goal))))
-                          goals))))
-        goals))
+top-level CLAIM/7 or CLAIM-ABSENT/7 goal BEFORE it binds: a dead filter
+unfused, and a generator the reads and strata analyses never counted
+once the pair fuses (#392, D3).  Positional, since the body runs as
+written and %ORDER-BODY hoists only CLAIM-PRODUCER/2."
+  (loop for tail on goals
+        for goal = (first tail)
+        thereis (and (%engine-goal-p goal "CLAIM-TOUCHED-AT" 2)
+                     (%variable-p (second goal))
+                     (notany (lambda (premise)
+                               (and (%claim-read-goal-p premise)
+                                    (eq (second premise) (second goal))))
+                             (ldiff goals tail)))))
 
 (defun %not-goal-p (goal)
   "(not G): the guard admits only a full goal as G."

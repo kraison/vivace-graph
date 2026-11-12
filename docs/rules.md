@@ -303,20 +303,27 @@ when the claim variable is fresh: right after a `claim/7` goal on it
 that no earlier goal names (`(claim-touched-after ?c ?t cursor f)
 (claim ...) (instant> ...)`, the generator first and the `claim/7`
 goal filtering by its bound-claim route), or on its own with nothing
-before it binding `?c` (every family). The comparison stays in the
-body, so a claim the index skips is one it would have rejected. Not
-fused, and so a filter paid for by the comparison: `?c` bound by an
-earlier goal, a goal between the three, the pair inside `or`, `not`,
-`if`, `once` or `forall`, `instant>=`, a cursor variable the `claim/7`
-goal itself binds. The generator reads every store in scope and merges
+before it binding `?c` (every family). That second shape is the one
+place the rewrite changes an answer: a filter on an unbound claim
+failed, so the pair written first answered nothing before #392 and
+generates now. The comparison stays in the body, so a claim the index
+skips is one it would have rejected. Not fused, and so a filter paid
+for by the comparison: `?c` bound by an earlier goal, a `claim/7` goal
+with a key bound (a key probe is already cheaper than the family's
+tail), a goal between the three, the pair inside `or`, `not`, `if`,
+`once` or `forall`, `instant>=`, a cursor variable the `claim/7` goal
+itself binds. The generator reads every store in scope and merges
 them into one sequence ascending by touched instant, this run's own
 derivation last, under `*claim-exclude-producers*` as `claim/7`'s
 routes are. The cursor protocol: a reader advances its cursor to the
 last `?t` of a page it consumed in full; the comparison is strict, so
 that row is not repeated. The engine's own stamps never collide
-(`%st-now` is monotonic per image), so two rows share an instant only
-when a caller stamped them so with `retract-claim :at`; a reader that
-pages inside such a tie is the caller's to reason about. The functor
+within one image (`%st-now` is monotonic per image), so in one store
+two rows share an instant only when a caller stamped them so with
+`retract-claim :at`; two stores in scope written by two images can
+share one without it. A page boundary inside such a tie drops the
+rows after it: a reader that may meet one pages wider than its ties,
+or re-reads from the previous cursor and drops the ids it has. The functor
 may be written by hand, `(claim-touched-after ?c ?t after family)`,
 with `family` `nil` for every family; with `?c` bound it filters. A
 rule body may not name it, and may not write a `claim-touched-at` goal
