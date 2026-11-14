@@ -511,10 +511,18 @@ true value, or NIL."
         (is-false (claim-current-p again))))
     (is-true (run-rules-is-quiet g))))
 
+(defparameter *settled-slow-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+   (claim-recorded-at ?p ?r) (instant-offset ?r \"PT3S\" ?d)
+   (now ?t) (instant>= ?t ?d)"
+  "*SETTLED-BODY* with a three-second flip: a close and reopen on a
+loaded ECL image crossed one second, the timer thread popped the timer
+before the status read, and :TIMERS was 0 (#494).")
+
 (test a-reopened-store-still-fires-a-pending-threshold
   (with-rules-graph-dir (g dir)
     (write-rule g :name "settled" :version "1" :family "rtt-claim"
-                  :head *settled-head* :body *settled-body*)
+                  :head *settled-head* :body *settled-slow-body*)
     (graph-db.rules:enable-forward-rules g)
     (commit-runs-web g "h1")
     (close-graph g)
@@ -526,7 +534,7 @@ true value, or NIL."
              (is (eql 1 (getf (graph-db.rules:forward-rules-status g2)
                               :timers)))
              (is (equal '("h1")
-                        (wait-until (lambda () (settled-hosts g2)) 3))))
+                        (wait-until (lambda () (settled-hosts g2)) 5))))
         (close-graph g2)))))
 
 (test closing-the-graph-stops-its-timers-and-drops-its-queue
