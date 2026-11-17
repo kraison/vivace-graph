@@ -246,5 +246,5 @@
       (when table
         (close-memory *test-heap*)
         (close-vev-index table)
-        (cl-fad:delete-directory-and-files "/var/tmp/vev2/")))))
+        (uiop:delete-directory-tree #p"/var/tmp/vev2/" :validate t)))))
 |#

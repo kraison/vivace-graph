@@ -792,6 +792,22 @@ accepted -- loudly."
           (is (equal '(:legacy) reasons))
           (is (equal (namestring file) (namestring chosen))))))))
 
+(test the-newest-snapshot-is-found-from-a-txn-dir-without-a-slash
+  "REPLAY's TXN-DIR is public, and \"/x/txn-log\" names the directory as
+well as \"/x/txn-log/\" does.  cl-fad listed either; some UIOPs list
+/x/ for the first, which holds no snapshot (GH #461)."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Slashless"))
+        (graph-db:snapshot g)))
+    (let ((with-slash (%bk-latest-snap (namestring dir)))
+          (without (graph-db::find-newest-snapshot
+                    (namestring (merge-pathnames "txn-log" dir)))))
+      (is-true with-slash)
+      (is (equal (and with-slash (namestring with-slash))
+                 (and without (namestring without)))))))
+
 (test an-interrupted-snapshot-never-bears-the-snap-name
   "GH #127.  The writer works under in-progress.* -- a name the ^snap-
 scan can never match -- and renames only after the completion trailer is
@@ -817,7 +833,7 @@ partial is deleted on the way out."
                         (remove-if-not
                          (lambda (f)
                            (cl-ppcre:scan "^snap-" (file-namestring f)))
-                         (cl-fad:list-directory
+                         (uiop:directory-files
                           (format nil "~A/txn-log/" (namestring dir))))
                         ;; and no stranded partial in in-progress/
                         (directory

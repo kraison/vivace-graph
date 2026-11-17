@@ -11,11 +11,71 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
-This section carries a **MAJOR** change: the spatial contract and two
+### Security
+
+- **A REST login no longer hands the password to `/bin/sh`** (#461).
+  `auth-rest-user` spliced the request's password into an
+  `openssl passwd` command line and ran it through the shell before any
+  comparison, so anyone who knew one username could run commands as the
+  server's user by putting a `;` in the password, on all 13
+  `with-rest-auth` routes. openssl now runs from an argument list with
+  the password on stdin, and so does `htpasswd -i` for `add-rest-user`;
+  the password is no longer on a command line, where `ps` showed it. The
+  login no longer logs both hashes at warn level on every attempt. It
+  compares them exactly (`equalp` ignored case) and in constant time,
+  and refuses a missing password, which used to be hashed as the string
+  `"NIL"`. An entry it cannot check (bcrypt, `$6$rounds=`) is a refusal,
+  not an error. `add-rest-user` now needs htpasswd from httpd 2.4, and
+  signals an error when htpasswd fails or when the username or password
+  would corrupt the file. Passwords still travel as request parameters.
+
+### Removed
+
+- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
+  lists and walks directories with UIOP, which ships with ASDF, so
+  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
+  (`replay`'s `txn-dir`) takes the directory with or without a trailing
+  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
+  programs with UIOP. `visualize :render` hands Graphviz the paths as
+  arguments, so a path containing a space, a quote or a `;` now renders.
+
+### Changed
+
+- **`graph-db/core` no longer depends on cl-json** (#462), nor,
+  through it, does `graph-db/replication`. `graph-db/query` (the
+  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
+  `graph-db/gui` already did, so a consumer of `graph-db`,
+  `graph-db/query` or `graph-db/gui` loads it as before.
+
+## [5.0.0] - 2026-11-17
+
+A **MAJOR** release: the spatial contract and two
 storage formats (#60).
 
 ### Added
 
+- **The touched-at index** (#392): every claim family carries an
+  ordered index on its transaction extent, keyed by the instant the
+  record last changed (`extent-sexp-touched-key`: the retraction when
+  closed, else the recording), maintained by the general index's own
+  update path at creation, `retract-claim` and a re-open.
+  `claims-touched-after` reads it from a cursor in ascending touched
+  order, both arities, retracted claims included, with
+  `:limit`/`:offset`; `claim-touched-at` is the instant itself. In
+  Prolog, `claim-touched-after/4` generates over every store in scope,
+  merged into one ascending sequence, every family when none is named;
+  the compiler fuses the change feed's existing text --
+  `(claim ...) (claim-touched-at ?c ?t) (instant> ?t cursor)`, or the
+  pair alone -- into it, so no reader changes a line; the pair alone,
+  which answered nothing before, now generates. The fused feed
+  answers in touched order rather than key order (`docs/rules.md`,
+  "Solution order"); `*clause-body-rewriters*` now promises the
+  solutions, and the order only where a rewriter's documentation says
+  so. `compile-rule` refuses the functor in a rule body and a
+  `claim-touched-at` goal no premise binds; standing text may not name
+  it. On the bench the claim-first feed over 20,000 claims with the
+  cursor past 95 % of them went from 5.98 s to 0.047 s for its 1,000
+  rows (`docs/perf-baselines.md`).
 - **The compiled query cache** (#376): `run-query-goals` canonicalises
   a query's shape (variables renamed, string, number and character
   literals lifted into a run-time vector) and keeps a bounded,
@@ -138,32 +198,73 @@ storage formats (#60).
   exported, for a caller that kept `guard-query-text`'s goals; the doc
   no longer calls `run-query-goals` exported.
 
-### Fixed
 
-- **One recompile parses each rule's text once** (#474). Compiling every
-  rule in scope guarded every other rule's text per rule compiled, so a
-  forward store's recompile after a `production` write was quadratic in
-  the rules; the dependency edges are now memoised for the length of one
-  recompile, and a test counts the guard calls.
-- **A forward step's rounds guard measures a chain of deltas each fed
-  by an action from the last** (#472, #475). A steady stream of commits
-  from other threads used to trip it and drop the whole queue, losing
-  those commits' derivations and firings until a `run-rules`; now each
-  queued delta carries a generation, only the delta at the bound is
-  dropped, and foreign commits and actions that write without feeding
-  their own read never count.
-- Refuse malformed ISO duration numbers without invoking the Lisp reader,
-  queue commits during forward opt-in, and clarify shutdown, firing history
-  and costs; cap compile failures, late-bind production actions, reset
-  inference counts, reuse compiled rules, and report match errors (#464).
+- **Forward evaluation of rules** (#456, design
+  `docs/superpowers/specs/2026-11-04-forward-rules-design.md`). A
+  store that calls `enable-forward-rules` derives at commit: each
+  committed transaction's claim writes become a weighted delta, the
+  strata that read what changed run from it through the fixpoint
+  machinery, and nothing calls `run-rules`. `claim-absent/7` answers
+  the determined absences (standing `:searched-empty` or
+  `:determined-empty`) as the second negation beside `not/1`.
+  `graph-db:*after-commit-hooks*` is the core seam: functions of the
+  committed transaction, called after `with-transaction`'s retry loop
+  outside every lock. `now/1` and `instant-offset/3` let a body state
+  a threshold against the evaluation instant; a forward-enabled store
+  schedules its own re-evaluation at the flip instant. The `graph-db`
+  package now shadows `now`, so the guard resolves the functor rather
+  than local-time's. `def-production` and the stored `production`
+  record add OPS5-style productions on the same machinery: a matching
+  body derives a durable `firing` claim keyed by the premises'
+  identities and the action runs from a salience-ordered agenda.
+  `def-rules-schema` now also declares the `production` record and
+  the `firing` family.
+
+- **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
+  subject and object keys, tested with `>/2`'s own predicate as a filter
+  on every route and as a skip on the namespace route; a `nil` or
+  unbound bound admits every row. The compiler writes it for a `claim/7`
+  followed at once by a `>` on its key; it may be written by hand, and
+  a rule body is refused it (`compile-rule`). The engine hook is
+  `*clause-body-rewriters*`, functions a subsystem registers to rewrite
+  a clause body before it compiles.
+- `node-geometries` (every `(slot . geometry)` a node occupies) and
+  `node-slot-geometry`; an application `node-geometry` method stays the
+  authority for its class and, on a single-slot class, may
+  `call-next-method`; on a multi-slot class the default signals under
+  `:error`, on the write path too.
+- Prolog `find-within/4`, `find-intersects/4`, `find-near/6` and
+  `find-nearest/6`, the slot in third position; the old arities remain
+  and resolve unnamed.
+
+**Re-check list for a consumer's port** (do these before setting the
+policy back to `:error`):
+
+1. Every spatial call site on a class with several geometry slots names
+   its `:slot`, in Lisp and in Prolog.
+2. Every `node-geometry` method written only to choose between indexed
+   slots is deleted; the slot name on the query replaces it. One of the
+   shape `(or (slot-value n 'outline) (call-next-method))` now signals on
+   a multi-slot class: rewrite it to return its geometry and slot,
+   `(values geometry 'outline)`, or delete it.
+3. Every registration source on a multi-slot registry says which geometry
+   it registers against (`:registry-slot`) and, when the source itself has
+   several, which one it registers (`:geometry-fn`).
+4. Schema tests that called `audit-spatial-slots` are dropped.
+5. Reopen each store once with time for the re-derivation; a large graph
+   rebuilds every spatial index at that open.
 
 ### Changed
 
-- **`graph-db/core` no longer depends on cl-json** (#462), nor,
-  through it, does `graph-db/replication`. `graph-db/query` (the
-  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
-  `graph-db/gui` already did, so a consumer of `graph-db`,
-  `graph-db/query` or `graph-db/gui` loads it as before.
+- **The examples and the manual reach the engine units:**
+  `examples/example.lisp` walks asserted clauses, `table-functor`,
+  `aggregate-all/3`, `reachable/3`, `k-hop/4` and `explain-goals`;
+  `examples/example-spacetime.lisp` ends with a stored rule under
+  `run-rules` and forward evaluation, a retraction losing its
+  derivation, and the change feed read both ways; the manual's
+  Chapter 18 documents `claim-touched-at` and
+  `claims-touched-after` beside the other readers.
+
 - **`trace-prolog` prints the four ports** (#124), one line per
   call, exit, redo and fail indented by depth, plus the clause a
   dispatcher tries; `(trace-prolog 'name)` traces every arity of one
@@ -261,7 +362,31 @@ storage formats (#60).
   says which of a registry's geometries it registers against and which of
   its own geometries it registers.
 
+### Removed
+
+- `audit-spatial-slots`, `node-geometry-slots-with-values`,
+  `*node-geometry-multi-sample-limit*` and the write-path "inert slot"
+  warning: there is no inert slot any more.
+
 ### Fixed
+
+- **One recompile parses each rule's text once** (#474). Compiling every
+  rule in scope guarded every other rule's text per rule compiled, so a
+  forward store's recompile after a `production` write was quadratic in
+  the rules; the dependency edges are now memoised for the length of one
+  recompile, and a test counts the guard calls.
+- **A forward step's rounds guard measures a chain of deltas each fed
+  by an action from the last** (#472, #475). A steady stream of commits
+  from other threads used to trip it and drop the whole queue, losing
+  those commits' derivations and firings until a `run-rules`; now each
+  queued delta carries a generation, only the delta at the bound is
+  dropped, and foreign commits and actions that write without feeding
+  their own read never count.
+- Refuse malformed ISO duration numbers without invoking the Lisp reader,
+  queue commits during forward opt-in, and clarify shutdown, firing history
+  and costs; cap compile failures, late-bind production actions, reset
+  inference counts, reuse compiled rules, and report match errors (#464).
+
 
 - **Spatial queries in an image that also loads `graph-db/rules`**
   (#451, found by CI). Since #60 landed, spatial-registry.lisp and
@@ -276,69 +401,6 @@ storage formats (#60).
   for the first time since the fixture was made; red on every push since
   c1411c8, invisible to pull requests, which run the fast tier. The
   fingerprint now excludes the sidecar beside schema.dat and tx/.
-
-### Removed
-
-- `audit-spatial-slots`, `node-geometry-slots-with-values`,
-  `*node-geometry-multi-sample-limit*` and the write-path "inert slot"
-  warning: there is no inert slot any more.
-
-### Added
-
-- **Forward evaluation of rules** (#456, design
-  `docs/superpowers/specs/2026-11-04-forward-rules-design.md`). A
-  store that calls `enable-forward-rules` derives at commit: each
-  committed transaction's claim writes become a weighted delta, the
-  strata that read what changed run from it through the fixpoint
-  machinery, and nothing calls `run-rules`. `claim-absent/7` answers
-  the determined absences (standing `:searched-empty` or
-  `:determined-empty`) as the second negation beside `not/1`.
-  `graph-db:*after-commit-hooks*` is the core seam: functions of the
-  committed transaction, called after `with-transaction`'s retry loop
-  outside every lock. `now/1` and `instant-offset/3` let a body state
-  a threshold against the evaluation instant; a forward-enabled store
-  schedules its own re-evaluation at the flip instant. The `graph-db`
-  package now shadows `now`, so the guard resolves the functor rather
-  than local-time's. `def-production` and the stored `production`
-  record add OPS5-style productions on the same machinery: a matching
-  body derives a durable `firing` claim keyed by the premises'
-  identities and the action runs from a salience-ordered agenda.
-  `def-rules-schema` now also declares the `production` record and
-  the `firing` family.
-
-- **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
-  subject and object keys, tested with `>/2`'s own predicate as a filter
-  on every route and as a skip on the namespace route; a `nil` or
-  unbound bound admits every row. The compiler writes it for a `claim/7`
-  followed at once by a `>` on its key; it may be written by hand, and
-  a rule body is refused it (`compile-rule`). The engine hook is
-  `*clause-body-rewriters*`, functions a subsystem registers to rewrite
-  a clause body before it compiles.
-- `node-geometries` (every `(slot . geometry)` a node occupies) and
-  `node-slot-geometry`; an application `node-geometry` method stays the
-  authority for its class and, on a single-slot class, may
-  `call-next-method`; on a multi-slot class the default signals under
-  `:error`, on the write path too.
-- Prolog `find-within/4`, `find-intersects/4`, `find-near/6` and
-  `find-nearest/6`, the slot in third position; the old arities remain
-  and resolve unnamed.
-
-**Re-check list for a consumer's port** (do these before setting the
-policy back to `:error`):
-
-1. Every spatial call site on a class with several geometry slots names
-   its `:slot`, in Lisp and in Prolog.
-2. Every `node-geometry` method written only to choose between indexed
-   slots is deleted; the slot name on the query replaces it. One of the
-   shape `(or (slot-value n 'outline) (call-next-method))` now signals on
-   a multi-slot class: rewrite it to return its geometry and slot,
-   `(values geometry 'outline)`, or delete it.
-3. Every registration source on a multi-slot registry says which geometry
-   it registers against (`:registry-slot`) and, when the source itself has
-   several, which one it registers (`:geometry-fn`).
-4. Schema tests that called `audit-spatial-slots` are dropped.
-5. Reopen each store once with time for the re-derivation; a large graph
-   rebuilds every spatial index at that open.
 
 ## [4.1.0] - 2026-10-31
 

@@ -457,6 +457,29 @@ and the comparison (#451)."
        (or (%engine-goal-p goals "CLAIM-AFTER" 9)
            (some #'%mentions-claim-after-p goals))))
 
+(defun %mentions-touched-after-p (goals)
+  "A CLAIM-TOUCHED-AFTER/4 goal anywhere in GOALS, at any nesting: the
+reads and strata analyses recognise CLAIM/7 by name, so a rule writes
+CLAIM-TOUCHED-AT and the comparison (#392)."
+  (and (consp goals)
+       (or (%engine-goal-p goals "CLAIM-TOUCHED-AFTER" 4)
+           (some #'%mentions-touched-after-p goals))))
+
+(defun %touched-at-without-premise-p (goals)
+  "Some TOP-LEVEL CLAIM-TOUCHED-AT/2 goal of GOALS names a variable no
+top-level CLAIM/7 or CLAIM-ABSENT/7 goal BEFORE it binds: a dead filter
+unfused, and a generator the reads and strata analyses never counted
+once the pair fuses (#392, D3).  Positional, since the body runs as
+written and %ORDER-BODY hoists only CLAIM-PRODUCER/2."
+  (loop for tail on goals
+        for goal = (first tail)
+        thereis (and (%engine-goal-p goal "CLAIM-TOUCHED-AT" 2)
+                     (%variable-p (second goal))
+                     (notany (lambda (premise)
+                               (and (%claim-read-goal-p premise)
+                                    (eq (second premise) (second goal))))
+                             (ldiff goals tail)))))
+
 (defun %not-goal-p (goal)
   "(not G): the guard admits only a full goal as G."
   (and (consp goal) (symbolp (first goal))
@@ -903,6 +926,12 @@ by both a stored rule and a DEF-RULE is a collision, refused."
       (when (%mentions-claim-after-p goals)
         (%refuse spec "claim-after/9 is not a rule premise: write ~
 claim/7 and the comparison, the compiler fuses them (#451)"))
+      (when (%mentions-touched-after-p goals)
+        (%refuse spec "claim-touched-after/4 is not a rule premise: write ~
+claim-touched-at and the comparison, the compiler fuses them (#392)"))
+      (when (%touched-at-without-premise-p goals)
+        (%refuse spec "claim-touched-at reads a premise's claim: bind ?c ~
+with claim/7 first (#392)"))
       (let* ((head (first goals))
              (body (%order-body (rest goals)))
              (body-vars (%body-variables spec body)))

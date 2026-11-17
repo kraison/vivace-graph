@@ -314,24 +314,25 @@ sweep of each table."
       (values (as-alist v) (as-alist e)))))
 
 (defun %on-disk-size (graph)
-  "Total bytes of the files under GRAPH's directory; unreadable files
-count zero."
+  "Total bytes of the files under GRAPH's directory, at any depth;
+unreadable files count zero."
   (let ((apparent 0) (allocated 0))
-    (fad:walk-directory
-     (graph-db::location graph)
-     (lambda (file)
-       (let ((size (or (ignore-errors
-                        (with-open-file (s file :element-type
-                                             '(unsigned-byte 8))
-                          (file-length s)))
-                       0)))
-         (incf apparent size)
-         ;; Sparse mmap stores: GiB apparent for MiB of data (GH #274).
-         (incf allocated (or (ignore-errors
-                              (graph-db::%posix-allocated-size
-                               (namestring file)))
-                             size))))
-     :directories nil)
+    (uiop:collect-sub*directories
+     (uiop:ensure-directory-pathname (graph-db::location graph))
+     t t
+     (lambda (directory)
+       (dolist (file (uiop:directory-files directory))
+         (let ((size (or (ignore-errors
+                          (with-open-file (s file :element-type
+                                               '(unsigned-byte 8))
+                            (file-length s)))
+                         0)))
+           (incf apparent size)
+           ;; Sparse mmap stores: GiB apparent for MiB of data (GH #274).
+           (incf allocated (or (ignore-errors
+                                (graph-db::%posix-allocated-size
+                                 (namestring file)))
+                               size))))))
     (values allocated apparent)))
 
 (defun %schema-summary (graph parent)

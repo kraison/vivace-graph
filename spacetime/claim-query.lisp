@@ -595,6 +595,39 @@ when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
     ;; (INDEX-LOOKUP, GH #408, #411).
     (%paginate all limit offset)))
 
+(defun claim-touched-at (claim)
+  "A LOCAL-TIME:TIMESTAMP: the instant CLAIM's transaction record last
+changed (the retraction when retracted, else the recording), or NIL for
+a claim predating the axis, a REAPED-CLAIM, or an extent with no
+timestamp edge (GH #392, design D2)."
+  (%extent-touched-at (claim-transaction-extent claim)))
+
+(defun claims-touched-after (graph claim-class after &key limit offset)
+  "CLAIM-CLASS's claims (a PARENT; both arities) whose touched instant
+is strictly after AFTER, a TIMESTAMP or an RFC 3339 string, ascending by
+touched instant; retracted claims included; an open transaction's own
+writes included.  Second value T when :LIMIT cut claims off (GH #392,
+design D2).  Signals UNKNOWN-CLAIM-FAMILY for an unregistered class, and
+the index's QUERY-PRECONDITION-ERROR when GRAPH's schema lacks it."
+  (let* ((family (claim-family claim-class))
+         (cursor (if (stringp after)
+                     (local-time:parse-timestring after)
+                     after))
+         ;; The cursor enters as a synthetic open extent at AFTER, whose
+         ;; touched key is AFTER's; the scan starts at that key inclusive
+         ;; and the equal instant is dropped by value below (design D2).
+         (rows (graph-db:index-range
+                graph (claim-family-parent family)
+                'transaction-extent-sexp
+                :start (extent->sexp
+                        (%open-transaction-extent cursor))))
+         (kept (loop for c in rows
+                     for touched = (claim-touched-at c)
+                     when (and touched
+                               (local-time:timestamp> touched cursor))
+                       collect c)))
+    (%paginate kept limit offset)))
+
 (defun delete-claims-by-producer (graph claim-class producer)
   "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS
 is the PARENT, so one call sweeps both arities.

@@ -2371,6 +2371,11 @@ The REST API is protected by a username and password authentication system. It u
 
 *Important:* Authentication credentials are *not* sent via standard HTTP Basic Auth headers. Instead, they must be included as `username` and `password` fields in the JSON body of *every single request*.
 
+**** What runs, and which entries are accepted
+~add-rest-user~ and ~delete-rest-user~ run ~*htpasswd-bin*~ (default ~/usr/bin/htpasswd~; it must be Apache httpd 2.4's, whose ~-i~ flag reads the password from stdin), and every login runs ~openssl passwd~ from ~PATH~. Both run from argument lists, never through a shell, and the password reaches them on stdin, so it never appears on a command line where ~ps~ would show it (#461).
+
+A login checks entries of the form ~$alg$salt$hash~ for the algorithms ~openssl passwd~ takes as a flag: ~apr1~ (htpasswd's default), ~1~, ~5~ and ~6~. Any other entry, including a bcrypt one written by ~htpasswd -B~, refuses every password. The computed and stored hashes are compared exactly, case included, and the comparison takes the same time wherever they differ. A missing password, or one containing a newline, carriage return or NUL, is refused. ~add-rest-user~ signals an error for such a password, for a username that is empty or contains a colon or a line break, and when htpasswd exits non-zero.
+
 **** Creating a User
 To add a new user, call the ~add-rest-user~ function from your Lisp environment. This will create or update the password file (named ~rpasswd~ by default in the current directory).
 
@@ -6339,6 +6344,34 @@ cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
 ~claims-by-producer~ paginates the same way (vivace-graph#302).
 
+~claim-touched-at~ (a claim) is the instant its transaction record last
+changed: the retraction when retracted, else the recording; ~NIL~ for a
+claim predating the axis, a ~reaped-claim~, or an extent with no
+timestamp edge. ~claims-touched-after~ reads the family's *touched-at
+index*, an ordered index on the transaction extent that
+~def-claim-classes~ declares and every create, retraction and re-open
+maintains (vivace-graph#392; ~docs/general-index-design.md~ §4): the
+family's claims, both arities, touched strictly after a cursor,
+ascending by touched instant, retracted claims included, an open
+transaction's own writes included. It is the change-feed read: the
+consumer keeps the largest instant of the last page as its cursor, and
+a claim whose record moved after it appears once, at its new instant.
+
+#+BEGIN_SRC lisp
+  (claims-touched-after graph 'region-state "2026-01-01T00:00:00Z")
+  ;; => the claims touched after that instant, oldest first;
+  ;;    second value T when :LIMIT cut the list
+  (claim-touched-at (first (claims-by-producer graph 'region-state "ingest")))
+  ;; => a LOCAL-TIME:TIMESTAMP, or NIL
+#+END_SRC
+
+The cursor is a ~TIMESTAMP~ or an RFC 3339 string; ~:LIMIT~ and
+~:OFFSET~ page as ~claims-by-producer~ does. The same read from Prolog
+is ~claim-touched-after/4~, which the compiler also produces from a
+feed's own text, ~(claim-touched-at ?c ?t) (instant> ?t cursor)~
+(~docs/rules.md~, "The touched-at route"); ~examples/example-spacetime.lisp~
+ends with both.
+
 ~:AS-OF~ (a TIMESTAMP) answers on the *transaction* axis
 (vivace-graph#300): each claim comes back as the *version* believed at
 that instant. An in-place update after the instant is unwound to the
@@ -7476,7 +7509,10 @@ This chapter provides a categorized reference for the most important exported sy
   Stops the REST API server.
 
 - ~add-rest-user (username password)~ ::
-  Creates a new user account for authenticating with the REST API.
+  Creates a new user account for authenticating with the REST API, via ~htpasswd -i~ (httpd 2.4). Signals an error when htpasswd fails or an argument cannot be stored.
+
+- ~delete-rest-user (username)~ ::
+  Removes a user account with ~htpasswd -D~. Signals ~uiop:subprocess-error~ when htpasswd fails.
 
 **** Concurrency & Locking (Advanced)
 - ~make-rw-lock ()~ ::
