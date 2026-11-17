@@ -9,6 +9,361 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
+## [5.0.0] - 2026-11-17
+
+A **MAJOR** release: the spatial contract and two
+storage formats (#60).
+
+### Added
+
+- **The touched-at index** (#392): every claim family carries an
+  ordered index on its transaction extent, keyed by the instant the
+  record last changed (`extent-sexp-touched-key`: the retraction when
+  closed, else the recording), maintained by the general index's own
+  update path at creation, `retract-claim` and a re-open.
+  `claims-touched-after` reads it from a cursor in ascending touched
+  order, both arities, retracted claims included, with
+  `:limit`/`:offset`; `claim-touched-at` is the instant itself. In
+  Prolog, `claim-touched-after/4` generates over every store in scope,
+  merged into one ascending sequence, every family when none is named;
+  the compiler fuses the change feed's existing text --
+  `(claim ...) (claim-touched-at ?c ?t) (instant> ?t cursor)`, or the
+  pair alone -- into it, so no reader changes a line; the pair alone,
+  which answered nothing before, now generates. The fused feed
+  answers in touched order rather than key order (`docs/rules.md`,
+  "Solution order"); `*clause-body-rewriters*` now promises the
+  solutions, and the order only where a rewriter's documentation says
+  so. `compile-rule` refuses the functor in a rule body and a
+  `claim-touched-at` goal no premise binds; standing text may not name
+  it. On the bench the claim-first feed over 20,000 claims with the
+  cursor past 95 % of them went from 5.98 s to 0.047 s for its 1,000
+  rows (`docs/perf-baselines.md`).
+- **The compiled query cache** (#376): `run-query-goals` canonicalises
+  a query's shape (variables renamed, string, number and character
+  literals lifted into a run-time vector) and keeps a bounded,
+  thread-safe per-image cache of compiled `select` functions keyed on
+  the shape and a functor generation; a shape runs interpreted on its
+  first sight and compiled from its second. Limits, offsets, budgets
+  and the callback are read at run time, so one entry serves every
+  call. The generation moves on `<-`, `reset-functor`, `table-functor`,
+  `untable-functor`, the deletion of a functor with clauses and an edge
+  type's install. `clear-query-cache`, `query-cache-stats`,
+  `*compiled-query-cache-size*` and `*compile-query-after*` are
+  exported; `run-perf-only` runs one perf case under `run-perf`'s
+  bindings. The guarded runner, the JSON DSL and `graph-db/rules`'
+  `%solutions` all go through it.
+- **`aggregate-all/3`, `reachable/3`, `k-hop/4`** (#123): `aggregate-all`
+  with `count`, `(sum ?e)`, `(min ?e)`, `(max ?e)`, `(bag ?t)`,
+  `(set ?t)` and the witness forms `(min ?e ?w)`, `(max ?e ?w)` over a
+  goal's solutions; a written-out goal compiles inline and is admitted
+  in guarded query text and rule bodies by position (a literal spec, a
+  static goal), a goal or spec in a variable runs through the runtime
+  functor like `findall`. `reachable/3` is the engine's tabled closure
+  over one edge type from a bound start (one table per query and
+  start; an unbound start or type is an instantiation error); `k-hop/4`
+  the distinct vertices at distance exactly K. On the bench the
+  three-hop query went from 1,064/s as a chain of edge goals to
+  33,333/s as `k-hop`; `shortest-path/4` (`graph-db/algorithms`,
+  unchanged) measured at 961/s beside a Lisp BFS. The internal `%unfloor`
+  and `%aggregate-step` compiler macros are excluded from free text;
+  `explain-goals` explains an aggregate's goal one level in;
+  `tests/rules/run-test.sh` loads its own checkout.
+- **Tabled predicates: `table-functor`, `untable-functor`,
+  `functor-tabled-p`** (#122): a declared user functor's calls are
+  memoised per query in variant tables and evaluated to a fixpoint by
+  recursive component, so a recursive `select` terminates on a cyclic
+  graph with the complete answer set (the 200-node ring bench: control
+  stack exhausted before, 200 solutions in 0.44 s after). `not`,
+  `forall`, `if` with an else arm, `findall`, `bagof` and `setof` over
+  an incomplete table of the predicate's own component signal
+  `prolog-unstratified-error`, which `catch/3` declines. A new `:table`
+  port, printed by `trace-prolog`, says whether a call led, followed,
+  consumed or was answered from a complete table; `explain-goals`
+  marks a tabled functor and `profile-goals` counts the events.
+  `deref-copy` now follows a bound variable instead of copying it as a
+  fresh one (its one caller pre-dereferenced).
+- **`profile-goals`, `explain-text`, `profile-text`** (#124):
+  `profile-goals` runs a query under the port hook and reports, per
+  functor, its call, exit, redo, fail and clause counts and the time
+  from its calls to its fails, with a tripped budget returned beside
+  the rows; the two text entries in `graph-db.query` explain or profile
+  guarded query text under the guard's refusals and budgets.
+- **`claim/7`'s route is one function and `explain-goals` names it**
+  (#124): `%claim-route` decides the route the goal takes in the
+  documented order and `explain-goals` reports the same words for a
+  `claim/7` or `claim-after/9` goal, so a query's route is confirmable
+  before it runs.
+- **`explain-goals`** (#124): one row per goal of a query, without
+  running it, naming the functor it resolves to, which arguments are
+  bound there, and the access path it takes, from a registry
+  (`register-access-path`) the type, slot, edge, ordered-index, unique
+  and spatial predicates fill; an asserted functor reports how many of
+  its clauses the first-argument index leaves; a path decided by a
+  value only known at run time says so; a cost-unbounded functor is
+  flagged.
+- **A 4-port trace hook** (#124). `*prolog-port-hook*`, when bound,
+  is called at the call, exit, redo and fail of every goal call and
+  every dynamic meta-call, and at a clause event when a dispatcher
+  tries a candidate; the depth it is given nests a callee's goals and
+  keeps the goals after a solved goal as its siblings, and a cut or a
+  budget error fires the fails it abandons. An untraced call costs
+  what it did: the check sits where the old `*prolog-trace*` print
+  sat. `with-prolog-ports` and `call-with-prolog-ports` bind the hook
+  for one extent.
+- **First-argument clause indexing** (#121). A call with a bound first
+  argument tries only the asserted clauses whose first head argument
+  can unify with it, keyed as a superset of `prolog-equal`: 1 and 1.0
+  share a key, a string and a keyword share one case-insensitively,
+  every cons shares one, and a node or other opaque value reaches only
+  the variable-headed clauses. Solution order is unchanged.
+  `*clause-indexing*` nil turns it off, for a `prolog-equal`
+  specialisation that widens equality among symbols, strings, numbers
+  or characters.
+- **The Prolog bench** (#45): `tests/perf/prolog-bench.lisp`, five cases,
+  one per performance unit of the 5.0 scope, and
+  `tests/perf/run-bench.sh` to run one bench alone.
+- **`retire-rule`** (#477) withdraws what a stored rule or stored
+  production concluded. In one transaction the record leaves scope, a
+  rule disabled and a production deleted, and every current claim and
+  `derived-from` record of its producer is retracted, never deleted; a
+  forward store cascades from the commit as from any lost premise, the
+  retired production's own action hears no `:lost`, and `run-rules` is
+  quiet after. The report's outcome is `:retired`, `swept` the claims
+  and the new `rule-report-records` the records.
+- **A rule or production body may read a family wide** (#469):
+  `(claim ?p fam "ns" ?k ?r ?ons ?ok)`, the relation free under a
+  literal family and namespace, compiles and is touched by a claim of
+  any relation of that family. Production `writes` may name a write's
+  family as `("family" "relation")`, and must beside such a read.
+- **`enable-forward-rules graph :on-failure fn`** (#468): `fn` of
+  `(name tag text condition)` is called once for everything that lands
+  on the status's failures, outside the step's transactions, the opt-in's
+  own `run-rules` refusals included; `rule-report-condition` carries the
+  caught condition on any report, which tells a cost-unbounded goal from
+  a budget overrun.
+- **`enable-forward-rules graph :drain :caller :on-queue fn`** (#467):
+  the commit hook only queues and the application calls `forward-step`
+  on a thread of its own, told by `fn` outside every lock whenever a
+  delta is queued; `forward-rules-status` reports `:drain`. The default
+  `:commit` is unchanged.
+- **`standing-query-problems`** (#470) says whether a production over a
+  body delivers exactly its query's rows, commit by commit, or why not,
+  goal by goal; `*standing-query-functor-classes*` classifies every
+  registered functor, and the rules suite requires an entry for each.
+  The design's standing-query equivalence test now compares rows, not
+  instantiation keys, over a join, a `not`, a comparison, a standing
+  filter and a family-wide read, through retractions, deletions and a
+  slot update.
+- **The screened reader is exported** (#366): `scan-query-text`,
+  `call-with-screened-forms`, `with-screened-forms`.
+- **`run-guarded-goals`** (#383): `run-guarded-prolog`'s run half,
+  exported, for a caller that kept `guard-query-text`'s goals; the doc
+  no longer calls `run-query-goals` exported.
+
+
+- **Forward evaluation of rules** (#456, design
+  `docs/superpowers/specs/2026-11-04-forward-rules-design.md`). A
+  store that calls `enable-forward-rules` derives at commit: each
+  committed transaction's claim writes become a weighted delta, the
+  strata that read what changed run from it through the fixpoint
+  machinery, and nothing calls `run-rules`. `claim-absent/7` answers
+  the determined absences (standing `:searched-empty` or
+  `:determined-empty`) as the second negation beside `not/1`.
+  `graph-db:*after-commit-hooks*` is the core seam: functions of the
+  committed transaction, called after `with-transaction`'s retry loop
+  outside every lock. `now/1` and `instant-offset/3` let a body state
+  a threshold against the evaluation instant; a forward-enabled store
+  schedules its own re-evaluation at the flip instant. The `graph-db`
+  package now shadows `now`, so the guard resolves the functor rather
+  than local-time's. `def-production` and the stored `production`
+  record add OPS5-style productions on the same machinery: a matching
+  body derives a durable `firing` claim keyed by the premises'
+  identities and the action runs from a salience-ordered agenda.
+  `def-rules-schema` now also declares the `production` record and
+  the `firing` family.
+
+- **`claim-after/9`** (#451): `claim/7` with strict lower bounds on the
+  subject and object keys, tested with `>/2`'s own predicate as a filter
+  on every route and as a skip on the namespace route; a `nil` or
+  unbound bound admits every row. The compiler writes it for a `claim/7`
+  followed at once by a `>` on its key; it may be written by hand, and
+  a rule body is refused it (`compile-rule`). The engine hook is
+  `*clause-body-rewriters*`, functions a subsystem registers to rewrite
+  a clause body before it compiles.
+- `node-geometries` (every `(slot . geometry)` a node occupies) and
+  `node-slot-geometry`; an application `node-geometry` method stays the
+  authority for its class and, on a single-slot class, may
+  `call-next-method`; on a multi-slot class the default signals under
+  `:error`, on the write path too.
+- Prolog `find-within/4`, `find-intersects/4`, `find-near/6` and
+  `find-nearest/6`, the slot in third position; the old arities remain
+  and resolve unnamed.
+
+**Re-check list for a consumer's port** (do these before setting the
+policy back to `:error`):
+
+1. Every spatial call site on a class with several geometry slots names
+   its `:slot`, in Lisp and in Prolog.
+2. Every `node-geometry` method written only to choose between indexed
+   slots is deleted; the slot name on the query replaces it. One of the
+   shape `(or (slot-value n 'outline) (call-next-method))` now signals on
+   a multi-slot class: rewrite it to return its geometry and slot,
+   `(values geometry 'outline)`, or delete it.
+3. Every registration source on a multi-slot registry says which geometry
+   it registers against (`:registry-slot`) and, when the source itself has
+   several, which one it registers (`:geometry-fn`).
+4. Schema tests that called `audit-spatial-slots` are dropped.
+5. Reopen each store once with time for the re-derivation; a large graph
+   rebuilds every spatial index at that open.
+
+### Changed
+
+- **The examples and the manual reach the engine units:**
+  `examples/example.lisp` walks asserted clauses, `table-functor`,
+  `aggregate-all/3`, `reachable/3`, `k-hop/4` and `explain-goals`;
+  `examples/example-spacetime.lisp` ends with a stored rule under
+  `run-rules` and forward evaluation, a retraction losing its
+  derivation, and the change feed read both ways; the manual's
+  Chapter 18 documents `claim-touched-at` and
+  `claims-touched-after` beside the other readers.
+
+- **`trace-prolog` prints the four ports** (#124), one line per
+  call, exit, redo and fail indented by depth, plus the clause a
+  dispatcher tries; `(trace-prolog 'name)` traces every arity of one
+  functor and `'name/2` one arity, matched by name so a schema
+  package's edge functor is named as written. It no longer sets
+  `*prolog-trace*`, which stays the compiler's own chatter.
+- **`<-` compiles the clause it adds, not the functor** (#121). Each
+  asserted clause is its own closure and the functor's function is a
+  dispatcher built once, so an assert's compile cost no longer grows
+  with the clause count; the cut, the barriers (`once`, `not`, `if`)
+  and the top-level queries behave as before, and a clause asserted
+  after `set-functor-fn` reinstalls the dispatcher as it always
+  recompiled. `*clause-compile-count*` counts clause compiles.
+- **`*prolog-max-query-length*` is enforced by the screen** (#366):
+  `run-guarded-prolog` and `guard-query-text` refuse an overlong text;
+  it was the GUI endpoint's check alone.
+- **One home for the row-cap and probe rule** (#328):
+  `graph-db:clamp-row-cap` and `graph-db:probe-limit`; the guard's and
+  the GUI's private copies are gone, and `run-query-goals` uses the same
+  function.
+- **A production's instantiation key keeps body position, and its
+  firing claim carries the key in the clear** (#471, #466). The key was
+  the premises' identity keys sorted, so a self-join's `(a,b)` and
+  `(b,a)` were one instantiation and a standing query missed a row. The
+  firing claim is now binary, object namespace `instantiation`, object
+  key the joined keys. **Firing claims written before this change have
+  other keys**: the first `run-rules` or forward step that touches the
+  production retracts them and derives the instantiations afresh, and
+  no action is called for either, as for any repair. A match's
+  `:bindings` now carries every body variable in first-appearance order
+  with each premise bound to its own variable, a body may name any
+  variable, the premise-count refusals say what they measure, and
+  `match-row` and `find-production` are exported.
+- **A forward rules step reads what it touches, not the touched rule's
+  whole derivation** (#457). The forward and targeted paths resolve
+  each identity they derive through the subject-relation index and
+  read provenance per touched derived claim; `run-rules` and the full
+  path still read the producer. `forward-rules-status` gains
+  `:last-step-elapsed`, and `bench-forward-step-reads` in the perf
+  suite reports a one-claim step's time against two derived-set sizes.
+- **`run-rules` retracts a derivation it no longer derives instead of
+  deleting it** (#456, D4 of the forward-rules design). The swept
+  claim and its `derived-from` records stay on record with their
+  transaction period closed, so provenance stays readable; an identity
+  derived again whose claim is retracted -- by a sweep or by hand --
+  is re-opened in place rather than left retracted. `rule-report-swept`
+  counts the retractions.
+- **A `.txn` file's header carries its transaction-id** (#422). The id
+  is written after the commit lock, so nothing new runs inside it and
+  the rename stays the commit point. Recovery cross-checks a nonzero
+  header id against the filename and refuses a mismatch with
+  `transaction-file-id-mismatch`, so a renamed or misplaced file fails
+  `open-graph` instead of replaying under the wrong id. Files written
+  by earlier versions, and by a crash between the rename and the patch,
+  have header 0 and are accepted as before. If the patch itself fails,
+  the commit is already durable and applied; the caller gets
+  `transaction-file-patch-error`, whose report says so.
+- **Paging a claim namespace by key costs the same at any depth**
+  (#451). `(> ?k "last-key")` written immediately after a `claim/7`
+  goal with the namespace bound and the key unbound compiles to
+  `claim-after/9`, whose namespace route skips the earlier keys before
+  reading their claims. On 20,000 keys the last 500-row page through
+  `run-guarded-prolog` went from 30 times the first page's cost to
+  1.1 times. Existing goal text gets this with no edit; `docs/rules.md`
+  "Solution order" lists the shapes that are not fused.
+- **A node is indexed under every declared geometry slot, and a spatial
+  query names the slot it tests** (#60). `find-nodes-near`,
+  `find-nearest-k`, `find-nodes-within` and `find-nodes-intersecting`
+  take `:slot`; the distance a near query reports is to that slot's
+  geometry, and a scope is subclass-inclusive (a parent scope reaches a
+  subclass's own slot by name). A class with one geometry slot behaves as
+  before, named or not. An **unnamed query on a class with several
+  geometry slots signals `query-precondition-error`**; it never unions
+  the slots and never picks one silently.
+- **`*spatial-unnamed-slot-policy*`** is the transition switch: `:error`
+  (the default) or `:first-declared`, which answers an unnamed query from
+  the first declared slot and warns once per class. It exists so a
+  consumer can port call site by call site; **it is removed in the next
+  major release**, tracked by its own issue.
+- **A geometry slot is identified by its declared type** — `geometry`, or
+  an `(or null geometry)`-style union naming it — not by the value it
+  happens to hold. An untyped `:index t` slot that held geometries was
+  spatial by accident; it is a plain secondary index now.
+- Under `:first-declared`, a node whose first declared geometry slot is
+  `nil` is not found by an unnamed query, where the old write-path rule
+  ("the first slot with a value") would have found it under its second
+  slot. Name the slot.
+- **Sidecar format 6 and memory image v9**: the spatial registry and
+  both memory-graph image formats re-derive every index once at the first
+  open after upgrading, so a node with two bound geometry slots moves from
+  one index into two. Older files are read; nothing is written back in
+  the old formats.
+- The spacetime `:registration` facet accepts `:registry-slot` and
+  `:geometry-fn`, and `register-geometry` takes `:slot`, so a source
+  says which of a registry's geometries it registers against and which of
+  its own geometries it registers.
+
+### Removed
+
+- `audit-spatial-slots`, `node-geometry-slots-with-values`,
+  `*node-geometry-multi-sample-limit*` and the write-path "inert slot"
+  warning: there is no inert slot any more.
+
+### Fixed
+
+- **One recompile parses each rule's text once** (#474). Compiling every
+  rule in scope guarded every other rule's text per rule compiled, so a
+  forward store's recompile after a `production` write was quadratic in
+  the rules; the dependency edges are now memoised for the length of one
+  recompile, and a test counts the guard calls.
+- **A forward step's rounds guard measures a chain of deltas each fed
+  by an action from the last** (#472, #475). A steady stream of commits
+  from other threads used to trip it and drop the whole queue, losing
+  those commits' derivations and firings until a `run-rules`; now each
+  queued delta carries a generation, only the delta at the bound is
+  dropped, and foreign commits and actions that write without feeding
+  their own read never count.
+- Refuse malformed ISO duration numbers without invoking the Lisp reader,
+  queue commits during forward opt-in, and clarify shutdown, firing history
+  and costs; cap compile failures, late-bind production actions, reset
+  inference counts, reuse compiled rules, and report match errors (#464).
+
+
+- **Spatial queries in an image that also loads `graph-db/rules`**
+  (#451, found by CI). Since #60 landed, spatial-registry.lisp and
+  rules/facts.lisp each defined a `%scope-keys` in the `graph-db`
+  package; the later load replaced the spatial one, and every spatial
+  finder then failed with "invalid number of arguments: 4". The spatial
+  reader is now `%spatial-scope-keys`. An image loading only one of the
+  two systems was never affected.
+- **The main suite's slow tier on `experiment`** (#453). The v2
+  migration test fingerprinted the source store's spatial sidecar, which
+  every `close-graph` rewrites and which sidecar format 6 (#60) changed
+  for the first time since the fixture was made; red on every push since
+  c1411c8, invisible to pull requests, which run the fast tier. The
+  fingerprint now excludes the sidecar beside schema.dat and tx/.
+
 ## [4.1.0] - 2026-10-31
 
 ### Added

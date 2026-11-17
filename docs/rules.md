@@ -35,9 +35,10 @@ cost-unbounded rule below.
 
 The subsystem's package is `graph-db.rules` (spec §3), but
 `rules/facts.lisp` is `(in-package #:graph-db)` and the `name/arity`
-symbols -- `claim/7`, `claim-current/1`, `claim-valid-at/2`,
+symbols -- `claim/7`, `claim-after/9`, `claim-current/1`,
+`claim-valid-at/2`,
 `claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
-`claim-retracted-at/2`, `claim-touched-at/2`,
+`claim-retracted-at/2`, `claim-touched-at/2`, `claim-touched-after/4`,
 `claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
 `claim-rule-version/2`, and `instant</2`, `instant>/2`, `instant<=/2`,
 `instant>=/2`, `instant=/2` -- are `graph-db` exports.
@@ -58,19 +59,24 @@ pathname and its `graph-db.rules` package are unchanged.
 
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
+(claim-after ?c family ?sns ?skey ?rel ?ons ?okey skey-after okey-after)
+(claim-absent ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
 (claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
-(claim-touched-at ?c ?at)
+(claim-touched-at ?c ?at)   (claim-touched-after ?c ?at after family)
 (claim-producer ?c ?p)      (claim-standing ?c ?s)
 (claim-relation ?c ?r)      (claim-rule-version ?c ?v)
 (instant< ?a ?b) (instant> ?a ?b) (instant<= ?a ?b) (instant>= ?a ?b)
 (instant= ?a ?b)
+(instant-offset ?x duration ?y)   (now ?t)      ; rule bodies only
 ```
 
 | functor | answers |
 |---|---|
 | `claim/7` | a claim of `family`, and its endpoints |
+| `claim-after/9` | `claim/7`'s rows with strict lower bounds on both keys, the namespace route started at the bound; "Solution order" (GH #451) |
+| `claim-absent/7` | `claim/7`'s rows restricted to current claims of standing `:searched-empty` or `:determined-empty`: the determined absences (D2) |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
 | `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
@@ -78,11 +84,14 @@ pathname and its `graph-db.rules` package are unchanged.
 | `claim-recorded-at/2` | when the claim was recorded, as an instant string |
 | `claim-retracted-at/2` | when it was retracted, as an instant string, or NIL while open (GH #391) |
 | `claim-touched-at/2` | the later of the two: the one cursor a change feed needs |
+| `claim-touched-after/4` | `claim/7`'s claims touched after `after`, from the touched-at index in ascending touched order, every family when `family` is unbound; the compiler writes it for the feed's text (#392) |
 | `claim-producer/2` | the producer -- also a generator, below |
 | `claim-standing/2` | the standing, as a lowercase string |
 | `claim-relation/2` | the relation |
 | `claim-rule-version/2` | the rule version, or NIL |
 | `instant</2` and friends | order two instants by value (GH #388) |
+| `instant-offset/3` | `?y` is `?x` plus an ISO-8601 duration of weeks, days, hours, minutes and seconds (`P1W`, `P2DT3H`, `PT90S`); months and years are refused (#456) |
+| `now/1` | the evaluation instant, one per `run-rules` call and per forward step; a rule body's functor only, refused in free text (#456) |
 
 `family` is the **parent** class name a `def-claim-classes` registered,
 never an arity subclass. The registry is `eq`-keyed on the symbol as
@@ -146,9 +155,10 @@ guard the schema's own canonical symbol is what reaches the goal.
   moves a claim's transaction record -- record, supersession,
   cross-producer outdating, retraction -- so a reader keeps one
   per-namespace cursor instead of a cursor plus a periodic full
-  re-read. Both goals still visit every claim of the namespace under
-  `max-inferences`; an index that makes the cursor goal proportional
-  to what changed is #392.
+  re-read. With `instant>/2` right after it, the compiler takes the
+  pair to the touched-at index (#392): the feed costs the claims
+  touched after the cursor, not the namespace's history -- "The
+  touched-at route" below.
 - `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2`,
   `instant=/2` compare two instants **by value**, each a string in any
   RFC 3339 spelling or a timestamp, so a client's `"2026-02-01"`
@@ -214,6 +224,11 @@ Raw, in the image, from any package:
 | object namespace, key unbound | the vocabulary route on the object side |
 | none of the above | the family walk -- see below |
 
+`explain-goals` (GH #124) names the route a `claim/7` goal will take, in
+these words, from what is bound at that point in the goal list, without
+running it; a namespace bound by an earlier goal rather than written
+reports the route as decided by value at run time.
+
 **The vocabulary routes (GH #389).** "Every claim about a subject in
 namespace N" is the natural question of a claim store, and until
 GH #389 it fell to the walk. Now `claim/7` reads the keys filed under
@@ -275,6 +290,50 @@ there it buys silence rather than a walk: that goal has no index to
 generate from and nothing to fall back to, so opting out of the refusal
 leaves the empty answer an unbudgeted query already gets.
 
+**The touched-at route (#392).** A change feed is the three-goal
+text `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-touched-at ?c ?t)
+(instant> ?t "<cursor>")`. Left as written it would be the vocabulary
+route filtered by instant -- the namespace's whole history for a
+cursor past most of it. So each claim family carries an ordered index
+on its transaction extent, keyed by the instant `claim-touched-at/2`
+answers (`claim-touched-at`, declared by `def-claim-classes`,
+maintained by the index's own update path at creation, retraction and
+re-open), and the compiler fuses the pair into `claim-touched-after/4`
+when the claim variable is fresh: right after a `claim/7` goal on it
+that no earlier goal names (`(claim-touched-after ?c ?t cursor f)
+(claim ...) (instant> ...)`, the generator first and the `claim/7`
+goal filtering by its bound-claim route), or on its own with nothing
+before it binding `?c` (every family). That second shape is the one
+place the rewrite changes an answer: a filter on an unbound claim
+failed, so the pair written first answered nothing before #392 and
+generates now. The comparison stays in the body, so a claim the index
+skips is one it would have rejected. Not fused, and so a filter paid
+for by the comparison: `?c` bound by an earlier goal, a `claim/7` goal
+with a key bound (a key probe is already cheaper than the family's
+tail), a goal between the three, the pair inside `or`, `not`, `if`,
+`once` or `forall`, `instant>=`, a cursor variable the `claim/7` goal
+itself binds. The generator reads every store in scope and merges
+them into one sequence ascending by touched instant, this run's own
+derivation last, under `*claim-exclude-producers*` as `claim/7`'s
+routes are. The cursor protocol: a reader advances its cursor to the
+last `?t` of a page it consumed in full; the comparison is strict, so
+that row is not repeated. The engine's own stamps never collide
+within one image (`%st-now` is monotonic per image), so in one store
+two rows share an instant only when a caller stamped them so with
+`retract-claim :at`; two stores in scope written by two images can
+share one without it. A page boundary inside such a tie drops the
+rows after it: a reader that may meet one pages wider than its ties,
+or re-reads from the previous cursor and drops the ids it has. The functor
+may be written by hand, `(claim-touched-after ?c ?t after family)`,
+with `family` `nil` for every family; with `?c` bound it filters. A
+rule body may not name it, and may not write a `claim-touched-at` goal
+whose claim no `claim/7` or `claim-absent/7` premise binds --
+`compile-rule` refuses both, in those words -- since the rewrite would
+make it a generator the reads and strata analyses never counted.
+`explain-goals` reports a hand-written goal as "touched-at index of F
+from the cursor", "touched-at index of every family from the cursor"
+or "that claim".
+
 `claim/7` is deliberately **not** `declare-functor-cost-unbounded`'d.
 That classifies a whole functor, and `%excluded-predicate-p` would
 then withhold `claim` from free text entirely -- breaking the guarded
@@ -301,8 +360,38 @@ write between two pages can shift a row across the boundary. A caller
 who wants a boundary a write cannot move pages by **key** instead: on
 a vocabulary route, `(> ?k "last-key-seen")` after the `claim/7` goal
 -- `>/2` orders two strings lexically since GH #387 -- restarts after
-that key, at the price of generating the earlier keys' claims and
-discarding them. Neither offset nor key bound is a snapshot cursor;
+that key. When the `>` goal is the very next goal after the `claim/7`
+goal, the compiler fuses the two into `claim-after/9`, whose namespace
+route skips the earlier keys before reading their claims, so a page
+costs one comparison per earlier key plus its own keys' claims, at any
+depth (GH #451). The comparison stays in the body, so a claim the route
+skips is always one the comparison would have rejected. Not fused, and
+so paid for by the comparison alone: `>=`, `<`, a numeric bound, any
+goal or cut between the two, a comparison inside `or`, `not`, `if`,
+`once` or `forall`.
+A `select` is rewritten when its file compiles, so a file compiled
+before `graph-db/rules` loaded is not fused until recompiled; a guarded
+query is compiled per request and always is.
+
+The change-feed pair, `(claim-touched-at ?c ?t) (instant> ?t cursor)`,
+is the other fusion (#392, "The touched-at route"): it changes the
+order. The fused feed answers in **ascending touched instant** across
+the stores in scope -- ties in scope order, then family order -- with
+this run's own derivation last, in place of the key order the
+vocabulary route would have given; that is the order a feed wants, and
+the one its cursor protocol depends on. `*clause-body-rewriters*`
+promises the same solutions, and the order only where the rewriter's
+own documentation says so.
+
+`claim-after/9` may be written by hand:
+`(claim-after ?c family sns ?skey rel ons ?okey skey-after okey-after)`
+answers the `claim/7` rows whose subject key is `>` `skey-after` and
+whose object key is `>` `okey-after`, by `>/2`'s predicate; a `nil` or
+unbound bound admits every row, and an object bound excludes a unary
+claim. A rule body may not name it -- `compile-rule` refuses, since its
+reads and strata analyses recognise `claim/7` by name -- and writes
+`claim/7` and the comparison instead, which the rule's run fuses.
+Neither offset nor key bound is a snapshot cursor;
 `docs/guarded-query.md` "Paging" has the trade-off.
 
 ## Unknown names
@@ -472,9 +561,32 @@ components and a rule's component is its **stratum** (see "Recursive
 rules"). Two things are still refused, naming the rule: a `not` whose
 goal reads a relation of the rule's own stratum, and a body `claim/7`
 that leaves its relation unbound -- it would read *every* relation,
-its own included, so that refusal says to bind the relation. The graph
-is the rule's own store's, plus the image's `def-rule`s -- a `:scope`
-does not widen it (see "Cross-store scope").
+its own included, so that refusal says to bind the relation -- unless
+it is a family-wide read, below. The graph is the rule's own store's,
+plus the image's `def-rule`s -- a `:scope` does not widen it (see
+"Cross-store scope"). A recompile of every rule in scope -- a forward
+store's after a `rule` or `production` write, `run-rules`' at its
+start -- guards each rule's text once for its own compile and once for
+its edges, not once per other rule (#474).
+
+**A family-wide read (#469).** `(claim ?p fam "ns" ?k ?r ?ons ?ok)`,
+the relation free under a *literal* family and a *literal* subject
+namespace, reads every relation of `fam` under `ns` -- the vocabulary
+route (GH #389), bounded by the namespace's keys -- and compiles.
+`compiled-rule-family-reads` lists such families. For stratification
+it is a read of every relation a rule in scope derives in that family
+and every relation a production declares it writes there (a write
+declared without its family counts for every family), so the rule runs
+after all of them. A rule whose head is in that family is refused as
+reading its own relation; a family-wide read of `firing` or
+`derivation` is refused. A production with such a read names each
+write's family, `:writes '(("rt-claim" "flag"))`: a write into the
+read family is "reads what it writes", a bare relation is refused
+asking for its family. With the family or the namespace unbound the
+goal is still refused as reading every relation. In forward mode a
+delta entry touches the rule when its claim is of that family, whatever
+its relation, and the forward path's `rule-delta/2` variant answers
+only that family's claims; the targeted path is unchanged.
 
 **A name belongs to one source.** A stored `rule` and a `def-rule` of
 the same name is a collision, refused whichever arrives second.
@@ -538,10 +650,22 @@ in one transaction always collide under `def-unique` (recon note C1,
 what is unchanged has no such collision, and it is sound because a body
 reads the committed store either way (recon note A6).
 
-A **retracted** derived claim whose identity is derived again stays
-retracted: keeping is not re-assertion. `run-rule` writes no
-transaction extent, so `retract-claim`'s closed period stands until
-something re-asserts it.
+**A sweep retracts; it never deletes** (D4 of the forward-rules
+design, `docs/superpowers/specs/2026-11-04-forward-rules-design.md`
+§4.2). A derivation the rule no longer derives is `retract-claim`ed
+together with its `derived-from` records, so the claim stays on
+record, `dependents-of` still answers through it, and
+`claims-by-producer` still returns it; `claim-current-p` tells it from
+a believed one. `rule-report-swept` counts these retractions. A
+**retracted** derived claim whose identity is derived again -- whether
+a sweep retracted it or a caller did by hand -- is **re-opened** in
+place: same node, transaction period re-opened as of now, counted as
+kept. The derivation is supported, so it is believed. A retracted
+claim the rule still does not derive is left as it is and counted
+nowhere. Note for a family with a `def-unique` over a subset of the
+identity: a retracted claim still occupies its key, so a later
+derivation that differs only outside that subset collides at commit
+exactly as a same-run sweep-and-insert does.
 
 **Duplicates collapse.** Two solutions with the same head endpoints and
 relation are one claim; for a temporal family the extent *start* joins
@@ -619,14 +743,16 @@ resolved.
 | field | meaning |
 |---|---|
 | `rule-name`, `version` | the rule as run |
-| `outcome` | `:derived` or `:refused` |
-| `derived`, `kept`, `swept` | the reconcile's three counts |
+| `outcome` | `:derived`, `:refused`, or `:retired` from `retire-rule` (#477) |
+| `derived`, `kept`, `swept` | the reconcile's three counts; behind `:retired`, `swept` is the claims retracted |
 | `disjoint-premises` | solutions dropped: premises never held at once |
 | `refusals` | a list of `(tag . text)` |
 | `inferences` | the count at the last solution |
 | `elapsed` | seconds |
 | `rounds` | the fixpoint rounds run, 1 outside a recursive stratum |
 | `stratum` | its stratum's rules, its own name alone for a rule with none |
+| `condition` | the condition caught behind a `:refused` outcome, else NIL (#468) |
+| `records` | the `derived-from` records `retire-rule` retracted, 0 on every other path (#477) |
 
 Every count is a total over the run: `disjoint-premises` included,
 across each variant and round of a recursive stratum.
@@ -641,7 +767,8 @@ else one of:
   (`prolog-permission-error`, recon note A16), or a head term is not a
   namespace or key this image knows;
 - `:budget` -- the rails: the inference budget, the timeout, or a goal
-  refused as `cost-unbounded`;
+  refused as `cost-unbounded` -- told apart by `condition`, a
+  `prolog-cost-unbounded-error` for the last;
 - `:solutions` -- the `*rules-max-solutions*` cap.
 
 The vocabulary is closed: a `constraint-violation` none of the three
@@ -823,6 +950,27 @@ derives -- and B's reading one A's derives -- is neither refused at
 compile nor settled at run. Recursion within one store is handled;
 see "Recursive rules" below.
 
+## Two negations
+
+A body has two ways to say "not there", and they mean different
+things (D2 of the forward-rules design,
+`docs/superpowers/specs/2026-11-04-forward-rules-design.md` §5.1):
+
+- `(not (claim ?c family ...))` is **closed-world**: no claim of that
+  shape is on record. It is stratified negation: the relation under
+  it must belong to an earlier stratum, and a rule that says it of its
+  own stratum is refused at compile.
+- `(claim-absent ?c family sns skey rel ons okey)` is a **determined
+  absence**: somebody looked and found nothing. It answers the current
+  claims of standing `:searched-empty` or `:determined-empty` under
+  that relation, exactly `claim/7`'s routes with a filter, and it is a
+  positive read for stratification, so a rule may use it freely. The
+  weak absences, `:uncovered` and `:indeterminate`, and a retracted
+  absence are not answers.
+
+Say the second when the store records searches; say the first when
+silence is the only evidence there is.
+
 ## Recursive rules
 
 A rule may read its own head relation, directly or through other
@@ -971,7 +1119,9 @@ cycle that runs through another store's rules is not detected.
   stays disabled (ruling T3-R5). The one place `enabled` buys no
   exemption is the *write*: `%validate-rule-writes` compiles every
   `rule` record it commits, disabled or not, so a disabled rule is
-  still a rule that could run.
+  still a rule that could run. Disabling leaves what the rule derived
+  current; `retire-rule` is how a rule leaves scope with its
+  conclusions withdrawn ("Retiring a rule", #477).
 - **A `def-rule` runs only where the store carries its family (ruling
   P8).** `*def-rules*` is image-wide; a rule whose family this store
   never declared is skipped silently, because it is not this store's
@@ -992,3 +1142,402 @@ cycle that runs through another store's rules is not detected.
   not compile**, where `run-rules` reports that member and runs the
   rest. The fixpoint needs every rule of the stratum: one missing is
   an incomplete answer, not a smaller one.
+
+## Retiring a rule (#477)
+
+A rule that is disabled or deleted stops running, but what it derived
+stays current, keeps feeding the rules downstream, and `run-rules`
+leaves it there: a disabled rule is out of scope, so nothing
+reconciles its producer's claims. A store whose rules can turn out to
+be wrong -- rules an operator added, or a model proposed and a review
+refuted -- needs a way to say "withdraw what this rule concluded".
+
+`graph-db.rules:retire-rule (graph name) => rule-report` does that for
+a stored rule or a stored production, in **one transaction**:
+
+- the record leaves scope: a `rule` record is **disabled** (`enabled`
+  nil; it stays readable and can be enabled again), a `production`
+  record is **deleted**, since it has no `enabled` and
+  `find-production` already answers NIL for a deleted one (#466);
+- every current claim the producer `rule/<name>` or
+  `production/<name>` derived is **retracted**, and so is every
+  current `derived-from` record of that producer.
+
+Retraction, never deletion: the claims and records stay on record, so
+`premises-of` and `dependents-of` still answer through them,
+`claims-by-producer` still returns them, and a read `:as-of` an
+instant before the retirement sees them current. The report's
+`outcome` is `:retired`, `swept` counts the claims and `records` the
+provenance records retracted. A name with no stored rule or production
+signals; a `def-rule` has no record to retire (`undef-rule` it, and
+`run-rules` leaves its derivations as it does a disabled rule's).
+
+Leaving scope and retracting go together in one transaction for a
+reason: retracting a current rule's claims by hand is undone by D4,
+which re-opens a derivation the rule still supports, as it should.
+
+On a forward store the commit cascades as any lost premise does: the
+retracted claims are −1 entries, the rules reading them re-derive
+their dependents on the targeted path, a dependent with another
+standing premise is kept and only its record of the retired premise
+retracted, and a production watching a retracted claim hears `:lost`.
+The retired production's **own** action hears nothing: its firings
+are retracted, but the production has left scope before the step
+runs, so no agenda entry names it. Under `:drain :caller` the cascade
+waits for the application's `forward-step`, like any other delta.
+After the step `run-rules` reports nothing to do.
+
+Writing the rule again -- enabling the record, or a new record under
+the name -- derives nothing by itself: a premise committed earlier is
+not a delta. `run-rule` or `run-rules` then re-opens the same claims
+and reports them `kept`, and a forward store cascades from the
+re-opened claims as from any +1.
+
+## Forward evaluation
+
+Design: `docs/superpowers/specs/2026-11-04-forward-rules-design.md`
+(decisions D1–D5 in its §1 are binding). Tracking: #456.
+
+`run-rules` is pull: somebody calls it. Forward evaluation is push:
+once a store opts in, every commit's claim writes are turned into a
+**delta** and the rules that read what changed run from it, in the
+committing thread, after the commit returns (D1: the derivation is a
+follow-on transaction, not part of the committing one). Nothing calls
+`run-rules`.
+
+```lisp
+(graph-db.rules:enable-forward-rules graph)    ; runs run-rules once
+(graph-db.rules:forward-rules-enabled-p graph) ; => T
+(graph-db.rules:disable-forward-rules graph)   ; drops the queue
+(graph-db.rules:enable-forward-rules graph     ; #467: the hook queues,
+  :drain :caller :on-queue #'wake-my-drainer)  ; the application drains
+```
+
+`enable-forward-rules` registers the store and runs `run-rules` once,
+so a store with premises committed before the opt-in starts at its
+fixpoint. The opt-in is per open graph object and lives in the image:
+reopen the store, opt in again. Disable and close do not wait for a
+step running on another user thread, even though status then says disabled.
+Stop the caller's committers -- and under `:drain :caller` its
+drainer -- before disabling or closing the graph.
+
+**The delta.** `claim-delta` renders a committed transaction's writes
+(every node of a registered claim family) as a table, relation →
+list of `(claim . weight)`:
+
+| write | weight |
+|---|---|
+| create | +1 |
+| delete | −1 (the old version) |
+| update that closes the transaction period (`retract-claim`) | −1 |
+| update that re-opens it | +1 |
+| any other update | −1 old version, +1 new version |
+
+A claim created and deleted in one transaction nets to nothing. A
+transaction that writes no claim queues nothing; one that writes a
+`rule` record invalidates the compiled-rule cache.
+
+**A step.** Strata run in dependency order, as `run-rules` runs them.
+A stratum the delta does not touch -- none of its rules reads a
+relation the delta names, positively or under a `not` -- is skipped.
+A stratum touched only by +1 entries on positive reads runs the
+**forward path**: every rule runs the variants of its body in which
+one `claim/7` or `claim-absent/7` goal answers from the delta instead
+of the store (the fixpoint machinery's `rule-delta/2`, now generated
+for every claim goal, not only the recursive ones), no producer is
+excluded, and the reconcile sweeps nothing and only adds provenance:
+the step derived from a delta, not from the whole store, so a claim it
+did not meet is not thereby lost. What a stratum constructed, re-opened or
+retracted joins the delta the later strata see.
+
+**Lost derivations.** A −1 entry (a deleted or retracted claim) is
+handled by one of three cases, the spec's §4.2 table:
+
+| the lost claim is read by | what runs |
+|---|---|
+| a non-recursive rule, positively | the **targeted path**: `dependents-of` names the derived claims whose provenance cites it; each is re-derived with its head bound and kept, re-opened, or retracted; provenance is reconciled for those claims alone |
+| a recursive stratum, positively | the stratum re-runs in full through the fixpoint, with the full sweep; provenance cannot bound a closure's loss |
+| any rule under `not`, or a rule reading an unbound relation (a +1 there too) | that stratum runs the **full path**, `run-rule` or the fixpoint with the full sweep |
+
+A lost claim a stratum itself derived -- a derived claim somebody
+retracted by hand -- is re-checked on the targeted path too, and
+re-opened when its premises still stand (D4: the derivation is
+supported, so it is believed). To withdraw a rule's conclusions for
+good, `retire-rule` takes the rule out of scope and retracts them in
+one transaction ("Retiring a rule", #477); the step then cascades
+from them. A retracted premise loses its
+dependents only if their bodies notice: **currency is the body's
+business**. A rule meant to track retraction says `claim-current` on
+each premise it tracks, exactly as it must under `run-rules`; a body
+that does not says that a retracted premise still supports its
+conclusion, and the targeted re-derivation honours that. Lost derived
+claims re-enter the step as −1 entries for the later strata, so a loss
+propagates down the strata in the same step.
+
+Each step's reports carry `rule-report-path`: `:forward`, `:targeted`
+or `:full`. Each stratum commits
+its own transaction, as `run-rules` does, and those commits do not
+queue themselves again.
+
+**The queue (D5).** Each enabled graph has one queue of pending
+deltas. The committing thread's hook queues its delta and then
+drains the queue, unless a step is already running on another thread,
+in which case it returns at once and the running step takes the new
+delta before it finishes. So a commit never waits on another commit's
+derivation, derivations are serialised per graph, and one step may
+run on a thread other than the one that committed the premise. The
+caveat that follows: **do not expect a derivation the moment your
+`with-transaction` returns** when other threads commit concurrently;
+poll `forward-rules-status` for an empty queue, or read the derived
+claims on the next commit's step. A commit made inside another
+transaction (a nested `with-transaction`) queues only; the outermost
+commit's hook, whatever graph it committed on and whether or not it
+wrote a claim, drains every enabled graph's queue, so a body that
+opened a transaction never has a step run inside it. A body that
+unwinds after a nested commit leaves that delta queued until the next
+outermost commit in the image, or an explicit `forward-step`. A step
+that never quiesces -- an action that keeps writing what the
+production reads -- is stopped by a **generation** on each queued
+delta: a commit from outside the step is generation 0, an action's
+commit is the generation of the delta being run plus one, and a delta
+at `*rules-max-rounds*` is dropped with a `:rounds` failure on the
+status while everything else is run. So a foreign commit never counts
+toward the bound, however steady the stream, and neither does an
+action that writes on every match without feeding its own read; only
+a chain of deltas each fed from the last is stopped (#472, #475).
+
+**`:drain :caller` (#467).** `(enable-forward-rules graph :drain
+:caller :on-queue fn)` keeps the committing thread out of it: the hook
+queues the delta and returns, so a commit runs no body and no action,
+holds no lock a body would wait on, and an action may take the
+application's own locks. The outermost commit's drain skips such a
+graph, nested commits included, and a threshold timer's delta only
+queues too. The application calls `forward-step` on a thread of its
+choosing; it drains in commit order under the same D5 contract, and
+returns at once when another thread's step is already running or the
+graph is disabled. `fn`, a function of the graph, is called outside
+every lock whenever a delta is queued -- by a commit, a timer, or a
+commit during the opt-in's hold -- so a drainer can wake on it without
+a signal of its own; a signal from `fn` is logged and recorded under
+`:on-queue`. `forward-rules-status` reports `:drain`. Before
+`disable-forward-rules` or `close-graph`, stop the committers and the
+drainer: neither waits for a `forward-step` in flight on another
+thread, and a `forward-step` that starts after the disable returns
+having done nothing. The default, `:commit`, is unchanged.
+
+**Failure (spec §4.4).** A rule that refuses in a step -- the rails,
+a constraint, a bad instant, a functor's own refusal -- is reported
+on the status and the step goes on with the next stratum and the
+next delta; the commit that queued the delta was durable before the
+step began and stays so. A condition that escapes the step is logged
+and recorded the same way under the name `:step`.
+
+```lisp
+(graph-db.rules:forward-rules-status graph)
+;; => (:enabled t :queue-depth 0 :running-p nil
+;;     :failures (("web-hosts" . "rule: ...")) :timers 0
+;;     :last-step-elapsed 0.004d0)
+```
+
+The last hundred failures are kept, newest first; `:last-step-elapsed`
+is the wall seconds of the last `forward-step` drain, NIL before one.
+`run-rules` after a failure reports the same refusal and repairs the
+rest. The opt-in's own `run-rules` lands its refusals here too.
+
+**The failure signal (#468).** `(enable-forward-rules graph
+:on-failure fn)` calls `fn` with `(name tag text condition)` once for
+everything that lands on `:failures`: `name` the rule or production
+(or `:step`, `:rounds`, `:timer`, `:on-queue`), `tag` as a report
+carries it (`:rule`, `:budget`, `:solutions`, a family name) or the
+failure's own (`:action` for an action's error or an unregistered
+action, `:writes` for a write outside the declared ones, `:match` for a
+match that could not be rendered, `:scheduling`, `:timer`, `:step`,
+`:rounds`, `:on-queue`), `text` the rendering on the status, and
+`condition` the condition caught, or NIL where none was (`:rounds`, an
+unregistered action). A cost-unbounded goal and a budget overrun are
+both `:budget`; the condition tells them apart, a
+`prolog-cost-unbounded-error` for the first. `fn` runs outside the
+step's transactions, so it may record state or delete the stored
+production whose action failed; the step stays sound and the
+production fires no more. A signal from `fn` is logged and the step
+goes on. `rule-report-condition` carries the same condition on a
+`run-rule` or `run-rules` report, so a consumer that seeds one
+production with `run-rule` reads a refusal the same way.
+
+**Thresholds (D3).** A body may say `(now ?t)` and compare `?t` with
+an instant of a premise claim: one of `claim-valid-from/2`,
+`claim-valid-to/2`, `claim-recorded-at/2`, `claim-touched-at/2`,
+`claim-retracted-at/2`, or `instant-offset/3` over one of them, with
+`instant<`, `instant<=`, `instant>` or `instant>=`. Any other use of
+`?t` is refused at compile, naming the goal: the instant a match flips
+at must be a function of its premises, never of the clock. Each such
+comparison is a **threshold** with a direction, a **gain** (false
+before the instant, true from it: `(instant>= ?t ?d)`) or a **loss**
+(`(instant< ?t ?d)`), and `compiled-rule-thresholds` lists them.
+
+```lisp
+;; "settled": a host has run web for a second
+(claim ?p rt-claim "host" ?h "runs" "app" "web")
+(claim-recorded-at ?p ?r) (instant-offset ?r "PT1S" ?d)
+(now ?t) (instant>= ?t ?d)
+```
+
+Under the `:premises` extent policy on a temporal family, a gain sets
+the derived claim's validity start to the flip instant and a loss sets
+its end. When a step or a `run-rules` evaluates a threshold rule, it
+also evaluates the body without its thresholds for the matches the
+delta reaches and schedules a **timer** at every flip instant still
+ahead. When the timer fires the match's premise claims re-enter the
+step as a delta: +1 for a gain, so the rule derives; +1 and −1 for a
+loss, so the targeted path retracts what no longer holds. Timers are
+in memory, per enabled graph, on one thread named "forward timer";
+`disable-forward-rules` and `close-graph` stop it, and
+`enable-forward-rules` rebuilds the timers from the store when it runs
+`run-rules`. `forward-rules-status` counts them under `:timers`.
+
+**Productions (spec §7).** A production is a body and an action: when
+the body matches, the action runs. It is the OPS5 idea on top of the
+Datalog layer, and it shares the layer's machinery: a production is
+compiled as a rule whose head is a binary claim of the `firing` family
+(subject namespace `production`, subject key the instantiation's key,
+relation the production's name, object namespace `instantiation`,
+object key the premises' identity keys in the clear, producer
+`production/NAME`, rule version the production's), so forward evaluation derives, retracts
+and re-opens firings exactly as it does derived claims, provenance
+names each firing's premises, and `run-rules` repairs them. A stored
+production retired with `retire-rule` has its firings retracted
+without its own action hearing `:lost` (#477).
+
+```lisp
+(graph-db.rules:def-production "web-watch"
+  :version "1" :family rt-claim :salience 10
+  :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\")
+         (claim-current ?p)"
+  :writes '("watched")
+  :action (lambda (event match) ...))
+```
+
+The **instantiation key** is the premises' identity keys **in body
+order**, each with its own `|` escaped, joined with `|`, hashed to
+sixteen hex digits by a small FNV-1a-64 written in the rules layer
+(`sxhash` is not stable across images and no hashing library is a
+dependency). Body order is what makes a self-join's `(a,b)` and
+`(b,a)` two instantiations, as they are two rows of the query (#471).
+The firing claim is binary: subject key the hash, object namespace
+`instantiation`, object key the joined keys in the clear, so a match
+reads its key off the firing and keeps it after a premise is deleted.
+A premise deleted and written again with the same identity is the same
+instantiation: the firing is re-opened, not duplicated. The body needs
+at least one top-level `claim/7` goal and at most eight premises, and
+a body with neither is refused in those words (#466).
+
+A stored production is a `production` record (`make-production`,
+slots `name version family body salience writes action`), `action` a
+string naming a function registered in `*production-actions*`; a
+record naming no registered action, or whose body does not compile,
+is refused at commit. `def-production` registers both the spec and
+the action under the production's name in the image. `:action` takes a
+function, or a symbol that is looked up at fire time, so an action
+redefined at the REPL is the one that runs (#464).
+
+**One stratification graph.** A production's `writes` are edges from
+each written relation to its reads, so a rule reading what a
+production writes runs in a later stratum, and a production that
+reads what it writes, or closes a cycle through its writes, is a
+`rule-compile-error`. A write is a relation string, or `("family"
+"relation")` when the body reads a family wide (#469); the run-time
+check then holds the action to that family too.
+
+**The agenda.** After a step's strata have run, the firings the step
+changed become agenda entries, `:added` for a derived or re-opened
+firing and `:lost` for a retracted one, sorted by salience descending,
+then arrival, then key, and each is fired:
+
+```lisp
+(funcall action event match)
+;; match => (:key "k1|k2" :premises (claims) :bindings (("?H" . "h1") ...)
+;;           :firing claim)
+```
+
+`:premises` are the premise claims that still exist, in body order;
+`:key` their identity keys in body order joined with `|`, read from the
+firing claim (so a `:lost` match whose premise is gone still has it);
+`:bindings` every variable the body text names, in first-appearance
+order, each premise variable bound to its own premise -- `(("?P" .
+claim) ("?H" . "h1") ...)` -- for an `:added` match, and NIL when the
+body no longer matches or a premise is gone. Nothing synthesised
+appears, and a body may name `?c` or `?instantiation-key` (#466).
+`(match-row match)` renders a match as `run-guarded-prolog :format
+:data` renders that solution, `(values columns cells)`: columns the
+camelCase field names, a node its id string; both NIL without
+bindings. `(find-production graph name)` answers the stored
+`production` record or NIL. An action may `with-transaction`; its commit queues a delta the running
+step takes next. A write to a relation outside the production's
+`writes` is recorded on `forward-rules-status`'s failures and the
+write stands; so is an action that signals, and the agenda goes on.
+Matches present at enable and repairs by `run-rules` get firing claims
+but no `:added` delivery; consumers read the firing claims for the initial
+set. A firing's history is readable through version history only: re-opening
+a kept derivation overwrites its transaction extent with an open-from-now one.
+
+**Standing queries (#470).** "A standing query is a production whose
+body is the query" (design §8) holds for the bodies
+`(standing-query-problems text graph)` admits: it answers NIL when a
+production over `text` delivers, commit by commit, exactly the rows a
+full re-evaluation of `text` would add and lose, else a list of
+reasons, each naming its goal. Admitted: top-level `claim/7` and
+`claim-absent/7` with a variable `?c` and a literal relation, or a
+family-wide read (#469); `not` over those, with a literal relation;
+tests over bound values (`=`, `<`, `instant<`, `instant-offset`, ...),
+`once`, `if` and `forall` over tests, and `or` under `once` or `not`;
+`claim-current`; a premise's slot read as a filter with a literal,
+`(claim-standing ?p "observed")`, or a slot no update changes
+(`claim-relation`, `claim-producer` of a premise). Refused: every other
+store read (`is-a`, `related`, `claimed`, `find-*`, views, edges,
+`node-slot-value`, a `claim-producer` generator); a claim read nested
+under `once`, `if` or `forall`; an `or` anywhere else, since it yields
+a row per true branch and a production holds one row per
+instantiation; `unique`, which keeps a seen-table across the query's
+solutions; a slot an update can change read into a variable (the row
+changes, the instantiation does not, so nothing is delivered --
+`claim-standing`, the extent instants, and also `claim-recorded-at`,
+which a re-open moves, and `claim-rule-version`, which an in-place
+save moves); an effect or `repeat`; `now`; no premise; more than
+eight. One timing caveat stands even for an admitted body: under
+`:drain :caller`, a premise deleted and written again under the same
+identity *between two drains* keeps its instantiation, so there is no
+`:lost` and no `:added` though the query's row now carries the new
+node's id; with a drain between the two commits the events are right,
+and a retraction and re-open is unaffected.
+The classification is `*standing-query-functor-classes*`
+(`rules/standing.lisp`), one entry per registered functor; the rules
+suite insists every functor has one, so a new functor chooses.
+`compile-rule` does *not* refuse the rest: `run-rules` runs every
+body correctly, forward mode's repair is `run-rules`, and a
+`claim-producer` generator is the fixpoint's own idiom (ruling P5).
+The check is the consumer's, at the moment it decides a body is a
+standing query.
+
+**Repair.** `run-rules` is the forward mode's repair: it computes the
+same fixpoint from scratch and reconciles fully, so after any step it
+reports nothing derived and nothing swept. If it does not, that is a
+defect in the step.
+
+**Cost.** A step reads in proportion to what it touches, not to the
+rule's standing derivation (#457): each identity the delta derives is
+resolved through the subject-relation index (the claims of one subject
+under one relation, from every producer), each swept or kept derived
+claim's provenance through the derivation family's subject index, and
+nothing enumerates the producer. The derivation itself is proportional
+to the delta's solutions. On the targeted path, `*rules-max-inferences*`
+bounds each dependent's query separately, so the step total is that bound
+times the dependents it re-derives. `forward-rules-status`'s `:last-step-elapsed`
+is the last step's wall time; `bench-forward-step-reads` in
+`tests/perf/rules-bench.lisp` runs a one-claim step against two
+derived-set sizes and reports the ratio (near 1). The full path --
+`run-rules`, `run-rule`, and a step's `:full` mode for a recursive
+stratum that lost a premise or a touched `not` -- still reads the whole
+producer, which is its job. One difference from that pass: two
+*current* claims of one identity under one producer (a hand-made
+duplicate) are both met by the full path, which sweeps the second,
+and only one by the per-key path, which leaves the other alone.

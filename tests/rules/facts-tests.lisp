@@ -754,3 +754,231 @@ no fixture: every store this suite makes carries the axis."
                                    (claim-touched-at ?c ?t)
                                    (lisp ?cur *cursor*)
                                    (instant> ?t ?cur)))))))
+
+;;; ---------------------------------------------------------------------
+;;; claim-after/9: claim/7 with strict lower bounds on the keys, whose
+;;; namespace route skips a key before reading its claims (GH #451).
+;;; ---------------------------------------------------------------------
+
+(test claim-after-with-no-bounds-answers-claim-rows
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("h1" "h1" "h2" "h2")
+               (select-flat (?k)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o nil nil))))))
+
+(test claim-after-skips-subject-keys-at-or-below-the-bound
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("h2" "h2")
+               (select-flat (?k)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o "h1" nil))))
+    (is (null (select-flat (?k)
+                (claim-after ?c rt-claim "host" ?k ?r ?ons ?o "h2" nil))))
+    (is (= 4 (length (select-flat (?k)
+                       (claim-after ?c rt-claim "host" ?k ?r ?ons ?o
+                                    "" nil)))))
+    ;; >/2 fails on a string against a number: nothing qualifies.
+    (is (null (select-flat (?k)
+                (claim-after ?c rt-claim "host" ?k ?r ?ons ?o 5 nil))))))
+
+(test claim-after-bounds-the-object-key-on-the-object-route
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("web" "web")
+               (select-flat (?o)
+                 (claim-after ?c rt-claim ?sns ?s ?r "app" ?o nil "db"))))))
+
+(test claim-after-filters-on-the-routes-it-cannot-skip
+  "Both namespaces bound: the subject route, the object bound a filter.
+Subject key bound: the bound-key route, same."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("h1" "web") ("h2" "web"))
+               (sort (select () (?s ?o)
+                       (claim-after ?c rt-claim "host" ?s "runs" "app" ?o
+                                    nil "db"))
+                     #'string< :key #'first)))
+    (is (equal '("web")
+               (select-flat (?o)
+                 (claim-after ?c rt-claim "host" "h1" "runs" "app" ?o
+                              nil "db"))))
+    ;; An object bound excludes a unary claim: > on NIL fails.
+    (is (equal '("runs" "runs" "runs")
+               (select-flat (?r)
+                 (claim-after ?c rt-claim "host" ?k ?r ?ons ?o nil ""))))))
+
+(test an-unbound-bound-is-no-bound
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (length (select-flat (?k)
+                       (claim-after ?c rt-claim "host" ?k ?r ?ons ?o
+                                    ?after nil)))))))
+
+(test a-bounded-namespace-route-costs-its-own-keys
+  "60 keys, bound at k55: the route reads four keys -- four index
+lookups, not sixty -- and answers under a budget of 30, which covers
+four keys' goals and not sixty.  The same bound as a separate goal
+after a TRUE still reads every key and blows the budget.  The lookup
+count is what sees the skip: a claim the filter drops never reaches a
+goal, so the budget alone cannot tell skip from filter."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (claim-after ?c rt-claim "host" ?k "up" ?ons ?o
+                                "k55" nil))))
+      (is (= 4 n)))
+    (counting-lookups (n)
+      (signals graph-db::prolog-resource-error
+        (select (:flat t :max-inferences 30) (?k)
+          (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+          (true)
+          (> ?k "k55")))
+      (is (< 4 n)))))
+
+;;; ---------------------------------------------------------------------
+;;; The rewrite: a > on the key right after claim/7 compiles to
+;;; claim-after/9 (GH #451, spec §2).
+;;; ---------------------------------------------------------------------
+
+(defun fused (goals) (graph-db::%fuse-key-bounds goals))
+
+(test the-rewrite-fuses-an-adjacent-key-bound
+  (let* ((body '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?k "h1")))
+         (out (fused body)))
+    (is (= 2 (length out)))
+    (is (string= "CLAIM-AFTER" (symbol-name (first (first out)))))
+    (is (equal '(?c rt-claim "host" ?k ?r ?ons ?o "h1" nil)
+               (rest (first out))))
+    (is (equal '(> ?k "h1") (second out))))
+  ;; The object key, and a bound through a variable.
+  (is (equal '(?c rt-claim ?sns ?s ?r "app" ?o nil ?b)
+             (rest (first (fused '((claim ?c rt-claim ?sns ?s ?r "app" ?o)
+                                   (> ?o ?b)))))))
+  ;; Both keys, two comparisons in a row.
+  (is (equal '(?c rt-claim "host" ?s ?r "app" ?o "h1" "db")
+             (rest (first (fused '((claim ?c rt-claim "host" ?s ?r "app" ?o)
+                                   (> ?s "h1") (> ?o "db"))))))))
+
+(test the-rewrite-leaves-every-other-shape-alone
+  (flet ((same (body) (is (eq body (fused body)))))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (true) (> ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) ! (> ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (>= ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (< ?k "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?k 5)))
+    (same '((claim ?c rt-claim "host" "h1" ?r "app" "db") (> ?o "db")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o) (> ?z "h1")))
+    (same '((claim ?c rt-claim "host" ?k ?r ?ons ?o)))
+    (same '((claim-current ?c) (> ?k "h1")))
+    (same '())))
+
+(test the-recommended-paging-shape-costs-its-own-keys
+  "The goal text docs/guarded-query.md recommends, under the budget and
+lookup count Task 2's cost test fixed: it answers only if the rewrite
+fused it."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k "k55"))))
+      (is (= 4 n)))
+    ;; The bound through a variable bound at run time.
+    (counting-lookups (n)
+      (is (equal '("k56" "k57" "k58" "k59")
+                 (select (:flat t :max-inferences 30) (?k)
+                   (= ?b "k55")
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k ?b))))
+      (is (= 4 n)))))
+
+(test the-guard-path-is-fused
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (let ((graph-db::*query-default-max-inferences* 30))
+      (counting-lookups (n)
+        (multiple-value-bind (columns rows)
+            (graph-db.query:run-guarded-prolog
+             "(claim ?c rt-claim \"host\" ?k \"up\" ?ons ?o) (> ?k \"k55\")"
+             g)
+          (declare (ignore columns))
+          (is (= 4 (length rows))))
+        (is (= 4 n))))))
+
+(test a-key-bound-at-run-time-takes-its-own-route
+  "Syntactically a variable, so it fuses; bound by = before the goal,
+so the bound-key route runs and the bound only filters."
+  (with-rules-graph (g)
+    (seed-keys g 60)
+    (counting-lookups (n)
+      (is (equal '("k57")
+                 (select (:flat t :max-inferences 1000) (?k)
+                   (= ?k "k57")
+                   (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                   (> ?k "k55"))))
+      ;; One lookup: the bound-key route, not four from the namespace
+      ;; route with its k55 bound.
+      (is (= 1 n)))
+    (is (null (select (:flat t :max-inferences 1000) (?k)
+                (= ?k "k50")
+                (claim ?c rt-claim "host" ?k "up" ?ons ?o)
+                (> ?k "k55"))))))
+
+(test an-unbound-bound-variable-answers-as-before
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:flat t :max-inferences 1000) (?k)
+                (claim ?c rt-claim "host" ?k ?r ?ons ?o)
+                (> ?k ?b))))))
+
+;;; claim-absent/7 (D2, forward-rules design §5.1)
+
+(defun seed-absences (g)
+  "Five unary rt-claims on h1..h5 under relation \"scanned\", one per
+standing, plus a sixth on h7 that is determined-empty but retracted;
+h6 has no claim at all.  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (loop for (key standing) in '(("h1" :searched-empty)
+                                  ("h2" :determined-empty)
+                                  ("h3" :uncovered)
+                                  ("h4" :indeterminate)
+                                  ("h5" :observed)
+                                  ("h7" :determined-empty))
+          do (make-rt-claim-unary :graph g :subject-namespace :host
+                                  :subject-key key :relation "scanned"
+                                  :producer "scan-c" :standing standing)))
+  (retract-claim (first (claims-touching g 'rt-claim :host "h7"
+                                         :role :subject
+                                         :relation "scanned"))))
+
+(test claim-absent-answers-determined-absences-only
+  "A determined absence is a current claim of standing :SEARCHED-EMPTY
+or :DETERMINED-EMPTY; the two weak absences, a presence, a retracted
+absence and a subject with no claim at all are not answers."
+  (with-rules-graph (g)
+    (seed-absences g)
+    (is (equal '("h1" "h2")
+               (sort (select-flat (?k)
+                       (claim-absent ?c rt-claim "host" ?k "scanned"
+                                     ?o ?ok))
+                     #'string<)))
+    ;; A bound subject takes the indexed route like CLAIM/7.
+    (is (equal '("determined-empty")
+               (select-flat (?s)
+                 (claim-absent ?c rt-claim "host" "h2" "scanned" ?o ?ok)
+                 (claim-standing ?c ?s))))
+    (is (null (select-flat (?s)
+                (claim-absent ?c rt-claim "host" "h5" "scanned" ?o ?ok)
+                (claim-standing ?c ?s))))))
+
+(test a-malformed-duration-number-is-refused-not-read
+  (dolist (text '("P.D" "P1.2.3D" "PT.S"))
+    (signals graph-db:query-precondition-error
+      (graph-db::%parse-iso-duration text)))
+  (is (= 1500000000 (graph-db::%parse-iso-duration "PT1.5S")))
+  (is (= (* 14 86400 1000000000)
+         (graph-db::%parse-iso-duration "P2W"))))

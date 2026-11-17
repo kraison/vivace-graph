@@ -22,9 +22,10 @@ hands a language model a query tool depends on `graph-db/core` and
 ```
 
 Pulls in `graph-db/core` and nothing web-facing. The exported guard
-API lives in `graph-db.query`; the DSL's exports (`compile-pattern-query`,
-`run-query-goals`, `run-pattern-query`, `def-query`, and friends) stay
-in `graph-db` as before.
+API lives in `graph-db.query`. The DSL's exports (`compile-pattern-query`,
+`run-pattern-query`, `def-query`, and friends) stay in `graph-db`; the
+runner behind them, `run-query-goals`, is internal, and the exported way
+to run kept goals is `run-guarded-goals` below.
 
 ## `run-guarded-prolog`
 
@@ -34,7 +35,8 @@ in `graph-db` as before.
   => (values columns rows truncated-p)
 ```
 
-Screens `text` character-by-character before the reader ever sees it,
+Screens `text` before the reader ever sees it -- refusing a text longer
+than `*prolog-max-query-length*` (GH #366), then character-by-character --
 reads it into a per-call scratch package that uses nothing, walks and
 rebuilds the resulting forms out of canonical, whitelisted symbols, and
 runs the result through the DSL's own runner (`:effects nil`, one
@@ -94,8 +96,10 @@ when that extra row shows up (more solutions exist than were
 returned) and `nil` when the result set exactly fills or falls under
 the cap. At the ceiling -- `limit` omitted or `>=
 *query-default-limit*` -- there is no room for the extra row
-(`%probe`), so an exactly-full page there reads as `truncated-p` `t`
-too; only a page short of 1000 rows is `nil` at the ceiling.
+(`probe-limit`), so an exactly-full page there reads as `truncated-p` `t`
+too; only a page short of 1000 rows is `nil` at the ceiling. The rule's
+home is `clamp-row-cap` and `probe-limit` in `graph-db`, which the
+runner, the guard and the GUI endpoints all call (#328).
 
 ## Paging (GH #387)
 
@@ -126,8 +130,13 @@ What this is and is not:
   produced -- and still count against `max-inferences` and `timeout`,
   which bind per call -- so a deep page of a large answer costs what
   every page before it cost. Size the budget for the deepest page, or
-  page by key, whose cost is the discarded keys' claims rather than
-  every earlier solution.
+  page by key: with the `>` goal written immediately after the
+  `claim/7` goal, the pair compiles to `claim-after/9`, whose route
+  starts at the bound, and a deep page costs
+  its own keys' claims plus one string comparison per earlier key
+  (GH #451; the condition and what is not fused are in `docs/rules.md`
+  "Solution order"). A `>` separated from the goal still works, at the
+  old price of the discarded keys' claims.
 - **Not a snapshot cursor.** Each call runs under its own read
   snapshot; nothing is held between pages, so nothing expires and
   nothing needs a token. A resumable cursor -- a suspended run holding
@@ -210,6 +219,72 @@ across the goals, which is all the engine asks of a variable
 anything the caller's own package holds. `graph-db/rules` compiles a
 rule's head and body through this, as one text so a variable shared
 between them reads as one symbol (`docs/rules.md`).
+
+## run-guarded-goals (GH #383)
+
+```lisp
+(run-guarded-goals vars goals graph &key limit offset max-inferences
+                                         timeout (format :data))
+  => (values columns rows truncated-p)
+```
+
+The run half of `run-guarded-prolog`, for a caller that kept the goals
+`guard-query-text` returned. `vars` and `goals` are that call's two
+values, unchanged. It applies the same rails keyword for keyword: the
+`limit` clamp and the probe, `offset` paging, the inference and time
+budgets, the `:data` or `:raw` shaping, and the same `truncated-p`
+reading, including at the ceiling with `limit` omitted. An unknown
+`format` is a type error before anything runs.
+
+So `guard-query-text` plus `run-guarded-goals` equals
+`run-guarded-prolog`, and the goals may be run any number of times.
+Each run sees the store as it is then, so a write made between runs
+shows in the next one.
+
+## The screened reader (GH #366)
+
+```lisp
+(scan-query-text text) => t           ; signals prolog-guard-error
+(call-with-screened-forms text function) => function's values
+(with-screened-forms (forms text) &body body)
+```
+
+The screen and the read, for an embedder that wants the forms rather
+than a guarded run. `scan-query-text` refuses, by name: a text longer
+than `*prolog-max-query-length*`, the package marker `:`, every `#`
+reader macro (`#.` above all), backquote and comma, unbalanced or
+over-deep parentheses, and an unterminated string or `|...|` name. An
+absurd exponent is refused by the exponent screen that follows it, and
+a non-finite number by the read. `call-with-screened-forms` screens
+`text`, reads it into a fresh scratch package that uses nothing, and
+calls `function` with the forms; `with-screened-forms` is the macro over
+it. Every refusal signals `prolog-guard-error`.
+
+The scratch package is deleted when `function` returns or unwinds, so
+nothing lands in the caller's package. Symbols in the forms are
+interned there: compare them by `symbol-name`, never by `eq` against a
+symbol of your own.
+
+The length cap is the screen's, so `run-guarded-prolog` and
+`guard-query-text` refuse an overlong text too, not only the GUI
+endpoint.
+
+## `explain-text` and `profile-text` (GH #124)
+
+```lisp
+(explain-text text graph &key stream)   => explain-goals' rows
+(profile-text text graph &key stream limit max-inferences timeout)
+  => (values solutions rows error)
+```
+
+Both screen, read and guard `text` exactly as `guard-query-text` does,
+then hand the goals to `graph-db:explain-goals` and
+`graph-db:profile-goals` (manual, Chapter 6). `explain-text` runs
+nothing; `profile-text` runs the query read-only under one snapshot
+with the guard's budgets as its defaults, so a profile from text is
+always bounded, and a tripped budget comes back as the third value with
+the rows of what ran. Refusals are `prolog-guard-error`, as everywhere
+in this file.
 
 ## What the guard admits
 

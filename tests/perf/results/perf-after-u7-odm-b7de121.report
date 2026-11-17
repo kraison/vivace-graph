@@ -1,0 +1,9 @@
+;;;; graph-db perf report
+;;;; tag=after-u7-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; change-feed-cursor                     SECONDS 0.047  
+;; change-feed-cursor-rows                ROWS 1000  
+
+(:PERF-REPORT :TAG "after-u7-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 5
+ :HOST "odm" :ENTRIES
+ (("change-feed-cursor" :SECONDS 0.047) ("change-feed-cursor-rows" :ROWS 1000)))

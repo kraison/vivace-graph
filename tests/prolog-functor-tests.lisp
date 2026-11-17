@@ -460,3 +460,22 @@ both orders, case-insensitively.  Two strings stay case-sensitive."
     (let ((*print-case* :downcase)
           (*print-base* 16))
       (is (equal '(42) (eval '(select-flat (?x) (= ?x 42) (numberp ?x))))))))
+
+(test a-clause-body-rewriter-runs-before-the-body-compiles
+  "GH #451: a registered rewriter sees the clause body as a goal list
+and its result is what compiles.  Registered for the test only.  SELECT
+compiles its clause at macroexpansion time, so the query is EVALed
+under the binding, not written inline."
+  (with-test-graph (g)
+    (flet ((rewrite (goals)
+             (substitute-if '(= ?x 42)
+                            (lambda (goal)
+                              (and (consp goal)
+                                   (symbolp (first goal))
+                                   (string= (symbol-name (first goal))
+                                            "RW-MARKER")))
+                            goals)))
+      (let ((graph-db:*clause-body-rewriters* (list #'rewrite)))
+        (is (equal '(42) (eval '(select-flat (?x) (rw-marker ?x)))))))
+    ;; Without it the marker is an unknown functor.
+    (signals error (eval '(select-flat (?x) (rw-marker ?x))))))

@@ -276,7 +276,10 @@ compound, or a control construct; its variables are runtime VAR structs."
                  (fn (or (get-functor-fn functor)
                          (gethash functor *prolog-global-functors*))))
             (if (functionp fn)
-                (apply fn (append gargs (list cont)))
+                (let ((hook *prolog-port-hook*))
+                  (if hook
+                      (%ported-call hook functor fn gargs cont)
+                      (apply fn (append gargs (list cont)))))
                 ;; Unknown predicate: noisy, but with an existence_error ball so
                 ;; catch/3 can recover from it.
                 (error 'prolog-error
@@ -319,9 +322,9 @@ Catcher unifies with it.  An uninstantiated BALL is an instantiation_error."
   "catch(Goal, Catcher, Recovery): prove GOAL; if it throws a ball that unifies
 with CATCHER, undo GOAL's bindings and prove RECOVERY instead.  A ball that does
 not unify propagates to an outer catch.  Errors raised by the CONTINUATION after
-GOAL succeeds are not caught here (only GOAL is protected).  Resource and
-permission errors are NOT catchable -- they must abort the query so a bounded,
-untrusted query cannot swallow its own enforcement."
+GOAL succeeds are not caught here (only GOAL is protected).  Resource,
+permission and unstratified errors are NOT catchable -- they must abort the
+query so a bounded, untrusted query cannot swallow its own enforcement."
   (let ((marker (list :catch))
         (entry (fill-pointer *trail*))
         (caught nil))
@@ -331,7 +334,8 @@ untrusted query cannot swallow its own enforcement."
              (lambda (c)
                (when (and (member marker *active-catches* :test #'eq)
                           (not (typep c 'prolog-resource-error))
-                          (not (typep c 'prolog-permission-error)))
+                          (not (typep c 'prolog-permission-error))
+                          (not (typep c 'prolog-unstratified-error)))
                  (let ((ball (or (prolog-error-ball c)
                                  (iso-ball (list :system-error (princ-to-string c))))))
                    (undo-bindings entry)
@@ -361,12 +365,16 @@ no solution -- not when Test succeeds but Then fails.  This is the runtime
 (meta-call) counterpart of the IF compiler macro; the two must agree."
   (when *prolog-trace* (format t "TRACE: IF/3(~A ~A ~A)~%" ?test ?then ?else))
   (let ((old-trail (fill-pointer *trail*))
+        (floor *negation-floor*)
         (cond-met nil))
     (block done
-      (call/1 ?test #'(lambda ()
-                        (setf cond-met t)
-                        (call/1 ?then cont)
-                        (return-from done))))
+      ;; Test is read as closed (tabling design D4); Then is not.
+      (with-negation-floor ()
+        (call/1 ?test #'(lambda ()
+                          (setf cond-met t)
+                          (let ((*negation-floor* floor))
+                            (call/1 ?then cont))
+                          (return-from done)))))
     (unless cond-met
       (undo-bindings old-trail)
       (call/1 ?else cont))))
@@ -383,14 +391,17 @@ Runtime (meta-call) counterpart of the FORALL compiler macro."
   (let ((old-trail (fill-pointer *trail*))
         (ok t))
     (block done
-      (call/1 cond
-              #'(lambda ()
-                  (let ((inner-trail (fill-pointer *trail*))
-                        (act nil))
-                    (block inner
-                      (call/1 action #'(lambda () (setf act t) (return-from inner))))
-                    (undo-bindings inner-trail)
-                    (unless act (setf ok nil) (return-from done))))))
+      ;; Cond and Action are read as closed (tabling design D4).
+      (with-negation-floor ()
+        (call/1 cond
+                #'(lambda ()
+                    (let ((inner-trail (fill-pointer *trail*))
+                          (act nil))
+                      (block inner
+                        (call/1 action
+                                #'(lambda () (setf act t) (return-from inner))))
+                      (undo-bindings inner-trail)
+                      (unless act (setf ok nil) (return-from done)))))))
     (undo-bindings old-trail)
     (when ok (funcall cont))))
 
@@ -418,7 +429,9 @@ Runtime (meta-call) counterpart of the FORALL compiler macro."
   "Prolog negation.  Does not retract, simply negates in the context of the
 query."
   (with-undo-bindings
-    (call/1 relation #'(lambda () (return-from not/1 nil)))
+    ;; RELATION is read as closed (tabling design D4).
+    (with-negation-floor ()
+      (call/1 relation #'(lambda () (return-from not/1 nil))))
     (funcall cont)))
 
 (def-global-prolog-functor or/2 (goal1 goal2 cont)
@@ -465,7 +478,9 @@ resolves bound variables to their values so the snapshot survives the undo --
 DEREF-COPY renames variables apart and would drop the bindings."
   (let ((acc nil)
         (old-trail (fill-pointer *trail*)))
-    (%solve goal (lambda () (push (deref-exp template) acc)))
+    ;; GOAL is read as closed (tabling design D4): findall, bagof, setof.
+    (with-negation-floor ()
+      (%solve goal (lambda () (push (deref-exp template) acc))))
     (undo-bindings old-trail)
     (nreverse acc)))
 
@@ -554,6 +569,19 @@ order and duplicates."
   "setof(Template, Goal, Set): like bagof, but each Set is sorted by the standard
 order of terms with duplicates removed."
   (%solve-aggregate template goal result cont t))
+
+(def-global-prolog-functor aggregate-all/3 (spec goal result cont)
+  "(aggregate-all Spec Goal Result): count, (sum E), (min E), (max E),
+(bag T), (set T), (min E W) or (max E W) over every solution of GOAL,
+binding nothing of GOAL's; min and max fail over no solution.  The
+runtime form; a static GOAL compiles inline (GH #123, design D1)."
+  (multiple-value-bind (kind template) (%aggregate-spec (deref-exp spec))
+    (multiple-value-bind (value ok)
+        (%aggregate-result kind (%findall-list template (var-deref goal)))
+      (when ok
+        (let ((old-trail (fill-pointer *trail*)))
+          (when (unify result value) (funcall cont))
+          (undo-bindings old-trail))))))
 
 (def-global-prolog-functor show-prolog-vars/2 (var-names vars cont)
   (if (null vars)
@@ -1200,6 +1228,8 @@ symbols are interned in NAME's own package.  Skipped, with a warning
 naming NAME, when that package is COMMON-LISP or KEYWORD -- neither
 tolerates new symbols (GH #172)."
   (let ((pkg (%schema-symbol-package name)))
+    ;; The compiled query cache keys on this (GH #376, design D3).
+    (incf *functor-generation*)
     (if (member pkg (list (find-package :common-lisp)
                           (find-package :keyword)))
         (warn "Skipping edge functor install for ~S: its package ~A ~
@@ -1213,6 +1243,22 @@ is locked (GH #172)." name (package-name pkg))
                    (export sym pkg)
                    (setf (gethash sym *prolog-global-functors*) fn)
                    sym)))
-          (install "/2" (%edge-functor/2 name))
-          (install "/3" (%edge-functor/3 name))))
+          (let ((s2 (install "/2" (%edge-functor/2 name)))
+                (s3 (install "/3" (%edge-functor/3 name)))
+                (path (lambda (bound args graph)
+                        (declare (ignore graph))
+                        (destructuring-bind (from to &rest more) args
+                          (declare (ignore more))
+                          (cond ((and (first bound) (second bound))
+                                 "vev index: one lookup")
+                                ((first bound)
+                                 (format nil "ve-out index of ~A" from))
+                                ((second bound)
+                                 (format nil "ve-in index of ~A" to))
+                                (t (format nil "every ~A edge"
+                                           (symbol-name name))))))))
+            ;; What EXPLAIN-GOALS says of a call on this edge type
+            ;; (design D3, GH #124): the index MAP-EDGES reads.
+            (register-access-path s2 path)
+            (register-access-path s3 path))))
     name))

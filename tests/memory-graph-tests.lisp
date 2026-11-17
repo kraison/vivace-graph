@@ -34,7 +34,7 @@ fault-on-access invariant.  Call at the start of any test that reopens a graph."
 ;; A geometry-bearing type: the :INDEX slot opts into spatial indexing.
 (def-vertex m-place ()
   ((label)
-   (geom :index t))
+   (geom :type geometry :index t))
   :graph-db-memory-test)
 
 ;; A SECOND geometry-bearing type declaring its OWN geometry slot, so it lands in
@@ -857,15 +857,13 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
           (collect-garbage))))))
 
 (test v5-memory-image-lazy-open-migrates-selectively
-  "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own deleted
-%REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class MIGHT carry a
-geometry, via NODE-GEOMETRY-INDEX-SLOTS -- which returns every :INDEX-marked slot,
-scalars included, so a class like M-TAG (an indexed STRING) is over-approximated
-and materialized too, same as v5 always did.  Plain M-PERSON, with no :INDEX slot
-at all, is the one guaranteed to stay a deferred LZNODE blob -- the property
-fault-on-access depends on.  A test that only checked the query would pass even if
-migration materialized everything; this also pins down what did and didn't get
-touched (GH #65)."
+  "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own
+deleted %REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class
+MIGHT carry a geometry, via NODE-GEOMETRY-INDEX-SLOTS.  Since #60 that is the
+DECLARED geometry slots, so M-TAG (an indexed STRING) stays a deferred LZNODE
+blob along with plain M-PERSON -- the property fault-on-access depends on.  A
+test that only checked the query would pass even if migration materialized
+everything; this also pins down what did and didn't get touched (GH #65)."
   (reset-mem-view-registry)
   (flet ((n-materialized (g)
            (loop for v being the hash-values of
@@ -904,13 +902,14 @@ touched (GH #65)."
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-region 'extent)
                              10.0d0 41.0d0 11.0d0 43.0d0)))
-                 ;; the 3 plain M-PERSON nodes (no :INDEX slot at all) are untouched
-                 (is (= 3 (n-lznodes g2))
-                     "nodes with no :INDEX slot were never touched by the migration")
-                 ;; the 2 geometry nodes AND the 5 M-TAG (:INDEX scalar,
-                 ;; over-approximated, same as v5 always did) were materialized
-                 (is (= 7 (n-materialized g2))
-                     "geometry nodes plus the over-approximated :INDEX-scalar class"))
+                 ;; the 3 M-PERSON and the 5 M-TAG (no GEOMETRY slot) are
+                 ;; untouched
+                 (is (= 8 (n-lznodes g2))
+                     "nodes with no geometry slot were never touched by the ~
+migration")
+                 ;; only the 2 geometry nodes were materialized (#60, §5.0)
+                 (is (= 2 (n-materialized g2))
+                     "geometry nodes alone are materialized"))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
 
@@ -938,7 +937,7 @@ empty, and deleting the image discards the ONLY durable copy of the graph
         (when msg
           (is (search "v5" msg))
           (is (search "v6" msg))
-          (is (search "v8" msg)
+          (is (search (format nil "v~D" graph-db::+native-image-version+) msg)
               "the message names the version this build writes")
           (is (not (search "Delete" msg)))
           (is (not (search "delete" msg))))))))
@@ -1151,3 +1150,87 @@ rebuilds from the journal), which is the documented recovery."
           "a refused create must leave no files behind")
       (is (probe-file (format nil "~A.dirty" loc))
           "the marker that records the earlier crash is kept"))))
+
+;;; ---------------------------------------------------------------------------
+;;; #60 spec §9: an image written before every geometry slot was indexed holds
+;;; one spatial record per class; reopening it re-derives from the nodes.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex m-twin ()
+  ((centroid :type geometry :index t)
+   (outline :type geometry :index t :spatial-precision 5))
+  :graph-db-memory-test)
+
+(defun %m-twin-indexed-p (g slot min-lon min-lat max-lon max-lat id)
+  (let ((idx (graph-db::spatial-index-for g 'm-twin slot)))
+    (and idx (has-p id (graph-db::spatial-index-query-bbox
+                        idx min-lon min-lat max-lon max-lat))
+         t)))
+
+(defun %m-twin-both-indexed-p (g id)
+  (and (%m-twin-indexed-p g 'centroid 29.9d0 49.9d0 30.1d0 50.1d0 id)
+       (%m-twin-indexed-p g 'outline 34.9d0 54.9d0 36.1d0 56.1d0 id)))
+
+(defun %write-pre-60-image (loc lazy patch)
+  "Create a memory graph at LOC with one M-TWIN, drop its OUTLINE index from
+the registry (as a pre-#60 image never had one), close it so the image is
+written, then call PATCH on the image file to stamp the older version.
+Returns the node id."
+  (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy lazy))
+        id)
+    (let ((*graph* g))
+      (with-transaction ()
+        (setq id (id (make-m-twin :centroid (graph-db::make-point 30d0 50d0)
+                                  :outline (scope-rect 35d0 55d0 36d0 56d0)))))
+      (is (%m-twin-both-indexed-p g id) "premise: both indexed before close")
+      (remhash (cons 'm-twin 'outline) (graph-db::spatial-indexes g))
+      (close-graph g :snapshot-p t))
+    (funcall patch (graph-db::memory-image-file loc))
+    id))
+
+(test a-v8-native-image-rebuilds-its-spatial-indexes
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let* ((loc (namestring dir))
+           (id (%write-pre-60-image
+                loc t
+                (lambda (file)
+                  ;; The version is the 4-byte little-endian word after the
+                  ;; magic (NI-UINT); stamp it 8.
+                  (let ((bytes (with-open-file (s file :element-type
+                                                 '(unsigned-byte 8))
+                                 (let ((a (make-array (file-length s)
+                                                      :element-type
+                                                      '(unsigned-byte 8))))
+                                   (read-sequence a s) a)))
+                        (off (length graph-db::*native-image-magic*)))
+                    (setf (aref bytes off) 8 (aref bytes (+ off 1)) 0
+                          (aref bytes (+ off 2)) 0 (aref bytes (+ off 3)) 0)
+                    (with-open-file (s file :direction :output
+                                            :if-exists :supersede
+                                            :element-type '(unsigned-byte 8))
+                      (write-sequence bytes s)))))))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc
+                                             :lazy t)))
+        (unwind-protect
+             (is (%m-twin-both-indexed-p g2 id)
+                 "a v8 image re-derives every slot's index from the nodes")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-v5-cl-store-image-rebuilds-its-spatial-indexes
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let* ((loc (namestring dir))
+           (id (%write-pre-60-image
+                loc nil
+                (lambda (file)
+                  (let ((plist (graph-db::%restore-node-image file)))
+                    (setf (getf plist :version) 5)
+                    (cl-store:store plist file))))))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (is (%m-twin-both-indexed-p g2 id)
+                 "a :version 5 image re-derives every slot's index")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

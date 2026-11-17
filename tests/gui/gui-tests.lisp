@@ -1343,7 +1343,11 @@ thing under test."
     (sort names #'string<)))
 
 (defparameter *reviewed-functor-inventory*
-  '("/=/2"
+  '("%closure-args/2"
+    "/=/2"
+    "aggregate-all/3"
+    "k-hop/4"
+    "reachable/3"
     "</2"
     "<=/2"
     "=/2"
@@ -1358,10 +1362,14 @@ thing under test."
     "find-by-slot/4"
     "find-by-unique/4"
     "find-intersects/3"
+    "find-intersects/4"
     "find-near/5"
+    "find-near/6"
     "find-nearest/5"
+    "find-nearest/6"
     "find-slot-range/5"
     "find-within/3"
+    "find-within/4"
     "findall/3"
     "forall/2"
     "geo-distance/5"
@@ -1450,6 +1458,13 @@ new sibling of not/once/if/forall): add its NAME to ~
 *PROLOG-GOAL-ARGUMENT-CONTROL* there instead -- that forces its ~
 arguments to be written-out goals, which keeps it on the compile-time ~
 path.~%~
+  * Yes, and only SOME positions are goals while another is a literal ~
+spec (an aggregate-all/3): add a positional entry (NAME :spec P :goal Q) ~
+to *PROLOG-GOAL-ARGUMENT-CONTROL*, so the goal position must be written ~
+out and the spec position must be a literal spec term; an internal ~
+compiler macro the expansion emits (a %aggregate-step) goes on ~
+*PROLOG-EXCLUDED-PREDICATES*, since the control-word table is derived ~
+from the compiler-macro property.~%~
   * No: nothing to do for this question.~%~%~
 Note on HOW an exclusion is enforced, if you add one: it is matched ~
 against GRAPH-DB-homed registry keys, so a schema owning the same name ~
@@ -1479,7 +1494,16 @@ preempt it.  REGEX-MATCH/2 is the worked example: (a+)+$ against a run ~
 of a's ran ~~2^n and blew a 30 s deadline from a payload of a few ~
 dozen characters.  A watchdog is NOT the alternative -- interrupting a ~
 worker mid-call can unwind holding the GUI rw lock or with an mmap ~
-operation in flight.~%~%~A"
+operation in flight.~%~%~
+QUESTION 3 -- what may a STANDING QUERY make of it?  A production body ~
+delivers exactly its query's rows only through goals the commit delta ~
+can see (docs/rules.md, \"Standing queries\"; #470).  Add an entry for ~
+it to GRAPH-DB.RULES:*STANDING-QUERY-FUNCTOR-CLASSES* in ~
+rules/standing.lisp -- :TEST for a check over bound values, ~
+:STORE-READ for anything that reads the store outside the claim ~
+families, the other classes as that table documents.  The rules suite ~
+(EVERY-REGISTERED-FUNCTOR-HAS-A-STANDING-QUERY-CLASS) fails until it ~
+has one.~%~%~A"
           (length added) added (%inventory-guidance)))
 
 (defun %removed-functor-message (removed)

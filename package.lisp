@@ -9,6 +9,10 @@
         #+ecl #:clos
         #+sbcl #:sb-mop
         #+sbcl #:sb-pcl)
+  ;; NOW is a rule-body functor (rules/facts.lisp NOW/1): the query
+  ;; guard interns a goal head by name here, and without the shadow it
+  ;; would find LOCAL-TIME:NOW instead (#456).
+  (:shadow #:now)
   #+sbcl (:shadowing-import-from "SB-EXT" "WORD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "STANDARD-METHOD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "FINALIZE-INHERITANCE")
@@ -248,6 +252,8 @@
            #:transaction-p
            #:graph-name
            #:transaction-error
+           #:transaction-file-id-mismatch
+           #:transaction-file-patch-error
            #:cross-graph-transaction-error
            #:duplicate-node-class-error
            #:master-host
@@ -275,6 +281,7 @@
            #:*query-default-limit*
            #:*query-default-max-inferences*
            #:*query-default-timeout*
+           #:clamp-row-cap #:probe-limit    ; the one row-cap rule (GH #328)
            #:query-param-error
            ;; checked query preconditions, typed (GH #286)
            #:query-precondition-error #:query-precondition-error-reason
@@ -462,6 +469,7 @@
            #:validation-report-violations #:validation-report-family-counts
            #:validation-report-checked-counts #:validation-report-spec-counts
            #:commit-view-graph #:*commit-validators*
+           #:*after-commit-hooks*                           ; #456
            ;; Disjointness over vertex types (GH #157, 4a)
            #:def-disjoint #:undef-disjoint #:disjointness-violation
            #:djv-classes #:djv-offender #:djv-name
@@ -537,6 +545,10 @@
            #:*trail*
            #:*var-counter*
            #:*functor*
+           #:*clause-indexing*
+           #:*prolog-port-hook* #:*prolog-port-depth*
+           #:call-with-prolog-ports #:with-prolog-ports
+           #:explain-goals #:register-access-path #:profile-goals
            #:make-functor
            #:maybe-add-undo-bindings
            #:compile-clause
@@ -545,6 +557,7 @@
            #:prolog-error-ball
            #:prolog-throw
            #:prolog-resource-error
+           #:prolog-unstratified-error
            ;; cost-boundedness classification (GH #285)
            #:declare-functor-cost-unbounded #:functor-cost-unbounded-p
            #:cost-unbounded-predicate-names #:prolog-cost-unbounded-error
@@ -575,8 +588,12 @@
            #:init-prolog
            #:*prolog-graph*
            #:*prolog-trace*
+           #:*clause-body-rewriters*
            #:trace-prolog
            #:untrace-prolog
+           #:table-functor #:untable-functor #:functor-tabled-p
+           #:clear-query-cache #:query-cache-stats
+           #:*compiled-query-cache-size* #:*compile-query-after*
            #:make-node-table
            #:node-equal
 
@@ -661,18 +678,15 @@
            #:rebuild-spatial-indexes
            #:regenerate-spatial-index
            #:regenerate-spatial-indexes
-           ;; §8: the inert second geometry slot.  Only the FIRST geometry-valued
-           ;; :INDEX slot of a class is ever indexed; AUDIT-SPATIAL-SLOTS is the
-           ;; exhaustive read-only sweep for the rest, and
-           ;; NODE-GEOMETRY-SLOTS-WITH-VALUES is the per-node predicate behind it.
-           #:audit-spatial-slots
-           #:node-geometry-slots-with-values
            ;; declaring a spatial index's grid precision: the reader for the
            ;; (slot :spatial-precision N) slot option, its one declaration surface
            #:spatial-precision-spec
            #:install-spatial-indexes
-           ;; write-path protocol (applications specialize this)
+           ;; write-path protocol (applications specialize these, #60)
            #:node-geometry
+           #:node-geometries
+           #:node-slot-geometry
+           #:*spatial-unnamed-slot-policy*
            ;; subset replication (field devices)
            #:replication-filter
            #:make-spatial-replication-filter
@@ -685,6 +699,11 @@
            #:find-intersects/3
            #:find-near/5
            #:find-nearest/5
+           ;; the same with the geometry slot in third position (#60)
+           #:find-within/4
+           #:find-intersects/4
+           #:find-near/6
+           #:find-nearest/6
            #:geo-distance/5
            #:geo-near/5
            #:geo-within/3

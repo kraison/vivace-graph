@@ -296,9 +296,11 @@ disjoint: (h1 Feb-Jun, v3), (h1 Aug-Sep, v1), (h2 May, v1),
         (is (= 2 (graph-db.rules:rule-report-kept report)))
         (is (= 1 (graph-db.rules:rule-report-swept report)))
         (is (= 0 (graph-db.rules:rule-report-derived report))))
-      ;; h3's provenance record went with it.
-      (is (= 2 (length (claims-by-producer a 'graph-db.rules:derivation
-                                           "rule/web-hosts")))))))
+      ;; h3's provenance record went with it: retracted, not deleted
+      ;; (D4), so two records are still believed.
+      (is (= 2 (count-if #'claim-current-p
+                         (claims-by-producer a 'graph-db.rules:derivation
+                                             "rule/web-hosts")))))))
 
 (test run-rules-takes-the-scope
   (with-two-stores (a b)

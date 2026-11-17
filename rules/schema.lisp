@@ -4,8 +4,9 @@
 (in-package #:graph-db.rules)
 
 (defmacro def-rules-schema (graph-name)
-  "Declare in the store GRAPH-NAME the RULE record (spec §5) and the
-DERIVATION provenance family (spec §9).  Both are per store, as every
+  "Declare in the store GRAPH-NAME the RULE record (spec §5), the
+DERIVATION provenance family (spec §9), the PRODUCTION record and the
+FIRING family (forward-rules design §7).  Both are per store, as every
 DEF-VERTEX is, so a store that holds rules evaluates this once beside
 its own schema; GRAPH-NAME is the literal keyword DEF-CLAIM-CLASSES
 takes.  One RULE per NAME: the identity facet's uniqueness is the
@@ -35,4 +36,24 @@ class's name as a string, HEAD and BODY guarded Prolog text."
        :one-of '(:premises :none) :required t
        :name rule-extent-policy)
      (graph-db.spacetime:def-claim-classes derivation ,graph-name)
+     ;; Productions (forward-rules design §7): the record, and the
+     ;; FIRING family their instantiations are recorded in.
+     (graph-db.spacetime:def-source production ,graph-name
+         ((name :type string :accessor production-name
+                :check graph-db.spacetime:canonical-relation-p)
+          (version :type string :accessor production-version
+                   :check graph-db.spacetime:canonical-relation-p)
+          (family :type string :accessor production-family)
+          (body :type string :accessor production-body)
+          (salience :initform 0 :accessor production-salience)
+          (writes :initform '() :accessor production-writes)
+          (action :type string :accessor production-action))
+       :identity (:namespace :production :key-slot name)
+       :space :none
+       :time :none
+       :attribution :none
+       :sensitivity (:class :internal)
+       :registration :none
+       :indexed-text (:text-fn production-body))
+     (graph-db.spacetime:def-claim-classes firing ,graph-name)
      ',graph-name))

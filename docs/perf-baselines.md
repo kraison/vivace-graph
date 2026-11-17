@@ -127,3 +127,130 @@ GH #255.)
   in a real workload, the fix is maintained per-transaction buckets
   behind the same overlay functions (spec 2026-10-29 §6), not a bigger
   scan.
+
+- **The Prolog Engine 5.0 "before"** (`run-prolog-bench`, GH #45).
+  `results/prolog-before-odm-55240fd.report` is the third of three
+  normal-scale runs on odm, SBCL 2.6.6, generation 5, 2026-11-09, taken
+  before any unit's code changed: 500 clause asserts at 16/s and 5,000
+  bound-first-argument lookups at 50,000/s (#121); 500 repeated guarded
+  shapes at 1,208/s (#376); a change-feed cursor over 20,000 claims in
+  6.9 s (#392); 100 three-hop selects at 2,041/s and 100 Lisp BFS paths
+  at 658/s (#123); and the recursive ring closure exhausting the control
+  stack in 0.09 s with no solution (#122). Each unit reruns the same
+  bench when it lands and posts both rows on its issue.
+- **Unit 2, clause indexing, after** (#121):
+  `results/prolog-after-u2-odm-6e416f7.report`, same host, SBCL and
+  generation, 2026-11-09, third of three runs. 500 asserts at 430/s
+  (was 16/s; runs 1 and 2: 488/s, 289/s), 5,000 bound lookups at
+  263,144/s (was 49,998/s); the new `clause-assert-10k` case asserts
+  10,000 clauses in 19.6 s (510/s; runs 1 and 2: 25.3 s, 25.5 s) and
+  answers 20,000 bound lookups at 192,298/s. An assert extends the
+  previous immutable clause set (one bucket replaced, the rest shared)
+  rather than rebuilding it, so the per-assert rate at 10,000 clauses
+  matches the rate at 500. The dispatcher tail-calls its last
+  candidate and a clause closure's body is its last form, so a
+  tail-recursive rule keeps constant stack: a probe recursing 2,000,000
+  deep passes on the unchanged engine and on this one, where a first
+  version that read a cut flag after the clause block died at 7,000.
+  `recursive-ring-closure` still exhausts the stack (its recursion
+  runs inside edge-generator frames, not a tail call); it does so in
+  0.065 s against 0.09 s before, a smaller frame per level, not a
+  change of outcome. The other rows are unchanged within noise.
+- **Unit 3, tracer and explain, after** (#124):
+  `results/prolog-after-u3-odm-d1b81b7.report`, same host, SBCL and
+  generation, 2026-11-09, third of three runs. The untraced call path
+  is unchanged within noise against the unit 2 report: `k-hop-3-select`
+  2,273/s (was 2,041/s; runs 1 and 2: 2,041, 2,128), bound lookups
+  277,762/s (was 263,144/s), `guarded-shape-repeat` 1,475/s (was
+  1,256/s). The new `traced-k-hop-3-select` row runs the same query
+  under `trace-prolog` to a null stream: 1,099/s (runs 1 and 2: 1,266,
+  1,408), so tracing roughly halves this query's throughput when it is
+  on and costs nothing when it is off.
+- **Unit 4, tabling, the chain case's before** (#122):
+  `results/prolog-before-u4-chain-odm-1798080.report`, same host, SBCL
+  and generation, 2026-11-10, third of three runs, taken before any
+  tabling code. The new `bench-tabled-chain` case runs the ring's
+  recursive `pbp-path/2` down a 200-node chain, which has no cycle, so
+  the untabled recursion finishes: `chain-closure-untabled` 0.085 s,
+  199 solutions (runs 1 and 2: 0.083, 0.084). The case adds a
+  `chain-closure-tabled` row on an engine with `table-functor`; the
+  ring row stays the termination check, this one is the per-call cost
+  of a table against a plain recursion.
+- **Unit 4, tabling, after** (#122):
+  `results/prolog-after-u4-odm-d5eaa6e.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `pbp-path/2` tabled by
+  the bench. `recursive-ring-closure` completes: 200 solutions in
+  0.444 s (runs 1 and 2: 0.487, 0.545) where the before exhausted the
+  control stack in 0.09 s with none; the right-recursive rule
+  evaluates one table per node inside its caller's, which is where the
+  time goes. `chain-closure-tabled` 0.108 s (0.112, 0.115) against
+  `chain-closure-untabled` 0.080 s (0.097, 0.090): the tabling tax on
+  an acyclic query, about a third. The spine row is deferred to unit 5
+  (#122: a bare bench image cannot open the application's store
+  without its schema classes).
+- **Unit 5, aggregation and graph predicates, the before** (#123):
+  `results/prolog-before-u5-odm-4d2fd2c.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, engine at the unit 4
+  merge. `bench-graph-predicates` gains two hand-written rows:
+  `reachable-closure-handwritten`, a left-recursive tabled `pbp-lpath/2`
+  closure from 100 starts over the 200-node chords ring, 130/s (runs 1
+  and 2: 147, 128), and `aggregate-count-findall`, `findall` plus a
+  `lisp` length over each start's two-hop neighbourhood, 50,000/s (a
+  neighbourhood of one to four paths). The existing rows on this
+  engine: `k-hop-3-select` 1,064/s (1,266, 1,163; the unit 3 report
+  read 2,273/s on the pre-tabling engine, so the after is read against
+  this run, not that one) and `shortest-path-lisp-bfs` 667/s (800,
+  654). The case records `k-hop-3-predicate`, `reachable-predicate`,
+  `aggregate-count-predicate` and `shortest-path-predicate` when the
+  predicates exist in the image.
+- **Unit 5, aggregation and graph predicates, after** (#123):
+  `results/prolog-after-u5-odm-faacd94.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, `graph-db/algorithms`
+  loaded. `k-hop-3-predicate` 33,333/s (runs 1 and 2: 20,000, 25,000)
+  against `k-hop-3-select` 1,064/s: distinct nodes at distance 3
+  against one row per walk, so the work differs, but this is the query
+  a reader writes either way. `shortest-path-predicate` 961/s (1,020,
+  752) against `shortest-path-lisp-bfs` 224/s (1,064, 238; the BFS row
+  is noisy on this host). `reachable-predicate` 244/s (216, 220)
+  against the hand-written closure's 245/s: the same tabled shape made
+  a predicate. `aggregate-count-predicate` 50,000/s (33,322, 33,333)
+  against `findall` plus `lisp` at 50,000/s: a one-to-four-path
+  neighbourhood either way. The spine row stays deferred (#123: the
+  predicate reaches the application's image with the release).
+- **Unit 6, the compiled query cache, the before** (#376):
+  `results/perf-before-u6-odm-0729954.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs, engine at the unit 5
+  merge, the three cases in one image through the new `run-perf-only`.
+  `guarded-shape-repeat` 2,008/s (runs 1 and 2: 1,520, 1,634);
+  `two-hop-related` (the consumer's guarded two-hop read from
+  `bench-claim-linking`) 840/s (966, 847); the new `rules-rerun` case
+  (one rule over 2,000 base claims, `run-rule` 20 times) 12.1 s for
+  the 20 runs, 0.60 s per run (12.2, 12.6). Each run of a rule
+  interprets its body's `select` afresh today.
+- **Unit 6, the compiled query cache, after** (#376):
+  `results/perf-after-u6-odm-20f933b.report`, same host, SBCL and
+  generation, 2026-11-10, third of three runs. Where the cache applies
+  it is 1.5×: the new `guarded-goals-repeat` pair (goals guarded once,
+  500 runs) 11,904/s compiled (runs 1 and 2: 12,499, 13,513) against
+  7,936/s interpreted (8,196, 9,090). The three plan cases barely
+  move, because the select is a small part of each: `guarded-shape-
+  repeat` 1,873/s (2,347, 2,358) against 2,008 before, noise, since a
+  guarded call is 0.55 ms of which the guard's own per-request setup
+  is 0.35 ms and the select 0.08 ms compiled (the probe on #376; the
+  guard's cost is #489); `two-hop-related` 935/s (905, 893) against
+  840; `rules-rerun` 11.4 s for 20 runs (11.4, 11.3) against 12.1,
+  the rest of a run being its sweep and writes.
+- **Unit 7, the touched-at index, the before** (#392):
+  `results/perf-before-u7-odm-bc44486.report`, same host, SBCL and
+  generation, 2026-11-11, third of three runs, engine at the unit 6
+  merge, `bench-change-feed-cursor` alone through `run-perf-only`:
+  the claim-first feed text over 20,000 claims with the cursor past
+  95 % of them, 5.98 s (runs 1 and 2: 7.02, 6.16) for its 1,000 rows.
+  The goal enumerates the namespace key by key and filters by instant.
+- **Unit 7, the touched-at index, after** (#392):
+  `results/perf-after-u7-odm-b7de121.report`, same host, SBCL and
+  generation, 2026-11-12, third of three runs, the same bench and
+  text: 0.047 s (runs 1 and 2: 0.058, 0.046) for the same 1,000 rows,
+  about 125× the before. The pair fuses into `claim-touched-after/4`,
+  which reads the touched-at index from the cursor; the `claim/7` goal
+  filters each row by its bound-claim route.

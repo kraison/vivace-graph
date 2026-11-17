@@ -1120,3 +1120,41 @@ subjects (GH #163)."
          (is (= 1 (length regs)))
          (is (%near 1d0 (%fraction-of (first regs)))
              "the repaired square lies wholly inside the region"))))))
+
+;;; ---------------------------------------------------------------------------
+;;; #60 spec §6.3: a registry whose regions carry several geometry slots.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex ct-region2 ()
+  ((name :type string)
+   (centroid :type geometry :index t)
+   (geom :type geometry :index t))
+  :graph-db-register-test)
+
+(test a-two-slot-registry-registers-by-the-named-slot
+  "REGISTER-GEOMETRY tests the registry slot it is given: region A's outline
+contains the point and B's centroid sits on it; only A registers.  Unnamed,
+the two-slot registry signals under the default policy."
+  (with-region-graph (g)
+    (let ((graph-db:*graph* g))
+      (with-transaction ()
+        (make-ct-region2 :name "a" :centroid (make-point 5d0 5d0)
+                         :geom (make-polygon
+                                '(((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                                   (0d0 0d0)))))
+        (make-ct-region2 :name "b" :centroid (make-point 1d0 1d0)
+                         :geom (make-polygon
+                                '(((5d0 5d0) (7d0 5d0) (7d0 7d0) (5d0 7d0)
+                                   (5d0 5d0)))))))
+    (multiple-value-bind (regs evaluated)
+        (register-geometry (make-point 1d0 1d0) 'ct-region2
+                           :slot 'geom :registry-graph g)
+      (is-true evaluated)
+      (is (= 1 (length regs)))
+      (is (string= "a" (let ((graph-db:*graph* g))
+                         (slot-value (getf (first regs) :region) 'name))))
+      (is (%near 1d0 (%fraction-of (first regs)))))
+    (let ((graph-db::*spatial-unnamed-slot-policy* :error))
+      (signals graph-db:query-precondition-error
+        (register-geometry (make-point 1d0 1d0) 'ct-region2
+                           :registry-graph g)))))

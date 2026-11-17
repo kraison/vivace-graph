@@ -101,3 +101,18 @@ engine traps, these are the ones a test author meets.
 - **ECL's `random` is deterministic per process:** two runs draw the
   same sequence, so a test that relies on random keys differing between
   processes must seed `*random-state*` itself.
+
+## Running a test system's test-op
+
+`tests/run-system-tests.sh SYSTEM...` runs each named system's
+`test-op` in its own fresh SBCL with the 16 GB heap, against this
+checkout (`CL_SOURCE_REGISTRY`), and exits non-zero when any fails. One
+image per system, as CI runs them: a suite's schema registers functors
+another suite's tripwire counts (the GUI's pinned functor inventory).
+
+```
+tests/run-system-tests.sh graph-db/query-test graph-db/gui-test
+```
+
+It is the verify command a worker runs for a unit that touches those
+systems; `tests/run-suite.sh` is for one FiveAM suite of `graph-db/test`.

@@ -103,6 +103,9 @@ scan route's own union (GH #333)."
 alone when it is NIL."
   (or *claim-scope* (list *graph*)))
 
+;; NOTINLINE: the #451 cost tests count calls by swapping it (ECL would
+;; otherwise compile same-file calls directly, CLAUDE.md engine traps).
+(declaim (notinline %scope-lookup))
 (defun %scope-lookup (class-name slots value)
   "INDEX-LOOKUP over every store in scope, in scope order.  A FOREIGN
 store whose schema does not carry CLASS-NAME contributes nothing --
@@ -260,30 +263,207 @@ the own store still signals."
                              (query-precondition-error () '()))))
        nil))))
 
-(defun %namespace-route (family role namespace rel emit)
+(defun %key-after-p (key bound)
+  "T when BOUND is NIL, else when KEY is > BOUND by >/2's own predicate:
+the one test CLAIM-AFTER/9 skips and filters by, so a skipped claim is
+always one the comparison rejects (#451)."
+  (or (null bound) (%ordered-p #'> #'string> key bound)))
+
+(defun %namespace-route (family role namespace rel emit &key after)
   "GH #389: every claim whose ROLE endpoint sits in NAMESPACE, key by
 key -- the keys from the vocabulary index, each key's claims from the
 same subject or object index the bound-key routes read, in ascending
 key order.  Bounded, unlike the walk: the work between two %TICKs is
-one key's claims, so a budget preempts between keys.  This run's own
-derivation follows, unfiltered; %UNIFY-CLAIM re-filters (GH #333)."
+one key's claims, so a budget preempts between keys.  A key not
+%KEY-AFTER-P AFTER is skipped before its lookup (#451).  This run's own
+derivation follows, whatever its namespace or role; %UNIFY-CLAIM
+re-filters (GH #333)."
   (let ((parent (graph-db.spacetime:claim-family-parent family))
         (binary (graph-db.spacetime:claim-family-binary family)))
     (dolist (key (%scope-keys family role namespace))
-      (mapc emit
-            (%exclude-producers
-             (ecase role
-               (:subject
-                (if rel
-                    (%scope-lookup parent
-                                   +claim-subject-relation-index-slots+
-                                   (list namespace key rel))
-                    (%scope-lookup parent +claim-subject-index-slots+
-                                   (list namespace key))))
-               (:object
-                (%scope-lookup binary +claim-object-index-slots+
-                               (list namespace key)))))))
+      (when (%key-after-p key after)
+        (mapc emit
+              (%exclude-producers
+               (ecase role
+                 (:subject
+                  (if rel
+                      (%scope-lookup parent
+                                     +claim-subject-relation-index-slots+
+                                     (list namespace key rel))
+                      (%scope-lookup parent +claim-subject-index-slots+
+                                     (list namespace key))))
+                 (:object
+                  (%scope-lookup binary +claim-object-index-slots+
+                                 (list namespace key))))))))
     (mapc emit (%derived-all))))
+
+(defvar *last-claim-route* nil
+  "The route the last CLAIM/7 call under a port hook took, for the
+tests of EXPLAIN-GOALS' claim rows (GH #124).  Written only while
+*PROLOG-PORT-HOOK* is bound.")
+
+(defun %claim-route (c-p sns-arg sns ons-arg ons skey okey rel
+                     &optional record)
+  "The route CLAIM/7 takes, in docs/rules.md's order (\"Routes, and what
+refuses\"): C-P a bound claim; SNS-ARG / ONS-ARG a bound namespace
+argument and SNS / ONS the keyword it names (NIL for none); SKEY, OKEY,
+REL bound or not.  %CLAIM-GOAL switches on it and EXPLAIN-GOALS reports
+it (GH #124); RECORD true notes it in *LAST-CLAIM-ROUTE*."
+  (let ((route (cond (c-p :bound-claim)
+                     ((and sns skey rel) :subject-relation-index)
+                     ((and sns skey) :subject-index)
+                     ((and ons okey) :object-index)
+                     ((and sns-arg (null sns)) :empty-namespace)
+                     ((and ons-arg (null ons)) :empty-namespace)
+                     (sns :subject-vocabulary)
+                     (ons :object-vocabulary)
+                     (t :family-walk))))
+    (when record (setf *last-claim-route* route))
+    route))
+
+(defun %claim-route-string (route)
+  "ROUTE as docs/rules.md's route table words it."
+  (ecase route
+    (:bound-claim "that claim")
+    (:subject-relation-index "subject-relation index")
+    (:subject-index "subject index")
+    (:object-index "object index")
+    (:empty-namespace "empty: the namespace names no keyword")
+    (:subject-vocabulary
+     "vocabulary route, subject side: keys from the vocabulary index")
+    (:object-vocabulary
+     "vocabulary route, object side: keys from the vocabulary index")
+    (:family-walk "family walk; refused under a resource bound")))
+
+(defun %explain-claim-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM/7 or CLAIM-AFTER/9 goal (design D3):
+the route %CLAIM-ROUTE picks from what is bound, a literal namespace
+resolved as the goal would resolve it, an argument bound by an earlier
+goal counted as bound and the row marked as decided by value."
+  (declare (ignore graph))
+  (destructuring-bind (c family sns skey rel ons okey &rest more) args
+    (declare (ignore family more))
+    (flet ((val (x b) (cond ((not b) nil) ((variable-p x) :bound) (t x))))
+      (let* ((cv (val c (nth 0 bound)))
+             (snsv (val sns (nth 2 bound)))
+             (skeyv (val skey (nth 3 bound)))
+             (relv (val rel (nth 4 bound)))
+             (onsv (val ons (nth 5 bound)))
+             (okeyv (val okey (nth 6 bound)))
+             (sns-kw (cond ((eq snsv :bound) :bound)
+                           (snsv (%namespace-keyword snsv))))
+             (ons-kw (cond ((eq onsv :bound) :bound)
+                           (onsv (%namespace-keyword onsv))))
+             (route (%claim-route cv snsv sns-kw onsv ons-kw
+                                  skeyv okeyv relv)))
+        ;; Decided by value only when the route would differ with the
+        ;; run-time-bound arguments unbound: a bound argument the
+        ;; route never consulted does not mark the row.
+        (flet ((literal (x) (if (eq x :bound) nil x)))
+          (let ((without (%claim-route (literal cv) (literal snsv)
+                                       (literal sns-kw) (literal onsv)
+                                       (literal ons-kw) (literal skeyv)
+                                       (literal okeyv) (literal relv))))
+            (format nil "~A~:[~;, by value at run time~]"
+                    (%claim-route-string route)
+                    (not (eq route without)))))))))
+
+(register-access-path 'claim/7 #'%explain-claim-path)
+(register-access-path 'claim-after/9 #'%explain-claim-path)
+
+(defun %explain-touched-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM-TOUCHED-AFTER/4 goal (design D3): a
+bound ?C is the claim, a literal family names its index, anything else
+is every family's."
+  (declare (ignore graph))
+  (cond ((nth 0 bound) "that claim")
+        ((let ((f (nth 3 args)))
+           (and f (symbolp f) (not (variable-p f))))
+         (format nil "touched-at index of ~A from the cursor"
+                 (symbol-name (nth 3 args))))
+        (t "touched-at index of every family from the cursor")))
+
+(register-access-path 'claim-touched-after/4 #'%explain-touched-path)
+
+(defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
+                    skey-after okey-after cont)
+  "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
+bound) applied as %KEY-AFTER-P filters on every route and as skips on
+the namespace routes (#451)."
+  (let* ((family (%family-or-ill-typed ?family))
+         (parent (graph-db.spacetime:claim-family-parent family))
+         (binary (graph-db.spacetime:claim-family-binary family))
+         (c (%prolog-index-bound ?c))
+         (sns-arg (%prolog-index-bound ?sns))
+         (ons-arg (%prolog-index-bound ?ons))
+         (sns (%namespace-keyword sns-arg))
+         (ons (%namespace-keyword ons-arg))
+         (skey (%prolog-index-bound ?skey))
+         (okey (%prolog-index-bound ?okey))
+         (rel (%prolog-index-bound ?rel)))
+    ;; Each indexed/scan route unions in this run's own derivation,
+    ;; keyed like the index it substitutes for (GH #333, C1);
+    ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
+    (flet ((emit (claim)
+             ;; The bounds filter on every route; the namespace routes
+             ;; also skip by them (#451).  A non-PARENT node (a bound
+             ;; ?c, another family's derivation) has no key to read
+             ;; and is left to %UNIFY-CLAIM's own TYPEP.
+             (when (or (not (typep claim parent))
+                       (and (%key-after-p
+                             (graph-db.spacetime:claim-subject-key claim)
+                             skey-after)
+                            (%key-after-p
+                             (and (typep claim binary)
+                                  (graph-db.spacetime:claim-object-key
+                                   claim))
+                             okey-after)))
+               (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
+                             cont))))
+      (ecase (%claim-route (node-p c) sns-arg sns ons-arg ons skey okey rel
+                           *prolog-port-hook*)
+        (:bound-claim (emit c))
+            (:subject-relation-index
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup
+                             parent +claim-subject-relation-index-slots+
+                             (list sns skey rel)))
+                           (%derived-by-subject rel (cons sns skey)))))
+            (:subject-index
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup parent
+                                           +claim-subject-index-slots+
+                                           (list sns skey)))
+                           (%derived-by-subject nil (cons sns skey)))))
+            (:object-index
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup binary
+                                           +claim-object-index-slots+
+                                           (list ons okey)))
+                           (%derived-by-object (cons ons okey)))))
+            ;; A bound namespace argument naming no keyword of this
+            ;; image -- a name no claim was recorded under, a non-wire
+            ;; spelling, a non-string: no solutions, and nothing
+            ;; interned.  Not the walk below, which under the guard's
+            ;; budget refuses instead (spec §4).
+            (:empty-namespace nil)
+            ;; A namespace without its key: the vocabulary routes
+            ;; (GH #389).  Subject first, so a goal binding both
+            ;; namespaces and neither key enumerates subjects.
+            (:subject-vocabulary
+             (%namespace-route family :subject sns rel #'emit
+                                   :after skey-after))
+            (:object-vocabulary
+             (%namespace-route family :object ons nil #'emit
+                                   :after okey-after))
+            (:family-walk
+             (mapc #'emit
+                     (append (%exclude-producers
+                              (%unbound-claim-scan family))
+                             (%derived-all))))))))
 
 (def-global-prolog-functor claim/7
     (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
@@ -300,62 +480,173 @@ which walks the family or is refused as cost-unbounded under a resource
 bound (GH #285, spec §4).  The indexed routes and the walk read every
 store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
 NIL; a bound ?C and the empty fast paths read no store at all (spec
-§10, GH #332).  Solution order: docs/rules.md \"Solution order\"."
-  (let* ((family (%family-or-ill-typed ?family))
-         (parent (graph-db.spacetime:claim-family-parent family))
-         (binary (graph-db.spacetime:claim-family-binary family))
-         (c (%prolog-index-bound ?c))
-         (sns-arg (%prolog-index-bound ?sns))
-         (ons-arg (%prolog-index-bound ?ons))
-         (sns (%namespace-keyword sns-arg))
-         (ons (%namespace-keyword ons-arg))
-         (skey (%prolog-index-bound ?skey))
-         (okey (%prolog-index-bound ?okey))
-         (rel (%prolog-index-bound ?rel)))
-    ;; Each indexed/scan route unions in this run's own derivation,
-    ;; keyed like the index it substitutes for (GH #333, C1);
-    ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
-    (flet ((emit (claim)
-             (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
-                           cont)))
-      (cond ((node-p c) (emit c))
-            ((and sns skey rel)
-             (mapc #'emit
-                   (append (%exclude-producers
-                            (%scope-lookup
-                             parent +claim-subject-relation-index-slots+
-                             (list sns skey rel)))
-                           (%derived-by-subject rel (cons sns skey)))))
-            ((and sns skey)
-             (mapc #'emit
-                   (append (%exclude-producers
-                            (%scope-lookup parent
-                                           +claim-subject-index-slots+
-                                           (list sns skey)))
-                           (%derived-by-subject nil (cons sns skey)))))
-            ((and ons okey)
-             (mapc #'emit
-                   (append (%exclude-producers
-                            (%scope-lookup binary
-                                           +claim-object-index-slots+
-                                           (list ons okey)))
-                           (%derived-by-object (cons ons okey)))))
-            ;; A bound namespace argument naming no keyword of this
-            ;; image -- a name no claim was recorded under, a non-wire
-            ;; spelling, a non-string: no solutions, and nothing
-            ;; interned.  Not the walk below, which under the guard's
-            ;; budget refuses instead (spec §4).
-            ((and sns-arg (null sns)) nil)
-            ((and ons-arg (null ons)) nil)
-            ;; A namespace without its key: the vocabulary routes
-            ;; (GH #389).  Subject first, so a goal binding both
-            ;; namespaces and neither key enumerates subjects.
-            (sns (%namespace-route family :subject sns rel #'emit))
-            (ons (%namespace-route family :object ons nil #'emit))
-            (t (mapc #'emit
-                     (append (%exclude-producers
-                              (%unbound-claim-scan family))
-                             (%derived-all))))))))
+§10, GH #332).  Solution order: docs/rules.md \"Solution order\".
+A > on the key right after this goal compiles to CLAIM-AFTER/9, which
+starts the namespace route at the bound (#451)."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil cont))
+
+(def-global-prolog-functor claim-after/9
+    (?c ?family ?sns ?skey ?rel ?ons ?okey ?skey-after ?okey-after cont)
+  "CLAIM/7's rows whose subject key is > ?SKEY-AFTER and whose object
+key is > ?OKEY-AFTER, by >/2's own predicate (two strings lexically,
+anything else fails); an unbound or NIL bound admits every row, and an
+object bound excludes a unary claim.  The namespace route for a bound
+key skips the earlier keys before reading their claims, so a page by
+key costs its own keys' claims at any depth.  The compiler writes this
+goal for a CLAIM/7 followed at once by a > on its key (spec §2); it may
+be written by hand, except in a rule body, which COMPILE-RULE refuses
+(#451)."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey
+               (%prolog-index-bound ?skey-after)
+               (%prolog-index-bound ?okey-after)
+               cont))
+
+;;; The rewrite (#451, spec §2): a > on the key right after a CLAIM/7
+;;; goal compiles to CLAIM-AFTER/9, the comparison kept.  Registered on
+;;; *CLAUSE-BODY-REWRITERS* below; runs on every clause body compiled.
+
+(defun %foreign-functor-in-p (package name arity)
+  "PACKAGE resolves NAME/ARITY to a registered functor of its own, not
+the engine's symbol inherited or imported."
+  (let ((s (find-symbol (format nil "~A/~D" name arity) package)))
+    (and s
+         (not (eq (symbol-package s) (symbol-package 'claim/7)))
+         (or (gethash s *prolog-global-functors*)
+             (gethash s *user-functors*))
+         t)))
+
+(defun %engine-functor-goal-p (goal name arity)
+  "GOAL calls the engine's NAME/ARITY as the compiler will resolve it: a
+symbol head so named with ARITY arguments, from the engine's package or
+from one registering no NAME/ARITY of its own -- MAKE-FUNCTOR-SYMBOL's
+lookup order without its interning."
+  (and (consp goal)
+       (symbolp (first goal))
+       (string= (symbol-name (first goal)) name)
+       (eql arity (1- (list-length goal)))
+       (let ((pkg (symbol-package (first goal))))
+         (or (null pkg)
+             (eq pkg (symbol-package 'claim/7))
+             (not (%foreign-functor-in-p pkg name arity))))))
+
+(defun %named-variable-p (x)
+  "A Prolog variable other than the anonymous ?, which names nothing
+twice."
+  (and (variable-p x) (string/= (symbol-name x) "?")))
+
+(defun %key-bound-goal-p (goal var)
+  "(> VAR B) with B a string literal or a variable."
+  (and (%engine-functor-goal-p goal ">" 2)
+       (eq (second goal) var)
+       (let ((b (third goal)))
+         (or (stringp b) (variable-p b)))))
+
+(defun %fuse-key-bounds (goals)
+  "GOALS with each CLAIM/7 goal that is followed at once by a > on its
+subject or object key variable (one each, in either order) replaced by
+the CLAIM-AFTER/9 carrying that bound; the comparisons stay.  Returns
+GOALS itself when nothing fuses (#451, spec §2)."
+  (let ((out '()) (changed nil) (rest goals))
+    (loop while rest
+          do (let ((goal (pop rest)))
+               (if (not (%engine-functor-goal-p goal "CLAIM" 7))
+                   (push goal out)
+                   ;; (claim ?c family sns skey rel ons okey): the
+                   ;; keys are the fourth and seventh ARGUMENTS.
+                   (let ((skey (fifth goal)) (okey (eighth goal))
+                         (sa nil) (oa nil))
+                     (flet ((take (g)
+                              (cond ((and (null sa) (%named-variable-p skey)
+                                          (%key-bound-goal-p g skey))
+                                     (setf sa (third g)))
+                                    ((and (null oa) (%named-variable-p okey)
+                                          (%key-bound-goal-p g okey))
+                                     (setf oa (third g))))))
+                       (when (and (take (first rest)) (second rest))
+                         (take (second rest))))
+                     (if (or sa oa)
+                         (progn
+                           (setf changed t)
+                           (push (list* (intern "CLAIM-AFTER"
+                                                (symbol-package 'claim/7))
+                                        (append (rest goal) (list sa oa)))
+                                 out))
+                         (push goal out))))))
+    (if changed (nreverse out) goals)))
+
+(pushnew '%fuse-key-bounds *clause-body-rewriters*)
+
+;;; The cursor rewrite (#392, design D4): a (claim-touched-at ?c ?t)
+;;; (instant> ?t B) pair with ?c fresh compiles to CLAIM-TOUCHED-AFTER/4
+;;; -- ahead of a CLAIM/7 goal on ?c that then filters, or alone over
+;;; every family -- the comparison kept.  Solution order becomes
+;;; ascending touched instant (docs/rules.md, "Solution order").
+
+(defun %var-occurs-p (var form)
+  "VAR appears in FORM at any depth."
+  (cond ((eq form var) t)
+        ((consp form) (or (%var-occurs-p var (car form))
+                          (%var-occurs-p var (cdr form))))
+        (t nil)))
+
+(defun %cursor-bound-goal-p (goal var)
+  "(instant> VAR B) with B a string literal or a variable."
+  (and (%engine-functor-goal-p goal "INSTANT>" 2)
+       (eq (second goal) var)
+       (let ((b (third goal)))
+         (or (stringp b) (variable-p b)))))
+
+(defun %fuse-touched-cursor (goals)
+  "GOALS with each (claim-touched-at ?c ?t) (instant> ?t B) pair fused
+into CLAIM-TOUCHED-AFTER/4 by design D4's two shapes; the comparison
+stays.  Shape 1 fuses only a CLAIM/7 goal with no key bound -- a
+vocabulary route or the walk -- since a key probe is already cheaper
+than the family's tail.  Returns GOALS itself when nothing fuses
+(#392)."
+  (let ((out '()) (changed nil) (rest goals)
+        (functor (intern "CLAIM-TOUCHED-AFTER" (symbol-package 'claim/7))))
+    (labels ((fresh-in (goals var)
+               (notany (lambda (g) (%var-occurs-p var g)) goals))
+             (key-free-p (claim-goal before)
+               ;; (claim ?c family sns skey rel ons okey): the keys
+               ;; are the fifth and eighth elements.
+               (let ((skey (fifth claim-goal)) (okey (eighth claim-goal)))
+                 (and (variable-p skey) (fresh-in before skey)
+                      (or (null okey)
+                          (and (variable-p okey)
+                               (fresh-in before okey)))))))
+      (loop while rest
+            do (let ((goal (pop rest)))
+                 (if (not (and (%engine-functor-goal-p
+                                goal "CLAIM-TOUCHED-AT" 2)
+                               (%named-variable-p (second goal))
+                               (%named-variable-p (third goal))
+                               (%cursor-bound-goal-p (first rest)
+                                                     (third goal))))
+                     (push goal out)
+                     (let ((c (second goal)) (at (third goal))
+                           (b (third (first rest))) (prev (first out)))
+                       (cond ((and prev
+                                   (%engine-functor-goal-p prev "CLAIM" 7)
+                                   (eq (second prev) c)
+                                   (fresh-in (rest out) c)
+                                   (key-free-p prev (rest out))
+                                   (not (and (variable-p b)
+                                             (%var-occurs-p b prev))))
+                              ;; Shape 1: generator, then the claim goal
+                              ;; as a filter, FAMILY as written there.
+                              (setf changed t)
+                              (pop out)
+                              (push (list functor c at b (third prev)) out)
+                              (push prev out))
+                             ((fresh-in out c)
+                              ;; Shape 2: every family.
+                              (setf changed t)
+                              (push (list functor c at b nil) out))
+                             (t (push goal out))))))))
+    (if changed (nreverse out) goals)))
+
+(pushnew '%fuse-touched-cursor *clause-body-rewriters*)
 
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
@@ -383,6 +674,24 @@ the present instant (GH #388)."
   (let ((c (%claim-arg ?c)))
     (when (and c (graph-db.spacetime:claim-current-p c))
       (funcall cont))))
+
+(def-global-prolog-functor claim-absent/7
+    (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
+  "CLAIM/7's routes filtered to the DETERMINED absences: a claim still
+believed (CLAIM-CURRENT-P) whose standing is :SEARCHED-EMPTY or
+:DETERMINED-EMPTY.  The second negation beside NOT/1 (D2, forward-rules
+design §5.1): NOT says no claim is on record, this says somebody looked
+and found nothing.  A positive read for stratification, so a rule may
+say it of its own relation's inputs freely.  The weak absences
+(:UNCOVERED, :INDETERMINATE) are not answers."
+  (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil
+               (lambda ()
+                 (let ((c (%claim-arg ?c)))
+                   (when (and c
+                              (graph-db.spacetime:claim-current-p c)
+                              (member (graph-db.spacetime:claim-standing c)
+                                      '(:searched-empty :determined-empty)))
+                     (funcall cont))))))
 
 (defun %instant-arg (x)
   "X as a LOCAL-TIME timestamp: a timestamp passes, an RFC 3339 /
@@ -477,11 +786,85 @@ precedes the start.  One cursor for a change feed that must see both
 records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
   (let ((c (%claim-arg ?c)))
     (when c
-      (%yield (?at (or (%claim-retracted-at c)
-                       (let ((at (graph-db.spacetime:claim-recorded-at c)))
-                         (and (typep at 'local-time:timestamp)
-                              (%instant-string at)))))
+      ;; One definition with CLAIM-TOUCHED-AFTER/4 and the index: the
+      ;; functor answers claim-touched-at as an instant string (D3).
+      (%yield (?at (let ((at (graph-db.spacetime:claim-touched-at c)))
+                     (and at (%instant-string at))))
         (funcall cont)))))
+
+(defun %touched-candidates (after family)
+  "Every store's claims touched after AFTER: FAMILY's (a CLAIM-FAMILY)
+or, when FAMILY is NIL, every family registered in this image.  The
+own store's ill-typed family signals, a foreign store's is swallowed,
+as %SCOPE-LOOKUP reads them; FAMILY NIL swallows every store's, since
+the reader named no family (D3).  One ascending sequence by touched
+instant, stable, so ties keep scope order then family order."
+  (let* ((graphs (%scope-graphs))
+         (own (first graphs))
+         (families (if family
+                       (list family)
+                       (alexandria:hash-table-values
+                        graph-db.spacetime::*claim-families*)))
+         (lists '()))
+    ;; Scope order is the OUTER loop and family order the inner one,
+    ;; so a stable sort leaves ties in that order (D3).
+    (dolist (graph graphs)
+      (dolist (f families)
+        (let ((claims
+                (handler-case
+                    (graph-db.spacetime:claims-touched-after
+                     graph (graph-db.spacetime:claim-family-parent f) after)
+                  (query-precondition-error (c)
+                    (when (and family (eq graph own))
+                      (error c))))))
+          (push claims lists))))
+    (%exclude-producers
+     (stable-sort (loop for chunk in (nreverse lists) append chunk)
+                  #'local-time:timestamp<
+                  :key #'graph-db.spacetime:claim-touched-at))))
+
+(def-global-prolog-functor claim-touched-after/4
+    (?c ?t ?after ?family cont)
+  "?C's touched instant as an instant string, filtered when ?C is a
+bound claim, generated otherwise from CLAIM-TOUCHED-AFTER over every
+store in scope in ascending touched order -- every family when ?FAMILY
+is unbound (touched-at index design D3, GH #392).  The compiler writes
+it for the feed's text; it may be written by hand, except in a rule
+body, which COMPILE-RULE refuses."
+  (let ((c (%claim-arg ?c))
+        (unbound (%unbound-p ?c)))
+    (cond
+      ;; A bound claim filters: ?T is its touched instant, strictly
+      ;; after ?AFTER.  No touched instant, or no ?AFTER, fails.
+      (c
+       (let ((after (%instant-arg ?after)))
+         (when after
+           (let ((at (graph-db.spacetime:claim-touched-at c)))
+             (when (and at (local-time:timestamp> at after))
+               (%yield (?t (%instant-string at))
+                 (funcall cont)))))))
+      ;; An unbound ?C generates from the index; a free ?AFTER has no
+      ;; route, so it answers nothing (D3).  ?FAMILY unbound or NIL is
+      ;; every family.
+      (unbound
+       (let ((after (%instant-arg ?after)))
+         (when after
+           (let ((fv (%prolog-index-bound ?family)))
+             (let ((family (and fv (%family-or-ill-typed ?family))))
+               (dolist (claim
+                        (append
+                         (%touched-candidates after family)
+                         (loop for d in (%derived-all)
+                               for at =
+                               (graph-db.spacetime:claim-touched-at d)
+                               when (and (typep at 'local-time:timestamp)
+                                         (local-time:timestamp> at after))
+                                 collect d)))
+                 (%yield (?c claim)
+                   (%yield (?t (%instant-string
+                                (graph-db.spacetime:claim-touched-at
+                                 claim)))
+                     (funcall cont))))))))))))
 
 ;; INSTANT</2 and friends compare two instants -- strings in any RFC
 ;; 3339 spelling, or timestamps -- by value, where </2 on two strings is
@@ -506,6 +889,184 @@ records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
 (%def-instant-compare instant=/2 local-time:timestamp=
   "True when ?A and ?B name the same instant, whatever their spelling
 \(GH #388).")
+
+(defvar *evaluation-instant* nil
+  "The instant NOW/1 answers: bound once per RUN-RULES call and per
+forward step (forward-rules design §5.2), so every rule of a run sees
+one clock; %ST-NOW when nothing bound it.")
+
+(def-global-prolog-functor now/1 (?t cont)
+  "?T is the evaluation instant, as an instant string.  A rule body's
+functor only (*PROLOG-RULE-ONLY-PREDICATES*, query/guard.lisp): the
+compiler admits ?T in comparisons with a claim's instants alone, and
+records each as a threshold (compile.lisp %THRESHOLDS)."
+  (%yield (?t (%instant-string (or *evaluation-instant*
+                                  (graph-db.spacetime::%st-now))))
+    (funcall cont)))
+
+(defun %parse-iso-duration (text)
+  "TEXT, an ISO-8601 duration of weeks, days, hours, minutes and
+seconds (PnW, PnD, PTnH, PTnM, PTnS and their combinations, seconds
+may be decimal), as nanoseconds.  Months and years are refused: they
+are not fixed durations.  Anything else malformed is refused too; both
+as QUERY-PRECONDITION-ERROR."
+  (flet ((refuse (why)
+           (error 'query-precondition-error
+                  :reason (format nil "~S is not a duration this ~
+engine takes: ~A" text why))))
+    (unless (and (stringp text) (> (length text) 1)
+                 (char-equal (char text 0) #\P))
+      (refuse "write PnW, PnD, PTnH, PTnM or PTnS"))
+    (let ((i 1) (n (length text)) (time-part nil) (total 0) (any nil))
+      (loop while (< i n)
+            do (let ((ch (char text i)))
+                 (cond ((char-equal ch #\T)
+                        (when time-part (refuse "two T designators"))
+                        (setf time-part t)
+                        (incf i))
+                       (t
+                        (let ((start i))
+                          (loop while (and (< i n)
+                                           (or (digit-char-p (char text i))
+                                               (char= (char text i) #\.)))
+                                do (incf i))
+                          (when (or (= start i) (>= i n))
+                            (refuse "a number must precede each unit"))
+                          (let* ((num (let ((value 0) (scale 1) (dot nil)
+                                            (digits 0))
+                                        (loop for j from start below i
+                                              for c = (char text j)
+                                              do (if (char= c #\.)
+                                                     (if dot
+                                                         (refuse
+                                                          "invalid number")
+                                                         (setf dot t))
+                                                     (progn
+                                                       (incf digits)
+                                                       (setf value
+                                                             (+ (* value 10)
+                                                                (digit-char-p
+                                                                 c)))
+                                                       (when dot
+                                                         (setf scale
+                                                               (* scale 10))))))
+                                        (when (zerop digits)
+                                          (refuse "missing number"))
+                                        (/ value scale)))
+                                 (unit (char-upcase (char text i)))
+                                 (per-unit
+                                   (cond ((and (not time-part)
+                                               (char= unit #\W))
+                                          (* 7 86400))
+                                         ((and (not time-part)
+                                               (char= unit #\D))
+                                          86400)
+                                         ((and time-part (char= unit #\H))
+                                          3600)
+                                         ((and time-part (char= unit #\M))
+                                          60)
+                                         ((and time-part (char= unit #\S))
+                                          1)
+                                         ((member unit '(#\Y #\M))
+                                          (refuse "months and years are ~
+not fixed durations"))
+                                         (t (refuse (format nil
+                                                            "unknown unit ~A"
+                                                            unit))))))
+                            (incf total (* num per-unit 1000000000))
+                            (setf any t)
+                            (incf i)))))))
+      (unless any (refuse "no component"))
+      (round total))))
+
+(def-global-prolog-functor instant-offset/3 (?x ?duration ?y cont)
+  "?Y is instant ?X plus ?DURATION, an ISO-8601 duration string of
+weeks, days, hours, minutes and seconds (%PARSE-ISO-DURATION; months
+and years are refused).  ?X unbound fails; a bound ?Y compares.  The
+instant a threshold flips at is computed this way (forward-rules
+design §5.2)."
+  (let ((x (%instant-arg ?x))
+        (d (%prolog-index-bound ?duration)))
+    (when x
+      (let ((nsec (%parse-iso-duration d)))
+        (%yield (?y (%instant-string
+                     (local-time:timestamp+ x nsec :nsec)))
+          (funcall cont))))))
+
+(defun %fnv-1a-64 (string)
+  "STRING's FNV-1a 64-bit hash over its character codes, as sixteen
+lowercase hex digits: stable across images, no dependency (forward-rules
+design §7, the firing subject key)."
+  (let ((h #xcbf29ce484222325))
+    (loop for ch across string
+          do (setf h (logand #xffffffffffffffff
+                             (* (logxor h (char-code ch))
+                                #x100000001b3))))
+    (format nil "~(~16,'0x~)" h)))
+
+(defun %escape-joined-field (string)
+  "STRING with its \\ and | escaped, the identity key's own rule, so
+%JOINED-IDENTITY-KEYS splits back exactly."
+  (with-output-to-string (out)
+    (loop for ch across string
+          do (when (or (char= ch #\\) (char= ch #\|))
+               (write-char #\\ out))
+             (write-char ch out))))
+
+(defun %joined-identity-keys (claims)
+  "CLAIMS' identity keys in the order given -- body order, which is
+what makes (a,b) and (b,a) two instantiations (#471) -- each escaped
+by %ESCAPE-JOINED-FIELD and joined with |: a production
+instantiation's name in the clear, the FIRING claim's object key."
+  (format nil "~{~A~^|~}"
+          (mapcar (lambda (c)
+                    (%escape-joined-field
+                     (graph-db.spacetime:claim-identity-key c)))
+                  claims)))
+
+(defun %split-joined-keys (string)
+  "The identity keys %JOINED-IDENTITY-KEYS joined into STRING, in
+order."
+  (let ((keys '())
+        (field (make-string-output-stream))
+        (i 0)
+        (n (length string)))
+    (loop while (< i n)
+          do (let ((ch (char string i)))
+               (cond ((char= ch #\\)
+                      (incf i)
+                      (when (< i n) (write-char (char string i) field)))
+                     ((char= ch #\|)
+                      (push (get-output-stream-string field) keys))
+                     (t (write-char ch field)))
+               (incf i)))
+    (push (get-output-stream-string field) keys)
+    (nreverse keys)))
+
+(defmacro %def-instantiation-key (n)
+  "INSTANTIATION-KEY/(N+2): ?KEY is the FNV-1a-64 hex of the N premise
+claims' joined identity keys and ?CLEAR that joined string itself.  The
+compiler appends this goal to a production's body (rules/compile.lisp);
+one arity per premise count."
+  (let* ((args (loop for i from 1 to n
+                     collect (intern (format nil "?P~D" i))))
+         (name (intern (format nil "INSTANTIATION-KEY/~D" (+ n 2)))))
+    `(def-global-prolog-functor ,name (?key ?clear ,@args cont)
+       (let ((claims (list ,@(mapcar (lambda (a) `(%claim-arg ,a)) args))))
+         (when (every #'identity claims)
+           (let ((clear (%joined-identity-keys claims)))
+             (%yield (?key (%fnv-1a-64 clear))
+               (%yield (?clear clear)
+                 (funcall cont)))))))))
+
+(%def-instantiation-key 1)
+(%def-instantiation-key 2)
+(%def-instantiation-key 3)
+(%def-instantiation-key 4)
+(%def-instantiation-key 5)
+(%def-instantiation-key 6)
+(%def-instantiation-key 7)
+(%def-instantiation-key 8)
 
 (def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601
@@ -611,14 +1172,27 @@ docs/rules.md)."
 
 (def-global-prolog-functor rule-delta/2 (?c ?rel cont)
   "?C over *RULE-DELTA*'s claims of relation ?REL (a string); a bound
-?C succeeds only when it is one of them.  Nothing without a delta
+?C succeeds only when it is one of them; with ?REL free, every delta
+claim with ?REL bound to its relation (#469).  Nothing without a delta
 bound.  Withheld from free text (*PROLOG-EXCLUDED-PREDICATES*): a rule
 body cannot name it, the fixpoint loop injects it (GH #333)."
   (let ((c (%claim-arg ?c))
         (unbound (%unbound-p ?c))
         (rel (%prolog-index-bound ?rel)))
-    (when (and *rule-delta* (stringp rel))
-      (let ((claims (gethash rel *rule-delta*)))
-        (cond (c (when (member c claims) (funcall cont)))
-              (unbound (dolist (claim claims)
-                         (%yield (?c claim) (funcall cont)))))))))
+    (when *rule-delta*
+      (cond ((stringp rel)
+             (let ((claims (gethash rel *rule-delta*)))
+               (cond (c (when (member c claims) (funcall cont)))
+                     (unbound (dolist (claim claims)
+                                (%yield (?c claim) (funcall cont)))))))
+            ;; ?REL free: a family-wide read's variant (#469); every
+            ;; delta claim, its relation bound alongside.
+            ((%unbound-p ?rel)
+             (maphash (lambda (r claims)
+                        (cond (c (when (member c claims)
+                                   (%yield (?rel r) (funcall cont))))
+                              (unbound
+                               (dolist (claim claims)
+                                 (%yield (?rel r)
+                                   (%yield (?c claim) (funcall cont)))))))
+                      *rule-delta*))))))

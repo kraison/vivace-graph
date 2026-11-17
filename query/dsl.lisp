@@ -23,6 +23,19 @@
 (defvar *query-default-timeout* 30
   "Wall-clock seconds a DEF-QUERY may run unless it overrides :TIMEOUT.")
 
+(defun clamp-row-cap (limit)
+  "LIMIT as the row cap: a positive integer, at most
+*QUERY-DEFAULT-LIMIT*; anything else is the ceiling (GH #328)."
+  (if (and (integerp limit) (plusp limit))
+      (min limit *query-default-limit*)
+      *query-default-limit*))
+
+(defun probe-limit (cap)
+  "Rows to ask for so CAP of them can be shown: one past CAP tells
+truncated from exactly full; at the ceiling there is no room, and an
+exactly-full page reads as truncated (GH #278, #328)."
+  (if (< cap *query-default-limit*) (1+ cap) cap))
+
 (defvar *pattern-query-callback* nil
   "Per-row callback for an EVAL'd ad-hoc pattern query (which has no lexical
 environment to capture one); RUN-PATTERN-QUERY binds it around the SELECT.")
@@ -328,28 +341,28 @@ prolog's :DATA format still converts them; :RAW does not)."
   ;; The eval'd SELECT / node-slot-value goals key off *GRAPH*.
   (let* ((*graph* graph)
          (*package* package)
-         (cap (if (and (integerp limit) (plusp limit))
-                  (min limit *query-default-limit*)
-                  *query-default-limit*))
+         (cap (clamp-row-cap limit))
          (run (lambda (cb)
-                ;; the select form is EVAL'd (null lexenv), so pass the
-                ;; callback through a special the form references
-                ;; rather than a lexical.
-                ;; Interpret the SELECT lambda, do not compile it: a
-                ;; native compile per request was ~94% of a small
-                ;; query's time, and interpreted solving still beats
-                ;; compile + compiled solving up to ~20 ms of work,
-                ;; the budget's neighbourhood (GH #373).
-                (let ((*pattern-query-callback* cb)
-                      #+sbcl (sb-ext:*evaluator-mode* :interpret))
-                  (eval `(select (:effects nil :snapshot t
-                                  :limit ,cap
-                                  :skip ,(when (integerp skip) skip)
-                                  :max-inferences
-                                  ,*query-default-max-inferences*
-                                  :timeout ,*query-default-timeout*
-                                  :callback *pattern-query-callback*)
-                                 ,vars ,@goals))))))
+                ;; The shape's form is one for every call that shares
+                ;; it: variables renamed, literals in *QUERY-LITERALS*,
+                ;; limit, skip, budgets and the callback read from
+                ;; specials (GH #376, design D1, D2).  Interpreted:
+                ;; a native compile per request was ~94% of a small
+                ;; query's time (GH #373); the cache compiles a shape
+                ;; once it repeats.
+                (multiple-value-bind (shape literals)
+                    (%canonical-query vars goals)
+                  (let ((*pattern-query-callback* cb)
+                        (*query-literals* literals)
+                        (*query-run-limit* cap)
+                        (*query-run-skip* (when (integerp skip) skip))
+                        #+sbcl (sb-ext:*evaluator-mode* :interpret))
+                    (let ((fn (%cached-query-function shape
+                                                      (length literals))))
+                      (if fn
+                          (funcall fn)
+                          (eval (%cached-query-form shape
+                                                    (length literals))))))))))
     (if (eq format :raw)
         (progn (funcall run callback) nil)
         (emit-query-results vars format run))))

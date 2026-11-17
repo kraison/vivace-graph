@@ -29,6 +29,12 @@ release wiring are in `docs/perf-baselines.md` (GH #253).
 - `bplus-bench.lisp` — B+ tree vs skip-list side-by-side (`graph-db::bplus-bench`).
 - `spacetime-bench.lisp` — edges-under-claims write/sweep/read measurement
   (GH #372).
+- `rules-bench.lisp` — paging a claim namespace by key through the guarded
+  runner, first page against last (GH #451).
+- `prolog-bench.lisp` — the Prolog Engine 5.0 before-and-after cases (GH
+  #45), one per performance unit of the 5.0 scope.
+- `run-bench.sh` — one bench function alone at small scale in a fresh
+  SBCL, e.g. `tests/perf/run-bench.sh run-prolog-bench` (GH #45).
 - `variance.py` — run-to-run variance analysis over report files.
 - `results/` — committed report files (see below).
 

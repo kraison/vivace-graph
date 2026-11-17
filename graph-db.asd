@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -130,7 +130,10 @@
                (:file "txn-log" :depends-on ("replication"))
                (:file "functor" :depends-on ("vertex" "edge" "views" "schema"))
                (:file "prologc" :depends-on ("functor"))
+               (:file "prolog-tabling" :depends-on ("prologc"))
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
+               (:file "prolog-graph-predicates"
+                :depends-on ("prolog-functors" "prolog-tabling"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
                       ("schema" "edge" "vertex" "views" "transactions"
@@ -139,6 +142,8 @@
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; explain-goals: the static account of a goal list (GH #124)
+               (:file "prolog-explain" :depends-on ("index"))
                ;; Counting index (GH #361): its own registry and graph
                ;; slot, parallel to DEF-INDEX's.
                (:file "count-index" :depends-on ("index"))
@@ -177,7 +182,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -198,11 +203,12 @@
 web-free.  docs/guarded-query.md; GH #322."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/core)
   :pathname "query/"
   :serial t
   :components ((:file "package")
+               (:file "compiled-cache")
                (:file "dsl")
                (:file "guard"))
   :in-order-to ((test-op (test-op :graph-db/query-test))))
@@ -213,11 +219,12 @@ web-free.  docs/guarded-query.md; GH #322."
 directly, web-free (GH #322)."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/query/"
   :serial t
-  :components ((:file "package") (:file "suite") (:file "guard-tests"))
+  :components ((:file "package") (:file "suite") (:file "guard-tests")
+               (:file "compiled-cache-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/query-test
                                        :run-query-tests)
@@ -230,12 +237,14 @@ directly, web-free (GH #322)."
 docs/rules.md; GH #304."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
   :components ((:file "package") (:file "facts") (:file "schema")
-               (:file "compile") (:file "run"))
+               (:file "compile") (:file "run") (:file "delta")
+               (:file "forward") (:file "thresholds")
+               (:file "productions") (:file "standing"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test
@@ -247,7 +256,8 @@ docs/rules.md; GH #304."
   :components ((:file "package") (:file "suite") (:file "facts-tests")
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
-               (:file "scope-tests"))
+               (:file "scope-tests") (:file "forward-tests")
+               (:file "explain-tests") (:file "touched-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)
@@ -262,7 +272,7 @@ docs/rules.md; GH #304."
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/replication
                :graph-db/query
                :hunchentoot
@@ -293,7 +303,7 @@ docs/rules.md; GH #304."
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
@@ -417,8 +427,8 @@ and read-only neighborhood exploration."
 (defsystem graph-db/perf-test
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
-  :depends-on (:graph-db :graph-db/spacetime :graph-db/test-scratch
-               :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/spacetime :graph-db/rules
+               :graph-db/test-scratch :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
@@ -430,7 +440,11 @@ and read-only neighborhood exploration."
                ;; trace both read paths); entry point (graph-db::bplus-bench).
                (:file "bplus-bench")
                ;; edges under claims, spec sec.9 (GH #372)
-               (:file "spacetime-bench"))
+               (:file "spacetime-bench")
+               ;; paging a namespace by key, first page vs last (GH #451)
+               (:file "rules-bench")
+               ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
+               (:file "prolog-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 
@@ -633,7 +647,8 @@ cl-temporal-extent."
                (:file "epoch-tests")                   ; GH #347
                (:file "vocabulary-tests")              ; GH #350
                (:file "endpoint-edge-tests")             ; GH #369
-               (:file "link-sweep-tests"))               ; GH #372
+               (:file "link-sweep-tests")               ; GH #372
+               (:file "touched-tests"))                 ; GH #392
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
@@ -700,6 +715,7 @@ cl-temporal-extent."
                (:file "spatial-query-tests")
                (:file "spatial-intersect-tests")
                (:file "spatial-scope-tests")
+               (:file "spatial-multi-slot-tests")  ; #60
                (:file "subset-replication-tests")
                (:file "peer-lamport-tests")
                (:file "peer-merge-tests")
@@ -713,6 +729,11 @@ cl-temporal-extent."
                (:file "query-tests")
                (:file "prolog-mutation-tests")
                (:file "prolog-functor-tests")
+               (:file "clause-indexing-tests")
+               (:file "tracer-explain-tests")
+               (:file "tabling-tests")
+               (:file "aggregation-tests")
+               (:file "graph-predicate-tests")
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")

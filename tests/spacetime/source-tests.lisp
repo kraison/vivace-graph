@@ -650,3 +650,25 @@ records stay readable; idempotent; a class object is accepted."
     (is (eq 'rs-thing (unregister-source (find-class 'rs-thing))))
     (register-source 'rs-thing *rs-facets*)
     (is (string= "one" (rs-label (resolve-endpoint :rs-things "u-1"))))))
+
+(test registration-facet-accepts-the-optional-slot-keys
+  "#60 spec §6.3: :REGISTRY-SLOT names the slot REGISTER-NODE passes to
+REGISTER-GEOMETRY and :GEOMETRY-FN the per-record source geometry.  Both are
+optional; when present they must be non-keyword symbols."
+  (flet ((form (name &rest extra)
+           `(def-source ,name :graph-db-source-test ((a :initarg :a))
+              :identity :none :space :none :time :none :attribution :none
+              :sensitivity :none :indexed-text :none
+              :registration (:registry st-region :registry-namespace :r
+                             :claim-class st-claim :producer "p"
+                             :relation "r" :method "m" :rule-version "1"
+                             :precision-fn nil :confidence-fn nil
+                             :method-fn nil ,@extra))))
+    (finishes (macroexpand-1 (form 'st-slotted-none)))
+    (finishes (macroexpand-1 (form 'st-slotted
+                                   :registry-slot 'geom
+                                   :geometry-fn 'st-outline)))
+    (signals invalid-source-facet
+      (macroexpand-1 (form 'st-slotted-bad :registry-slot :geom)))
+    (signals invalid-source-facet
+      (macroexpand-1 (form 'st-slotted-bad2 :geometry-fn "st-outline")))))

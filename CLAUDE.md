@@ -48,7 +48,8 @@ Three traps when running tests here:
 - **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
   test system's `:perform`, which binds `graph-db::*system-directory*` and
   `graph-db::*type-registry*`; without it every test fails at `make-graph`
-  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`.
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`;
+  on one test of the rules suite, `tests/rules/run-test.sh TEST-NAME`.
 - **The node cache hides identity bugs.** While it is on, two lookups of
   one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
   or CLOS-valued slots passes by accident. A test that depends on two
@@ -114,7 +115,10 @@ Scratch locations differ between the two generations of tests:
   and never run the full suite by hand.
 - **PRs merge into `experiment`, but the default branch is `master`,** so
   `Closes #N` in a PR body never fires: close the issue by hand with the
-  landing SHA (PR #393).
+  landing SHA (PR #393). **A PR's green check is the fast tier**: the
+  slow suites run only on the push after the merge, so read that run
+  (`gh run list --branch experiment`) before calling the unit landed;
+  two merges sat red for a day unread (#453).
 - **A worktree loads the main checkout's code** unless told otherwise:
   Quicklisp's `local-projects` links `graph-db.asd` to the main checkout. In
   an image started in a `.worktrees/` tree, first run
@@ -132,9 +136,13 @@ Scratch locations differ between the two generations of tests:
     `defvar`ed in `globals.lisp` or earlier in `graph-db.asd`'s chain; a
     later `defvar` leaves those bindings lexical and silently inert
     (`*record-reads*`, GH #92);
-  - FiveAM test names are symbols, and the main suite's files share the
-    `graph-db/test` package, so a reused name silently replaces the first
-    test: grep `tests/` before naming one (90de8e8);
+  - FiveAM test names are symbols, and a suite's files share one package
+    (`graph-db/test`, `graph-db/rules-test`), so a reused name silently
+    replaces the first test, and a reused helper `defun` or
+    `defparameter` replaces the first definition the same way: grep the
+    suite's directory before naming either (90de8e8; a `reaches` helper
+    in `tests/rules/forward-tests.lisp` broke 13 fixpoint tests,
+    2026-11-05);
   - a test that swaps an engine function with `(setf fdefinition)` needs it
     declaimed `notinline`, or ECL compiles same-file calls directly and the
     swap never fires (`mmap.lisp`, 2277ee8);

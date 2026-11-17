@@ -121,7 +121,8 @@ are not checked against the registry.")
 ;; independent of +STORAGE-VERSION+.  v8 (#187) widens type-id from 2 to 4
 ;; bytes; v5/v6/v7 stay readable, because a cleanly-closed memory graph's
 ;; image is its ONLY durable copy -- the journal is cleared on checkpoint.
-(alexandria:define-constant +native-image-version+ 8)
+;; 9 since #60 (see memory-graph.lisp's writer).
+(alexandria:define-constant +native-image-version+ 9)
 (alexandria:define-constant +image-type-id-bytes+  4)
 (alexandria:define-constant +fixed-integer-64+    #x01)
 (alexandria:define-constant +data-magic-byte+     #x17)
@@ -413,8 +414,60 @@ strictly-safe pre-durability abort.")
 (defvar *trail* (make-array 200 :fill-pointer 0 :adjustable t))
 (defvar *var-counter* 0 "Counter for generating variable names.")
 (defvar *functor* nil "The Prolog functor currently being compiled.")
+(defvar *clause-cut-flag* nil
+  "While a clause body compiles into its own closure: the symbol of
+that closure's CUT variable, set by a cut before it returns from the
+clause block.  NIL at top level and under a barrier (clause indexing
+design D3, GH #121).")
+(defvar *clause-compile-count* 0
+  "Clauses compiled into their own closure since the image started;
+a test's evidence that an assert compiles one clause (GH #121).")
+(defvar *clause-indexing* t
+  "When true a call with a bound first argument tries only the clauses
+whose first head argument can unify with it (design D4, GH #121).  NIL
+tries every clause in order: for a PROLOG-EQUAL specialisation that
+widens equality among symbols, strings, numbers or characters, and for
+measuring the index in one image.")
+(defvar *prolog-port-hook* nil
+  "NIL, or a function of (PORT FUNCTOR ARGS DEPTH) called at :CALL,
+:EXIT, :REDO and :FAIL of every goal call and at :CLAUSE when a
+dispatcher tries a candidate (tracer design D1, GH #124).  Bind it;
+TRACE-PROLOG sets it.")
+(defvar *prolog-port-depth* 0
+  "Goal calls open above the current one while the hook runs.")
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
+
+;; Tabling (GH #122; docs/superpowers/specs/2026-11-10-tabling-design.md).
+;; Bound fresh by SELECT and ?-, the two query roots (design D6).
+(defvar *tables* nil
+  "The current query's variant tables: an EQUAL hash from %VARIANT-KEY
+to TBL, or NIL outside a query (design D2).")
+(defvar *table-stack* nil
+  "The tables whose evaluation is open, innermost first (design D3).")
+(defvar *round* 0
+  "The fixpoint round the open component is in (design D3).")
+(defvar *answers-added* 0
+  "Answers added to any table in the current round; a round that adds
+none completes the component (design D3).")
+(defvar *negation-floor* 0
+  "The table-stack depth a read-as-closed construct was entered at; a
+dependency on a table below it is unstratified (design D4).")
+(defvar *table-serial* 0
+  "The last CREATED-AT handed to a table of the current query (D2).")
+
+;; The compiled query cache (GH #376;
+;; docs/superpowers/specs/2026-11-10-compiled-query-cache-design.md).
+(defvar *query-literals* #()
+  "The literals lifted out of the running query's shape, a simple
+vector %BIND-LITERALS reads by index (design D1).")
+(defvar *query-run-limit* nil
+  "The row cap of the running RUN-QUERY-GOALS call (design D2).")
+(defvar *query-run-skip* nil
+  "The rows the running RUN-QUERY-GOALS call skips first (design D2).")
+(defvar *functor-generation* 0
+  "Moves when a user functor's content changes; part of the compiled
+query cache's key (design D3).")
 
 #+sbcl
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))
@@ -492,6 +545,17 @@ not match established segment dimension ~D"
 ;;; index arity.  Distinct from SIMPLE-ERROR / TYPE-ERROR so a server can
 ;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
 ;;; (query/dsl.lisp) is its DSL-level subclass.
+
+;;; #60 spec §4.4: what an UNNAMED spatial query does on a class with several
+;;; geometry slots.  :ERROR (default) signals QUERY-PRECONDITION-ERROR;
+;;; :FIRST-DECLARED tests the first declared slot and warns once per class.
+;;; A transition switch for consumers porting to :SLOT; removed in the next
+;;; major release after they have.  Defined here so every file binds the
+;;; same special (the GH #92 trap).
+(defvar *spatial-unnamed-slot-policy* :error
+  "How an unnamed spatial query resolves on a class with several geometry
+slots: :ERROR (default) or :FIRST-DECLARED (first declared slot, one warning
+per class).  Transitional (#60).")
 
 (define-condition query-precondition-error (error)
   ((reason :initarg :reason :reader query-precondition-error-reason))

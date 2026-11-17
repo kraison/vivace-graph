@@ -1,0 +1,14 @@
+;;;; graph-db perf report
+;;;; tag=after-u4-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; chain-closure-untabled                 SECONDS 0.08  SOLUTIONS 199  
+;; chain-closure-tabled                   SECONDS 0.108  SOLUTIONS 199  
+;; recursive-ring-closure                 SECONDS 0.444  
+;; recursive-ring-outcome                 OUTCOME COMPLETE  SOLUTIONS 200  
+
+(:PERF-REPORT :TAG "after-u4-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 5
+ :HOST "odm" :ENTRIES
+ (("chain-closure-untabled" :SECONDS 0.08 :SOLUTIONS 199)
+  ("chain-closure-tabled" :SECONDS 0.108 :SOLUTIONS 199)
+  ("recursive-ring-closure" :SECONDS 0.444)
+  ("recursive-ring-outcome" :OUTCOME :COMPLETE :SOLUTIONS 200)))

@@ -978,6 +978,25 @@ O(n*dim))."
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
 
+(defun run-perf-only (function &key (scale *perf-scale*) (tag "perf")
+                                    (output (report-pathname tag)))
+  "FUNCTION, one bench case or a lambda over several, under the bindings
+RUN-PERF makes, with a report to OUTPUT: a unit's before and after rows
+without the whole suite (GH #376).  Returns T."
+  (let* ((*perf-scale* scale)
+         (system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil)
+         (graph-db:*system-clock* nil))
+    (reset-perf-report)
+    (format t "~&=== graph-db perf case (~A, scale ~A) ===~%" *lisp-impl* scale)
+    (finish-output)
+    (unwind-protect
+         (progn (funcall function)
+                (write-perf-report output :tag tag))
+      (graph-db-test-scratch:cleanup-scratch-run)))
+  t)
+
 (defun run-perf (&key (scale *perf-scale*) (tag "perf")
                       (output (report-pathname tag)))
   "Run the full perf suite at SCALE, record results, write a report to OUTPUT.
@@ -1016,6 +1035,17 @@ Measurement-only; always returns T."
            (bench-peer-replication)
            (bench-vector-search)
            (bench-claim-linking)
+           (bench-claim-key-paging)
+           (bench-forward-step-reads)
+           (bench-rules-rerun)
+           ;; the Prolog Engine 5.0 before-and-after cases (GH #45)
+           (bench-clause-assert)
+           (bench-clause-assert-10k)
+           (bench-guarded-shape-repeat)
+           (bench-change-feed-cursor)
+           (bench-graph-predicates)
+           (bench-traced-k-hop)
+           (bench-recursive-ring)        ; last: see PBP-RING-CLOSURE
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).

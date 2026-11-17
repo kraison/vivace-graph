@@ -42,11 +42,11 @@ Real-HW lesson: the in-lock **syscall count**, not data volume, drives it:
 
 Only **rename-only** relieves it (the kept-open header-patch variant also *errored*
 under load). So fix #1 writes the `.txn` file *before* the lock and only renames
-under it; the header `transaction-id` becomes a placeholder (the **filename** is
-authoritative; recovery reads it from there). Replication is unaffected (it reads
-the replication-log, where masters patch the real id into the in-memory bytes).
-See the TODO above `finalize-tx-persistence` — flagged to revisit for
-correctness/maintainability.
+under it; the header `transaction-id` is written after the lock
+(`patch-tx-file-header-id`, #422) and recovery cross-checks it against the
+**filename**, its replay key; a header of 0 is the crash window between the two
+and is accepted. Replication is unaffected (it reads the replication-log, where
+masters patch the real id into the in-memory bytes).
 
 Result @64: CCL `concurrent-stress` **3/15 → 11/18**. Gate at shipped config
 (`*stress-thread-count*` 16): SBCL + ECL all green; CCL test/acid/

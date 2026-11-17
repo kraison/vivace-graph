@@ -68,17 +68,13 @@ asks for none."
   (let ((text (%prolog-field body "query")))
     (unless (stringp text)
       (graph-db.query::%refuse "the request needs a \"query\" string"))
-    (when (> (length text) graph-db.query:*prolog-max-query-length*)
-      (graph-db.query::%refuse "query is ~D characters; the limit is ~D"
-                               (length text)
-                               graph-db.query:*prolog-max-query-length*))
     text))
 
 (defun %run-guarded-prolog (text limit graph)
   "The workbench envelope over GRAPH-DB.QUERY:RUN-GUARDED-PROLOG (GH
 #322).  The runner clamps and probes exactly as the DSL endpoint does,
 so the envelope's CAP/TRUNCATED come straight from its own answer."
-  (let ((cap (%clamp-row-cap limit)))
+  (let ((cap (graph-db:clamp-row-cap limit)))
     (multiple-value-bind (columns rows truncated)
         (graph-db.query:run-guarded-prolog text graph :limit cap)
       (%query-envelope-from-rows columns rows cap truncated))))

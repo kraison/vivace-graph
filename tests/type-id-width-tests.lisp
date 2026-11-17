@@ -307,19 +307,24 @@ return DEST as a string."
 (defun %data-fingerprint (dir)
   "A sorted SHA256 listing of every file under DIR's heap and node/index
 tables -- used to assert MIGRATE-GRAPH leaves OLD-LOCATION's DATA untouched.
-Excludes schema.dat and tx/: an ordinary open rewrites schema.dat
-(UPDATE-SCHEMA calls SAVE-SCHEMA on every open; same content, re-serialized)
-and creates a new empty tx/replication-*.log file (the transaction manager
-always opens one).  No open in these tests rewrites schema.dat any more --
-MIGRATE-GRAPH suppresses the replay for both of its own, and %READ-V2-GRAPH's
-guard open is frozen (#186) -- but the exclusion stays: it names what an
-ORDINARY open does, which is what the assertion is defending against.
-Neither is data loss; both were confirmed to be the ONLY two things that
-change, by exhaustive diff during the #166 migration work.  Shells out (find +
-sha256sum), the same portability boundary EXTRACT-V1-FIXTURE already accepts
-by shelling out to tar."
+Excludes schema.dat, tx/ and spatial-indexes.dat: an ordinary open rewrites
+schema.dat (UPDATE-SCHEMA calls SAVE-SCHEMA on every open; same content,
+re-serialized), creates a new empty tx/replication-*.log file (the
+transaction manager always opens one), and every CLOSE-GRAPH rewrites the
+spatial sidecar (SAVE-SPATIAL-INDEX-ROOTS) -- a derived index the nodes are
+authoritative for, byte-identical until a format bump re-derives it once
+(format 6, #60; caught by the push tier, #453).  No open in these tests
+rewrites schema.dat any more -- MIGRATE-GRAPH suppresses the replay for both
+of its own, and %READ-V2-GRAPH's guard open is frozen (#186) -- but the
+exclusion stays: it names what an ORDINARY open does, which is what the
+assertion is defending against.  None is data loss; schema.dat and tx/ were
+confirmed the only two things that changed by exhaustive diff during the #166
+migration work, and a stage-by-stage fingerprint under #453 showed the sidecar
+as the only third.  Shells out (find + sha256sum), the same portability
+boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
   (uiop:run-program
-   (format nil "find ~A -type f -not -name schema.dat -not -path '*/tx/*' ~
+   (format nil "find ~A -type f -not -name schema.dat ~
+-not -name spatial-indexes.dat -not -path '*/tx/*' ~
 -print0 | sort -z | xargs -0 sha256sum"
            (uiop:escape-sh-token (namestring (truename dir))))
    :output '(:string :stripped t) :force-shell t))

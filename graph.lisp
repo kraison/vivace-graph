@@ -131,14 +131,16 @@ see the comment at the OPEN below."
                      indexes from live node geometries, which are authoritative."
                     file e)
               nil))
-        ;; A COMPLETE v3 or v4 sidecar has v5's layout and names LIVE ordered
-        ;; maps; only their CONTENT is stale (v3's multipolygon cells, GH #103;
-        ;; v4's untagged entries, GH #104).  Open those roots too -- not to
+        ;; A COMPLETE v3, v4 or v5 sidecar has v6's layout and names LIVE
+        ;; ordered maps; only their CONTENT is stale (v3's multipolygon cells,
+        ;; GH #103; v4's untagged entries, GH #104; v5's one index per class,
+        ;; #60).  Open those roots too -- not to
         ;; trust them, but so REBUILD-SPATIAL-INDEXES can FREE them: the
         ;; registry is the only place it looks for storage to reclaim, so
         ;; skipping this strands every stale index in a region GC-HEAP never
         ;; sweeps.  Returning NIL is what routes to that rebuild.
-        (when (and complete (member format (list +spatial-index-format+ 3 4)))
+        (when (and complete
+                   (member format (list +spatial-index-format+ 3 4 5)))
           (dolist (r indexes)
             (destructuring-bind (owner slot address precision backend max-cells
                                  &optional counts)

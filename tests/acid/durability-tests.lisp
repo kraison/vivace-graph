@@ -121,7 +121,17 @@
                  (error () nil))
                ;; Verify the hook self-cleared
                (is (null *after-apply-tx-writes-hook*)
-                   "Hook must have self-cleared after firing"))
+                   "Hook must have self-cleared after firing")
+               ;; The crash fired inside the lock, after the rename and
+               ;; before the post-lock id patch: the window recovery
+               ;; must accept (#422).
+               (let ((files (directory (merge-pathnames "tx/*.txn" path))))
+                 (is (= 1 (length files)) "one .txn file left behind")
+                 (when files
+                   (is (= 0 (graph-db::transaction-id
+                             (graph-db::load-tx-file (first files))))
+                       "a crash inside the lock leaves the header at 0; ~
+recovery trusts the filename (#422)"))))
           ;; Close the graph cleanly: flushes on-disk structures, removes .dirty
           ;; The .txn file in tx/ is NOT affected by close-graph.
           (ignore-errors (close-graph g :snapshot-p nil))
@@ -199,3 +209,196 @@ bytes)."
                        "Recovered update must hold the NEW label"))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; ---------------------------------------------------------------------------
+;;; #422: a .txn file's header carries its id once the commit lock is
+;;; released; recovery cross-checks it against the filename.
+;;; ---------------------------------------------------------------------------
+
+(test recovery-refuses-a-renamed-transaction-file
+  "A .txn file whose nonzero header id differs from its filename is
+tampered with or misplaced; recovery refuses it by name rather than
+replaying it under the filename's id (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (close-graph g :snapshot-p nil))
+      ;; A hand-made file: header id 7, filename says 9, no writes.
+      ;; Layout per SERIALIZE-TX-HEADER: size at 0, flags at 8, type at 9,
+      ;; id at 10, write count at 18, write size at 26.
+      (let* ((file (make-pathname :name (format nil "~16,'0X" 9)
+                                  :type "txn"
+                                  :defaults (merge-pathnames "tx/" path)))
+             (header (graph-db::make-tx-header-vector))
+             (signalled nil))
+        (graph-db::serialize-uint64 header graph-db::+tx-header-size+ 0)
+        (setf (aref header 9) graph-db::+tx-header-type-code+)
+        (graph-db::serialize-uint64 header 7 graph-db::+tx-header-id-offset+)
+        (with-open-file (s file :direction :output
+                                :element-type '(unsigned-byte 8))
+          (write-sequence header s))
+        ;; One open only: a refused open may leave .dirty behind, and a
+        ;; second attempt would then fail for that reason instead.
+        (handler-case
+            (let ((g (open-graph *acid-graph-name* path)))
+              (close-graph g :snapshot-p nil))
+          (graph-db:transaction-file-id-mismatch (c)
+            (setf signalled t)
+            (is (= 7 (graph-db::header-id c)))
+            (is (= 9 (graph-db::filename-id c)))
+            (is (search "0000000000000009" (princ-to-string c))
+                "the report names the file")))
+        (is-true signalled
+                 "open-graph must refuse the mismatched file (#422)")))))
+
+(test a-committed-transaction-file-carries-its-id
+  "After commit the .txn file's header id equals its filename's id,
+written after the manager lock is released; the patch precedes the
+rename to .committed (#422)."
+  (with-temp-directory (dir)
+    (let ((graph-db::*delete-committed-transaction-files* nil)
+          (path (namestring dir)))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (define-acid-views)
+               (with-transaction ()
+                 (make-ac-item :value 1 :label "patched"))
+               (let ((files (directory
+                             (merge-pathnames "tx/*.committed" path))))
+                 (is (= 1 (length files)) "one .committed file")
+                 (when files
+                   (let ((file (first files)))
+                     (is (= (parse-integer (pathname-name file) :radix 16)
+                            (graph-db::transaction-id
+                             (graph-db::load-tx-file file)))
+                         "header id must equal the filename id")))))
+          (close-graph g :snapshot-p nil))))))
+
+(test a-memory-graph-journal-entry-carries-its-id
+  "The retained journal of a memory graph is patched too, and the
+patched entry still replays on the next open (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir))
+          (vid nil))
+      (let ((g (graph-db::make-memory-graph *acid-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setq vid (id (make-ac-item :value 2 :label "journaled"))))
+               (let ((files (directory (merge-pathnames "tx/*.txn" path))))
+                 (is (= 1 (length files)) "one retained journal entry")
+                 (when files
+                   (let ((file (first files)))
+                     (is (= (parse-integer (pathname-name file) :radix 16)
+                            (graph-db::transaction-id
+                             (graph-db::load-tx-file file)))
+                         "journal header id must equal the filename id")))))
+          (ignore-errors (close-graph g :snapshot-p nil))))
+      ;; No checkpoint was written, so the open replays the journal.
+      (let ((g2 (graph-db::open-memory-graph *acid-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is-true (lookup-vertex vid)
+                        "the patched journal entry replays on open"))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test a-wal-suppressed-commit-patches-nothing
+  "No file, no patch: a WAL-suppressed graph commits without a .txn
+file and without an error from the patch step (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *acid-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (setf (graph-db::wal-suppressed-p g) t)
+               (finishes
+                 (with-transaction ()
+                   (make-ac-item :value 3 :label "unjournaled")))
+               (is (null (directory (merge-pathnames "tx/*.txn" path)))
+                   "no .txn file")
+               (is (null (directory (merge-pathnames "tx/*.committed" path)))
+                   "no .committed file"))
+          (setf (graph-db::wal-suppressed-p g) nil)
+          (close-graph g :snapshot-p nil))))))
+
+(test a-patch-failure-after-the-commit-point-propagates
+  "The file is made read-only inside the lock, after the rename and
+before the patch.  The commit is durable, applied and :COMMITTED, the
+file is marked committed with header 0, and the caller gets
+TRANSACTION-FILE-PATCH-ERROR, which says so (#422)."
+  (if (string= "0" (string-trim '(#\Newline #\Space)
+                                 (uiop:run-program '("id" "-u")
+                                                   :output :string)))
+      (skip "root ignores a file's mode; the patch cannot be made to fail")
+      (with-temp-directory (dir)
+        (let ((graph-db::*delete-committed-transaction-files* nil)
+              (path (namestring dir))
+              (captured nil)
+              (txfile nil)
+              (vid nil))
+          (let ((g (make-graph *acid-graph-name* path
+                               :buffer-pool-size 1000)))
+            (unwind-protect
+                 (let ((*graph* g))
+                   (setf *after-apply-tx-writes-hook*
+                         (lambda ()
+                           (setf captured graph-db::*transaction*
+                                 txfile (graph-db::transaction-pathname
+                                         captured))
+                           (uiop:run-program
+                            (list "chmod" "0400" (namestring txfile)))))
+                   (handler-case
+                       (progn
+                         (with-transaction ()
+                           (setq vid (id (make-ac-item :value 4
+                                                       :label "ro"))))
+                         (fail "a patch failure must signal"))
+                     (graph-db:transaction-file-patch-error (c)
+                       (is (equal (namestring txfile)
+                                  (namestring (graph-db::patch-file c))))
+                       (is (search "is committed" (princ-to-string c))
+                           "the report says the transaction is committed")))
+                   (is (null *after-apply-tx-writes-hook*)
+                       "Hook must have self-cleared after firing")
+                   (is (eql :committed (graph-db::state captured))
+                       "the transaction ends :COMMITTED, so it stays in the ~
+manager's table for OCC until pruned")
+                   (is-true (lookup-vertex vid)
+                            "the transaction was applied before the patch")
+                   (let ((committed (directory
+                                     (merge-pathnames "tx/*.committed" path))))
+                     (is (= 1 (length committed))
+                         "cleanup marked the file committed")
+                     (is (null (directory (merge-pathnames "tx/*.txn" path)))
+                         "no .txn file is left for recovery")
+                     (when committed
+                       (is (= 0 (graph-db::transaction-id
+                                 (graph-db::load-tx-file (first committed))))
+                           "the unpatched file keeps header 0"))))
+              (setf *after-apply-tx-writes-hook* nil)
+              (dolist (f (directory (merge-pathnames "tx/*.*" path)))
+                (uiop:run-program (list "chmod" "0600" (namestring f))))
+              (ignore-errors (close-graph g :snapshot-p nil))))))))
+
+(test a-journal-entry-removed-before-the-patch-does-not-fail-the-commit
+  "CHECKPOINT-MEMORY-GRAPH may clear the journal between the rename and
+the patch; a file that is gone has been superseded, and the commit
+finishes without an error (#422)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir))
+          (vid nil))
+      (let ((g (graph-db::make-memory-graph *acid-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g))
+               (setf *after-apply-tx-writes-hook*
+                     (lambda ()
+                       (delete-file (graph-db::transaction-pathname
+                                     graph-db::*transaction*))))
+               (finishes
+                 (with-transaction ()
+                   (setq vid (id (make-ac-item :value 5 :label "gone")))))
+               (is (null *after-apply-tx-writes-hook*))
+               (is-true (lookup-vertex vid) "applied all the same"))
+          (setf *after-apply-tx-writes-hook* nil)
+          (ignore-errors (close-graph g :snapshot-p nil)))))))

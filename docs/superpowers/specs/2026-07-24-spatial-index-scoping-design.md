@@ -419,6 +419,8 @@ log as the degradation was.
 
 ## 8. CR-3.1: inert-slot warning
 
+> **Superseded** by `2026-11-01-multi-slot-spatial-indexing-design.md` (#60): every declared geometry slot is indexed, so there is no inert slot and the warning and `audit-spatial-slots` are gone.
+
 Value-based, since the declared-type version is not buildable (§2.1(b)).
 
 A node reaching spatial maintenance runs the geometry loop *without* the early return, counts
@@ -613,6 +615,8 @@ geometries and consume the geometry-slot ordering from the type table.
 ---
 
 ## 13. Deferred
+
+> CR-3.2 below **landed** as `2026-11-01-multi-slot-spatial-indexing-design.md` (#60); it did need a format change after all (sidecar 6, memory image v9) and the query names its slot instead of unioning.
 
 **CR-3.2 — index a node under every indexed geometry slot.** Agreed as the more correct semantics
 and wanted; explicitly breaking, so it ships versioned. It needs a plural `node-geometries` protocol

@@ -1,0 +1,22 @@
+;;;; graph-db perf report
+;;;; tag=after-u5-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; k-hop-3-select                         OPS 100  SECONDS 0.094  OPS/S 1064  
+;; shortest-path-lisp-bfs                 OPS 100  SECONDS 0.446  OPS/S 224  
+;; reachable-closure-handwritten          OPS 100  SECONDS 0.408  OPS/S 245  
+;; aggregate-count-findall                OPS 100  SECONDS 0.002  OPS/S 50000  
+;; k-hop-3-predicate                      OPS 100  SECONDS 0.003  OPS/S 33333  
+;; reachable-predicate                    OPS 100  SECONDS 0.409  OPS/S 244  
+;; aggregate-count-predicate              OPS 100  SECONDS 0.002  OPS/S 50000  
+;; shortest-path-predicate                OPS 100  SECONDS 0.104  OPS/S 961  
+
+(:PERF-REPORT :TAG "after-u5-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 5
+ :HOST "odm" :ENTRIES
+ (("k-hop-3-select" :OPS 100 :SECONDS 0.094 :OPS/S 1064)
+  ("shortest-path-lisp-bfs" :OPS 100 :SECONDS 0.446 :OPS/S 224)
+  ("reachable-closure-handwritten" :OPS 100 :SECONDS 0.408 :OPS/S 245)
+  ("aggregate-count-findall" :OPS 100 :SECONDS 0.002 :OPS/S 50000)
+  ("k-hop-3-predicate" :OPS 100 :SECONDS 0.003 :OPS/S 33333)
+  ("reachable-predicate" :OPS 100 :SECONDS 0.409 :OPS/S 244)
+  ("aggregate-count-predicate" :OPS 100 :SECONDS 0.002 :OPS/S 50000)
+  ("shortest-path-predicate" :OPS 100 :SECONDS 0.104 :OPS/S 961)))

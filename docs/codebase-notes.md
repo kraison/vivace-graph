@@ -74,6 +74,45 @@ or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
   summing a parent and its subtypes counts them twice. Pass
   `:include-subclasses-p nil` to every non-leaf type when the counts must
   add up (GH #219).
+- **Ask `graph-db:explain-goals` before guessing a goal's cost.** It
+  names, per goal, the access path the engine will take for that
+  binding pattern (type index, adjacency index, ordered index, a
+  `claim/7` route, or a scan) without running anything;
+  `graph-db:profile-goals` runs the query and counts each functor's
+  ports (GH #124, manual Chapter 6). A change feed over a claim
+  namespace is the three-goal text `claim/7`, `claim-touched-at/2`,
+  `instant>/2` as written: the compiler takes it to the touched-at
+  index, so it costs what changed since the cursor, not the
+  namespace's history (GH #392, `docs/rules.md`).
+- **Bind the first argument of an asserted predicate when you can.** A
+  call to a `<-`-defined functor with a bound first argument tries only
+  the clauses whose first head argument can unify with it; unbound, it
+  tries them all in order (first-argument indexing, GH #121, manual
+  Chapter 6). Asserting a clause compiles that clause only.
+- **Table a recursive predicate over a graph that may be cyclic, and
+  write it left-recursive.** `(table-functor 'path 2)` evaluates each
+  distinct call once per query to a fixpoint, so the closure terminates
+  on a cycle; the left-recursive shape runs in constant stack, the
+  right-recursive one as deep as the distinct nodes (GH #122, manual
+  Chapter 6). `not`, `forall`, `if` with an else arm, `findall`,
+  `bagof` and `setof` over the predicate's own component signal
+  `prolog-unstratified-error`.
+- **Count with `aggregate-all`, close over with `reachable`, step with
+  `k-hop`,** not with `findall` plus a `lisp` call or a chain of edge
+  goals. `(aggregate-all count GOAL ?n)` with the goal written out
+  compiles inline and is admitted in guarded text; `(reachable ?from ?x
+  type)` is the engine's tabled closure over one edge type from a bound
+  start; `(k-hop ?from k ?x type)` the distinct nodes at distance k.
+  Weighted paths are `graph-db/algorithms`' `shortest-path/4` (GH #123,
+  manual Chapters 6 and 14).
+- **A repeated query shape runs compiled; vary the literals, not the
+  shape.** `run-query-goals` lifts strings and numbers out of a guarded
+  or DSL query and caches the compiled `select` per shape, so a
+  consumer's template with a changing key compiles once; a fresh shape
+  per call (a different goal order, a symbol where a string was)
+  interprets every time. `<-`, `reset-functor`, `table-functor` and an
+  edge type's install move the generation and retire the old entries;
+  `query-cache-stats` says what is cached (GH #376, manual Chapter 6).
 - **Pass `:collect-p t` only when you use the list,** since it builds one
   cons per edge.
 - **Key a hash table by an id, with `:test 'equalp`.** An id is a 16-byte

@@ -1,0 +1,8 @@
+;;;; graph-db perf report
+;;;; tag=before-u4-chain-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; chain-closure-untabled                 SECONDS 0.085  SOLUTIONS 199  
+
+(:PERF-REPORT :TAG "before-u4-chain-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL
+ :GENERATION 5 :HOST "odm" :ENTRIES
+ (("chain-closure-untabled" :SECONDS 0.085 :SOLUTIONS 199)))

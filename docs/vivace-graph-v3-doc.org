@@ -557,7 +557,7 @@ How can VivaceGraph ensure it wasn't terminated abruptly, leaving the database i
 - *On Shutdown:* When you call ~close-graph~, all files are safely synced to disk, and only then is the ~.dirty~ file deleted.
 - *On Next Startup:* When you next call ~open-graph~, it first checks for the existence of the ~.dirty~ file.
   - If the file is *not* present, it means the last session was closed cleanly. The graph opens normally.
-  - If the file *is* present, it means the application crashed or was killed before ~close-graph~ could complete. The database is potentially in an inconsistent state, and ~open-graph~ signals ~store-not-closed-cleanly-error~ (its ~store-not-closed-location~ reader names the store), refusing to open; the recovery procedure is to delete the ~.dirty~ marker and reopen — ~open-graph~ then runs recovery itself. ~make-graph~ refuses a location carrying ~.dirty~ with the same condition, before creating anything (GH #246).
+  - If the file *is* present, it means the application crashed or was killed before ~close-graph~ could complete. The database is potentially in an inconsistent state, and ~open-graph~ signals ~store-not-closed-cleanly-error~ (its ~store-not-closed-location~ reader names the store), refusing to open; the recovery procedure is to delete the ~.dirty~ marker and reopen — ~open-graph~ then runs recovery itself, replaying the ~tx/*.txn~ files in filename order. Each file's header carries its transaction-id (written after the commit lock; 0 if the process died in the instant between the rename and that write), and recovery refuses a file whose nonzero header id disagrees with its filename with ~transaction-file-id-mismatch~ — a renamed or misplaced file is reported, never replayed under the wrong id (#422). ~make-graph~ refuses a location carrying ~.dirty~ with the same condition, before creating anything (GH #246).
 
 This mechanism prevents the use of a potentially corrupted database, safeguarding your data integrity.
 
@@ -644,6 +644,8 @@ The transaction manager is the central orchestrator responsible for:
 - *Managing the Commit Log:* The manager is responsible for writing committed transactions to the on-disk replication log, ensuring that changes are durable.
 
 Every operation that modifies the graph occurs within the context of the currently active transaction, which is bound to the special variable ~*transaction*~.
+
+Once ~with-transaction~ has committed, it calls each function on ~*after-commit-hooks*~ with the committed transaction, on the committing thread, after its retry loop has returned and outside every lock and the ~*transaction*~ binding, so a hook may open a transaction of its own; a body that unwound or a commit that was refused calls none. This is the seam the forward evaluation of rules plugs into (~docs/rules.md~, "Forward evaluation").
 
 *** The ~with-transaction~ Macro
 
@@ -985,6 +987,24 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 | ~(<edge-name> ?from ?to ?weight)~           | Also unifies ~?weight~ with the edge's weight.                  |
 | ~(outgoing-edges ?vertex ?edge-var)~        | Finds all outgoing edges from ~?vertex~.                        |
 | ~(incoming-edges ?vertex ?edge-var)~        | Finds all incoming edges.                                       |
+| ~(reachable ?from ?to edge-type)~           | Every vertex reachable from the bound ~?from~ by one or more ~edge-type~ edges, each once; tabled, so it terminates on a cycle (GH #123). |
+| ~(k-hop ?from k ?to edge-type)~             | The distinct vertices at distance exactly ~k~ from ~?from~ along ~edge-type~ edges; ~k~ = 0 is ~?from~. |
+
+~reachable~ and ~k-hop~ need a bound start and a bound edge type: an
+unbound start or type signals an instantiation error (~k-hop~ fails
+quietly on an unbound type). Weighted shortest paths, distances,
+components and rankings are the ~graph-db/algorithms~ predicates of
+Chapter 14 (~shortest-path/4~, ~distance/3~, ~reachable/2~, ...).
+
+*Example:* everyone Bob can reach through ~follows~, and how many.
+#+BEGIN_SRC lisp
+  (select-flat (?x)
+    (is-a ?bob user) (node-slot-value ?bob username "bob")
+    (reachable ?bob ?x follows))
+  (select-flat (?n)
+    (is-a ?bob user) (node-slot-value ?bob username "bob")
+    (aggregate-all count (reachable ?bob ?x follows) ?n))
+#+END_SRC
 
 *Example:* Find all users who follow Bob.
 #+BEGIN_SRC lisp
@@ -1017,6 +1037,14 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 | ~(lisp ?var lisp-expression)~           | Evaluates the Lisp expression and unifies the result with ~?var~.        |
 | ~(or goal1 goal2 ... )~                 | Succeeds if /any/ of the goals succeed.                                  |
 | ~(not goal)~                            | Succeeds if the nested ~goal~ fails.                                     |
+| ~(aggregate-all spec goal ?result)~     | ~spec~ is ~count~, ~(sum ?e)~, ~(min ?e)~, ~(max ?e)~, ~(bag ?t)~, ~(set ?t)~, ~(min ?e ?w)~ or ~(max ?e ?w)~: the aggregate over every solution of ~goal~, which binds nothing. ~count~, ~sum~, ~bag~ and ~set~ always succeed (0, 0, nil, nil over none); ~min~ and ~max~ fail over none; the witness forms bind ~(e w)~ (GH #123). |
+
+A written-out ~goal~ compiles inline (no meta-call, so it is admitted
+in guarded text and under ~:effects nil~); a goal or spec in a
+variable goes through the runtime functor, like ~findall~. An
+aggregate reads its goal's tables as closed, so over a tabled
+predicate's own recursive component it is refused like ~not~ (the
+tabled predicates section).
 
 *Example:* Use the powerful `lisp` predicate to find posts with more than 10 characters.
 #+BEGIN_SRC lisp
@@ -1058,6 +1086,281 @@ This is a two-hop traversal: Alice -> Follows -> User -> Authored -> Post.
     ;; The engine backtracks on Goal 2, finds Carol, but she has no posts, so Goal 3 fails.
     ;; The final result is ("Hello, graph world!").
 #+END_SRC
+
+*** Asserted clauses with ~<-~: one closure each, first-argument indexing
+
+~<-~ adds a clause to a user functor at run time, the Prolog
+~assert~: ~(<- (parent alice bob))~ is a fact, ~(<- (ancestor ?a ?c)
+(parent ?a ?b) (ancestor ?b ?c))~ a rule. The functor is named by its
+head and arity (~parent/2~), lives in the image, and answers ~select~
+goals like any built-in predicate.
+
+Since GH #121 each clause compiles once, into its own closure, when it
+is added; the functor's function is a dispatcher built once that walks
+the candidate clauses in source order, undoes bindings between them,
+and stops at a cut. An assert's compile cost is therefore independent
+of how many clauses the functor already has: the unit's bench went
+from 16 asserts per second at 500 clauses to a rate that does not fall
+with the count. The cut keeps its meaning: it commits to the clause,
+discards the clause's earlier choice points and the remaining clauses,
+and ~once~, ~not~ and ~if~ stay opaque to it as before. A clause whose
+last goal calls a functor keeps that call in tail position, so a
+tail-recursive rule runs in constant stack as it always did.
+
+A call whose first argument is bound tries only the clauses whose
+first head argument can unify with it. The index keys that argument as
+a *superset* of ~prolog-equal~, so a bucket may hold a clause that then
+fails unification but never misses one that matches:
+
+| first argument | key |
+|---|---|
+| unbound variable | every clause, in order |
+| ~nil~ or a non-keyword symbol | the symbol |
+| string or keyword | its upcased name (a string and a keyword unify case-insensitively) |
+| number | its ~rational~ value (1 and 1.0 unify) |
+| character | the character |
+| cons | one bucket for every cons |
+| non-string array, non-finite float | every clause (~equalp~ can equal a string) |
+| node, timestamp, other object | only the variable-headed clauses |
+
+Clauses whose first head argument is a variable are merged into every
+lookup by source position, so solution order is exactly what trying
+every clause would give. ~*clause-indexing*~ set to ~nil~ turns the
+index off and tries every clause; set it if you specialise
+~prolog-equal~ to make two values of the indexed types equal across
+those keys (a symbol equal to a string, say).
+
+Introspection: ~(graph-db::functor-clauses (lookup-functor
+(make-functor-symbol 'parent 2)))~ is the ordered clause list;
+~reset-functor~ empties a functor and ~delete-functor~ unregisters it;
+~graph-db::*clause-compile-count*~ counts clause compiles since the
+image started. A clause of another arity than the functor's signals
+~prolog-error~; a functor's arity is part of its name, so ~<-~ can
+never raise that, only a direct ~add-functor-clause~ or
+~make-functor :clauses~ can.
+
+*** Tabled predicates: ~table-functor~
+
+A recursive rule over a graph that may hold a cycle never finishes
+top-down: the ring bench of GH #122 exhausted the control stack before
+it reached its inference budget. ~table-functor~ declares a user
+functor *tabled*: each distinct call, by variant (~(path a ?x)~ and
+~(path a ?y)~ are one call, ~(path ?x ?y)~ another), gets a table of
+answers for the length of the query, the table is evaluated to
+completion by iterating its recursive component to a fixpoint, and
+every later call of the same variant is answered from it. It is
+declared from Lisp, like a view; there is no Prolog-side directive, so
+guarded query text cannot declare one:
+
+#+BEGIN_SRC lisp
+(<- (path ?a ?b) (knows ?a ?b))
+(<- (path ?a ?c) (knows ?a ?b) (path ?b ?c))
+(table-functor 'path 2)        ; interns PATH/2 in *PACKAGE*, as <- does
+(functor-tabled-p 'path 2)     ; => T
+(select (?x) (path alice ?x))  ; terminates on a cycle; each node once
+(untable-functor 'path 2)
+#+END_SRC
+
+~table-functor~ before any clause registers the functor; a built-in
+(~is-a/2~) is refused with ~prolog-error~. The declaration survives
+~reset-functor~ and ~make-functor :clauses~.
+
+Which recursive shape to write matters for the stack, not the answer:
+
+- *left-recursive*, ~(<- (path ?a ?c) (path ?a ?b) (knows ?b ?c))~: the
+  recursive call is the variant being evaluated and reads the table as
+  it is built, so the Lisp stack is as deep as the clause body,
+  whatever the graph's size. Write this one for closure over a large
+  graph.
+- *right-recursive*, ~(<- (path ?a ?c) (knows ?a ?b) (path ?b ?c))~:
+  each reachable node gets its own table, evaluated inside its
+  caller's, so the stack is as deep as the distinct nodes on the way.
+  It terminates on a cycle, but a chain longer than the control stack
+  holds still exhausts it.
+
+Answers are stored once per variant (1 and 1.0 are one answer, two
+lookups of one vertex are one) in first-derivation order, and a
+non-ground answer is copied fresh for each consumer. A cut inside a
+tabled clause prunes that evaluation, as it does untabled: the table is
+the answer set under the clauses with their cuts, and an answer stored
+in an earlier round stays when a later round's cut skips its clause.
+To take one answer, put ~once~ on the consumer side.
+
+Under ~trace-prolog~ a tabled call fires one extra port, ~:table~,
+after its ~:call~: ~TABLE PATH/2 leader 3~ (it led its component to
+completion in three passes), ~follower 4~ (evaluated, left incomplete
+with four answers so far, completed by its leader), ~consume 2~ (read
+an incomplete table without evaluating) or ~complete 6~ (answered from
+a finished table: no ~CLAUSE~ lines follow). ~explain-goals~ appends
+~, tabled~ to the functor's path and ~profile-goals~ counts the events
+under ~tables~.
+
+*Negation is stratified or refused.* ~not~, ~forall~, ~if~ with an
+else arm, ~findall~, ~bagof~ and ~setof~ conclude something from a goal
+having no further solution, so they read the goal's tables as closed.
+Over a tabled predicate outside the current recursive component that
+is sound and works: ~(not (reachable ?x ?y))~ inside a rule that is not
+itself part of ~reachable~. Inside the predicate's own component the
+table is not closed yet, and the call signals
+~prolog-unstratified-error~ (ball ~(:permission-error :negate
+:procedure NAME/ARITY)~), which ~catch/3~ declines as it declines the
+resource and permission errors. ~once~, two-argument ~if~ and the cut
+only prune and are allowed.
+
+Tables live for one query: ~select~ and ~?-~ bind them fresh and drop
+them on exit, so a clause asserted between two queries is seen by the
+second, and a ~:write~ effect inside a query (~retract~) is not seen by
+a table that query already built. Threads never share a table.
+
+The engine's own tabled predicate is ~reachable/3~ (the built-in
+tables above): two left-recursive clauses over ~outgoing-edges/4~,
+one table per start, which is the shape to copy for a closure of your
+own.
+
+Measured on odm (SBCL 2.6.6, third of three runs,
+~tests/perf/results/prolog-after-u4-odm-d5eaa6e.report~): the 200-node
+ring went from control stack exhausted in 0.09 s with no solution to
+200 solutions in 0.44 s; down a 200-node chain, where the untabled
+recursion finishes, the tabled closure takes 0.11 s against 0.08 s
+untabled, the price of a table a query did not need.
+
+*** Watching and explaining a query: the ports, ~trace-prolog~, ~explain-goals~
+
+Every goal call fires four *ports* when a hook is set: ~:call~ when the
+goal is tried, ~:exit~ on each solution, ~:redo~ when the engine comes
+back for the next one, and ~:fail~ when there are no more. An asserted
+functor's dispatcher also fires ~:clause~ before each clause it tries,
+and a tabled functor's entry ~:table~ once per call with the path it
+took (the previous section).  The hook is ~*prolog-port-hook*~, a function of ~(port functor args
+depth)~; unset, a goal call costs what it always did (GH #124).
+~with-prolog-ports~ binds it for one form:
+
+#+BEGIN_SRC lisp
+(with-prolog-ports ((port functor args depth)
+                    (format t "~A ~A ~A~%" port functor depth))
+  (select-flat (?x) (ancestor bob ?x)))
+#+END_SRC
+
+~trace-prolog~ installs a printing hook, for every functor or for the
+ones named (~'ancestor~ every arity, ~'ancestor/2~ one), and
+~untrace-prolog~ removes it. Over three ~parent~ facts and the usual two
+~ancestor~ clauses, ~(select-flat (?x) (ancestor bob ?x))~ under
+~(trace-prolog 'ancestor 'parent)~ traces as follows (unfiltered, the
+engine's own ~select/2~ goal shows too); the number is the depth, and
+~CLAUSE 2/3~ is the second of the functor's three clauses, the one the
+first-argument index left:
+
+#+BEGIN_EXAMPLE
+[0] CALL ANCESTOR/2 (BOB ?1)
+[1]   CLAUSE ANCESTOR/2 1/2
+[1]   CALL PARENT/2 (BOB ?1)
+[2]     CLAUSE PARENT/2 2/3
+[1]   EXIT PARENT/2 (BOB CAROL)
+[0] EXIT ANCESTOR/2 (BOB CAROL)
+[0] REDO ANCESTOR/2 (BOB CAROL)
+[1]   REDO PARENT/2 (BOB CAROL)
+[1]   FAIL PARENT/2 (BOB CAROL)
+[1]   CLAUSE ANCESTOR/2 2/2
+[1]   CALL PARENT/2 (BOB ?2)
+[2]     CLAUSE PARENT/2 2/3
+[1]   EXIT PARENT/2 (BOB CAROL)
+[1]   CALL ANCESTOR/2 (CAROL ?1)
+[2]     CLAUSE ANCESTOR/2 1/2
+[2]     CALL PARENT/2 (CAROL ?1)
+[3]       CLAUSE PARENT/2 3/3
+[2]     EXIT PARENT/2 (CAROL DAN)
+[1]   EXIT ANCESTOR/2 (CAROL DAN)
+[0] EXIT ANCESTOR/2 (BOB DAN)
+...
+[1]   REDO PARENT/2 (BOB CAROL)
+[1]   FAIL PARENT/2 (BOB CAROL)
+[0] FAIL ANCESTOR/2 (BOB ?1)
+#+END_EXAMPLE
+
+A cut or a budget error unwinds through the open calls and each fires
+its ~FAIL~ on the way out, so a trace always balances. ~(setf
+*prolog-trace* t)~ is something else: the compiler's own chatter.
+
+~explain-goals~ tells you, without running anything, what each goal
+will do for the arguments bound at that point in the goal list (a
+variable counts as bound once an earlier goal mentioned it, which is
+the compiler's own reading and can be optimistic for a ~=~ between two
+fresh variables): the functor it resolves to, which arguments are
+bound, and the *access path*, from a registry the type, slot, edge, ordered-index, unique,
+spatial and ~claim/7~ predicates fill (~register-access-path~ adds
+one). An asserted functor reports how many of its clauses the
+first-argument index leaves; a path decided by a value only known at
+run time says so; an unknown functor is a row, not an error.
+
+#+BEGIN_EXAMPLE
+(explain-goals '(?x) '((ancestor bob ?x) (parent ?x ?y) (no-such ?y))
+               :stream *standard-output*)
+(ANCESTOR BOB ?X)
+    ANCESTOR/2 (user): first-argument index: 2 of 2 clauses
+(PARENT ?X ?Y)
+    PARENT/2 (user): first-argument index: by value at run time, 3 clauses
+(NO-SUCH ?Y)
+    UNKNOWN: no such functor: the call signals
+#+END_EXAMPLE
+
+Over a graph the same call says ~type index: PERSON~ for ~(is-a ?p
+person)~, ~ve-out index of ?P~ for ~(knows ?p ?q)~ with ~?p~ bound, ~vev
+index: one lookup~ with both ends bound, ~ordered index on PERSON.NAME~
+for ~find-by-slot~, and ~docs/rules.md~'s route words for ~claim/7~.
+~profile-goals~ runs the query under a counting hook and reports each
+functor's ports and the time from its calls to its fails:
+
+#+BEGIN_EXAMPLE
+(profile-goals '(?x) '((ancestor alice ?x)) :stream *standard-output*)
+ANCESTOR/2: 4 calls, 6 exits, 6 redos, 4 fails, 8 clauses, 0.000 s
+PARENT/2: 8 calls, 6 exits, 6 redos, 8 fails, 6 clauses, 0.000 s
+SELECT/2: 3 calls, 3 exits, 3 redos, 3 fails, 0 clauses, 0.000 s
+#+END_EXAMPLE
+
+Both have text entries in ~graph-db.query~, ~explain-text~ and
+~profile-text~, that go through the guard first (docs/guarded-query.md).
+
+*** The compiled query cache
+
+Every client query, the guarded Prolog runner, the JSON pattern DSL
+and a rule's body alike, reaches ~select~ through ~run-query-goals~,
+which used to ~eval~ a fresh ~select~ form per request under the
+interpreter (a native compile cost 18 to 20 ms, most of a small
+query's time: GH #373). Since GH #376 the runner canonicalises the
+form first and keeps a per-image cache of compiled shapes:
+
+- *the shape*: the variables renamed by first appearance and every
+  atom that is not a symbol (a string, a number, a node a Lisp caller
+  binds with ~=~) in a goal argument lifted into a vector the query
+  reads at run time, so ~(find-by-slot ?s thing key "t-3")~ and
+  ~... "t-4"~ are one shape (an ~aggregate-all~ spec word and the
+  expression of a ~lisp~ goal stay in place);
+- *the cache*: a shape runs interpreted the first time it is seen and
+  is compiled on its second lookup (~*compile-query-after*~, 2), then
+  runs compiled; ~*compiled-query-cache-size*~ (256) entries, the least
+  recently used evicted; one lock, the compile outside it;
+- *what moves it*: the key carries ~graph-db::*functor-generation*~,
+  which moves when a user functor's content changes, an assert with
+  ~<-~, ~reset-functor~, ~table-functor~, ~untable-functor~, the
+  deletion of a functor with clauses, or an edge type's functors being
+  installed, so an entry compiled before is never found again and ages
+  out; a query's own transient functor never moves it. A compiled form
+  looks every functor up at run time, so the generation is hygiene, not
+  correctness;
+- *per call*: ~:limit~, ~:offset~, the budgets and the row callback are
+  read from specials when the query runs, so one entry serves every
+  page and budget of a shape, and a budget trips inside a compiled run
+  as it does interpreted.
+
+~(clear-query-cache)~ empties it; ~(query-cache-stats)~ reports
+~(:entries n :compiled n :hits n :misses n :compiles n :evictions n)~.
+A size of zero turns the cache off. A workload that asserts with ~<-~
+between its queries keeps every shape cold, since each assert is a new
+generation and no shape reaches its second hit; assert first, then
+query.
+On the unit 6 bench (odm, GH #376) the repeated guarded shape, the
+consumer's two-hop read and a rule run twenty times are measured
+before and after; the rows are in ~docs/perf-baselines.md~.
 
 *** Pattern Matching Graph Structures
 
@@ -2483,6 +2786,15 @@ reaches the Prolog compiler. In order (~gui/prolog.lisp~):
    distinct names add no symbol to ~GRAPH-DB~ or ~KEYWORD~ and no
    package to the image.
 
+The pipeline is also exported in pieces (~docs/guarded-query.md~):
+~guard-query-text~ is steps 2 to 4, returning the guarded goals for a
+caller that keeps them; ~run-guarded-goals~ is step 5 over those goals,
+with ~run-guarded-prolog~'s cap, probe, paging and budgets (GH #383);
+and ~scan-query-text~ with ~with-screened-forms~ is steps 2 and 3 alone,
+the screened reader for an embedder with its own dispatch (GH #366).
+~*prolog-max-query-length*~ is enforced by the screen itself, so every
+entry refuses an overlong text, not only the GUI endpoint.
+
 The whitelist is *derived from the live image*, never hand-maintained:
 the ~(name . arity)~ pairs are enumerated out of
 ~*prolog-global-functors*~ and ~*user-functors*~ (so a graph's edge
@@ -2544,6 +2856,10 @@ so every caller gets the guard, not only this surface):
   the runtime functor behind it meta-calls whatever the variable holds.
   Writing the goal out in full keeps all of them on the compile-time
   path. ~(not (node-slot-value ?p name "Alice"))~ is fine.
+  ~aggregate-all~ is admitted by position (GH #123): its spec must be
+  a literal (~count~, ~(sum ?e)~, ...) and its goal written out, so
+  ~(aggregate-all count (is-a ?i item) ?n)~ answers and
+  ~(aggregate-all ?s ?g ?n)~ is refused naming the position.
 
 All three lists name *engine* predicates, so they are matched two ways,
 independently. By **home**: only against registry entries homed in
@@ -3266,7 +3582,7 @@ To put a node type on the map, give it a geometry slot and mark that slot ~:inde
                       :note "sighting near the river"))
 #+END_SRC
 
-Under the hood, indexing goes through the ~node-geometry~ generic function, which returns the geometry a node occupies (or ~nil~ — the default — for a node with no location). The ~:index t~ flag wires this up for you: ~node-geometry~'s default method returns the value of the node's indexed geometry slot. You only need to write a ~node-geometry~ method yourself for a *computed* geometry (e.g. derived from several slots, or fetched from a related node); an explicit method takes precedence over the default.
+Under the hood, indexing goes through the ~node-geometries~ generic function, which returns every geometry a node occupies as a list of ~(slot-name . geometry)~ — by default one entry per declared geometry slot that holds a value, so a node with two geometry slots is in two indexes (#60). A /geometry slot/ is an ~:index t~ slot whose declared type is ~geometry~ (or an ~(or null geometry)~-style union naming it); the declaration, not the value, decides. ~node-geometry~ is the single-geometry convenience and the extension point: write a method yourself only for a *computed* geometry (e.g. derived from several slots, or fetched from a related node). An explicit method is the authority for its class — ~node-geometries~ yields its one geometry — and on a single-slot class it may ~call-next-method~ to fall back to the declared slot. On a multi-slot class the default signals under ~:error~ (on the write path too, since the method is what indexes the node): a method of the shape ~(or (slot-value n 'outline) (call-next-method))~ is rewritten to return its geometry and slot, ~(values geometry 'outline)~.
 
 #+BEGIN_SRC lisp
   ;; Equivalent to the :index t form above, and the escape hatch for a
@@ -3279,7 +3595,7 @@ Under the hood, indexing goes through the ~node-geometry~ generic function, whic
 
 - A geometry slot declared on a *mixin* gives all of that mixin's subclasses /one shared/ index — the index is owned by the class that /declares/ the slot, not by each subclass. Sibling subclasses are then kept apart at query time by the scope's type filter, not by storage — and that filter runs /inside/ the index scan, so sharing an index costs a scoped query nothing. A class that declares its own geometry slot (no mixin) gets an index to itself.
 - Indexes are created *lazily*, on the first geometry-valued write for that class+slot — not by ~make-graph~. A slot marked ~:index t~ that never actually holds a geometry creates no index at all, and a query scoped to it simply returns ~nil~. Each index lives in the graph's index region (~indexes.dat~) and is reopened automatically by ~open-graph~; you never manage it directly.
-- *Known limitation — scoping to a parent does not reach a subclass's /own/ extra index.* A scope resolves the /named/ class's geometry slots, but the result type-filter admits subclasses. So if a subclass declares an /additional/ geometry slot of its own, ~(find-nodes-within 'parent …)~ will not scan that subclass-declared index, even though a node stored in it is a ~parent~ by ~typep~. Scope to the exact subclass (or use ~:all~) to reach it. This is not data loss — the node is indexed and findable — only the parent scope misses it; it is folded into the "index a node under every geometry slot" work (GitHub #60), where the multi-index semantics are solved once.
+- *A scope is subclass-inclusive.* Scoping to a parent reaches every finalized subclass, including an /additional/ geometry slot a subclass declares on its own: ~(find-nodes-within 'parent area :slot 'extra)~ scans the subclass's index for ~extra~ and skips the classes that lack that slot (#60).
 
 Here is a second spatial type, so the query examples below have two classes to scope across. Because ~sensor~ declares its own geometry slot, it gets its own index, independent of ~observation~'s:
 
@@ -3300,7 +3616,22 @@ Here is a second spatial type, so the query examples below have two classes to s
 #+END_SRC
 
 
-*One geometry slot per node is indexed.* A node is indexed by the /first/ geometry-valued indexed slot ~node-geometry~ finds; a second geometry-valued indexed slot on the same class is silently /inert/. Because the effective geometry is decided by value at write time (the ~:type geometry~ declaration cannot be compared reliably across application packages), VivaceGraph reports this by value rather than by declaration: a class whose nodes bind two geometry slots triggers a ~warn~ on the write path — naming the class, the geometry slots found, and which one wins — sampled over the class's first 64 nodes, so it costs nothing steady-state. ~audit-spatial-slots~ (graph) is the exhaustive, read-only counterpart: it sweeps every live node and reports every such class with its winning and inert slots — the thing to run after a migration or wire into a schema test suite.
+*Several geometry slots on one class, and the slot a query names.* A class may declare several geometry slots — a centroid and an outline, say — and a node is indexed under every one it binds. A query then names the geometry it tests with ~:slot~ (#60):
+
+#+BEGIN_SRC lisp
+  (def-vertex district ()
+    ((centroid :type geometry :index t)
+     (outline  :type geometry :index t :spatial-precision 5))
+    :sensor-app)
+
+  ;; Districts whose CENTROID lies inside AREA, and whose OUTLINE overlaps it:
+  (find-nodes-within 'district area :slot 'centroid)
+  (find-nodes-intersecting 'district area :slot 'outline)
+  ;; The distance reported is to the named slot's geometry.
+  (find-nodes-near 'district 45.67 12.34 5000.0 :slot 'centroid)
+#+END_SRC
+
+A class with /one/ geometry slot behaves as before, with or without ~:slot~. An *unnamed query on a multi-slot class signals* ~query-precondition-error~: it never unions the slots and never picks one silently. ~*spatial-unnamed-slot-policy*~ is the transition switch for a consumer porting its call sites: ~:error~ (the default) or ~:first-declared~, which answers an unnamed query from the first declared slot and warns once per class. The switch is removed in the next major release; port the call sites, do not depend on it. Naming a slot the scope's classes do not declare signals in every spelling (~'nothing~, ~:centroid~, ~"centroid"~).
 
 *** Querying
 
@@ -3324,7 +3655,13 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
   ;; :all scans every index in the graph.
   (find-nodes-within '(observation sensor) my-region)
   (find-nodes-within :all my-region)
+
+  ;; A class with several geometry slots: name the one the query tests.
+  (find-nodes-within 'district my-region :slot 'centroid)
+  (find-nodes-within :all my-region :slot 'outline)   ; classes without OUTLINE are skipped
 #+END_SRC
+
+Every query takes ~:slot~; it is required on a class with several geometry slots and optional on one with a single slot (see "Making a node type spatial" for the unnamed rule and the transition switch). An unnamed ~:all~ signals as soon as any class in the type registry has several geometry slots.
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
 
@@ -3352,13 +3689,18 @@ band, never the whole globe. The candidates are then refined with
   ;; All observations inside a region geometry bound to ?area:
   (select-flat (?o)
     (find-within ?o observation ?area))
+
+  ;; A multi-slot class names its slot in third position:
+  (select-flat (?d)
+    (find-within ?d district centroid ?area))
 #+END_SRC
 
-~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
+~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The slot-naming arities put the slot right after the scope: ~find-near/6~ and ~find-nearest/6~ take ~?node scope slot lat lon …~, ~find-within/4~ and ~find-intersects/4~ take ~?node scope slot area~; the old arities remain and resolve the slot as an unnamed Lisp query does (#60). The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
 
 *** Under the hood, and a few caveats
 
-- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v5) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
+- *Scope resolution is image-wide.* A scope's subclasses come from the class hierarchy (MOP), not from one graph's schema, so a multi-slot subclass defined for another graph in the same image makes an unnamed parent scope signal under ~:error~ in this graph too. Name the slot (#60).
+- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v6; v5 and earlier indexed a node once) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
 - *A bounded insert, self-healed at query time.* To stop a huge polygon from covering an astronomical number of fine cells, an insert caps its cover (16384 cells per index) and, when it must, stores that geometry more coarsely. The coarsening is made safe by the same /filter then refine/ contract: each index remembers the coarsest precision it actually holds and a query never covers finer than that, so a coarsely-stored country-scale polygon is still found (then refined exactly). Deleting the oversized geometry lets the finer selectivity return on its own, with no rebuild. Per-index precision (above) is the real control; the cap and clamp are a safety net for data that does not match the grid. The cap bounds a /whole geometry's/ cover: a multipolygon is covered part by part (so the gaps between separated parts are not indexed) but at one precision — the finest whose total fits — so a small island in a large boundary keeps full precision rather than dragging the index's clamp down with it (GH #103).
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *A bounded query window.* A radius query's window is clamped to the
@@ -3393,7 +3735,7 @@ band, never the whole globe. The candidates are then refined with
 
 A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its own region, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
 
-~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when its geometry lies in the area:
+~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when /any/ of its geometries lies in the area — a district whose centroid is outside but whose outline reaches in still ships (#60). Each geometry is judged by its representative point, so an extended geometry's test is as coarse as the refine layer's:
 
 #+BEGIN_SRC lisp
   (make-graph :ops-app "/data/field-laptop/"
@@ -3658,6 +4000,15 @@ The native algorithms are also exposed as Prolog functors, so analysis composes 
 
 The predicates are ~shortest-path/4~ (From To Path Cost), ~distance/3~, ~reachable/2~, ~connected-component/2~, ~degree/2~, ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~. They are pure reads, so they run even under a read-only ~:effects nil~ query. (As with any functor, a query written in a package other than ~graph-db~ must import the predicate's ~name/arity~ symbol — see Chapter 7.)
 
+~reachable/2~ here and the engine's ~reachable/3~ (Chapter 6) are
+different predicates: ~reachable/2~ is a yes/no Dijkstra check between
+two bound vertices over every edge type; ~reachable/3~ enumerates the
+closure from a bound start over one edge type through a per-query
+table, composes with other goals, and is admitted in guarded text.
+On the unit 5 bench (GH #123, odm) ~shortest-path/4~ answers 100
+pairs at 961/s where a hand-written Lisp breadth-first search ran at
+224 to 1,064/s.
+
 *** Caveats
 
 - *Recompute cost.* ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~ recompute the whole ranking on each call; for repeated use, call the Lisp ~page-rank~ / ~hub-authority-values~ once and keep the result.
@@ -3704,7 +4055,7 @@ Because the graph model, `with-transaction`, OCC validation, and the Prolog engi
 
 *** Durability: journal + checkpoint image
 
-Having no heap, an in-memory graph's durable record is the same write-ahead transaction journal (the ~.txn~ files) the on-disk engine produces — here *retained* rather than folded into a heap. On top of the journal it keeps a *checkpoint image*: a single file (~graph.img~) written at each clean ~close-graph~ that captures the whole graph — the node tables *and* the derived structures (indexes, spatial grid, views). Opening restores that image in one read, then replays any journal entries committed after it.
+Having no heap, an in-memory graph's durable record is the same write-ahead transaction journal (the ~.txn~ files) the on-disk engine produces — here *retained* rather than folded into a heap. Each entry's header carries its own id, written once the commit lock is released, and recovery refuses an entry whose header id disagrees with its filename (~transaction-file-id-mismatch~, #422). On top of the journal it keeps a *checkpoint image*: a single file (~graph.img~) written at each clean ~close-graph~ that captures the whole graph — the node tables *and* the derived structures (indexes, spatial grid, views). Opening restores that image in one read, then replays any journal entries committed after it.
 
 - *Clean close* → the image is written and the journal cleared; the next open restores the image quickly.
 - *Crash* (no clean close) → the retained journal replays on the next open. An in-memory graph *opened* over a ~.dirty~ marker tolerates it: it always rebuilds from its durable journal + image, so an unclean shutdown is *recovered*, not an error (contrast Chapter 3). *Creating* one there is different: ~make-memory-graph~ refuses a location carrying ~.dirty~ with ~store-not-closed-cleanly-error~, exactly as ~make-graph~ does — creating over a live or crashed store would silently orphan its journal and image (vivace-graph#250). A consequence worth stating: because ~.dirty~ is superseded blindly, a memory graph deliberately provides *no cross-process exclusion* — nothing stops a second process from opening the same directory — so where that matters, exclusion is the application's responsibility (GH #246).
@@ -5988,6 +6339,34 @@ cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
 ~claims-by-producer~ paginates the same way (vivace-graph#302).
 
+~claim-touched-at~ (a claim) is the instant its transaction record last
+changed: the retraction when retracted, else the recording; ~NIL~ for a
+claim predating the axis, a ~reaped-claim~, or an extent with no
+timestamp edge. ~claims-touched-after~ reads the family's *touched-at
+index*, an ordered index on the transaction extent that
+~def-claim-classes~ declares and every create, retraction and re-open
+maintains (vivace-graph#392; ~docs/general-index-design.md~ §4): the
+family's claims, both arities, touched strictly after a cursor,
+ascending by touched instant, retracted claims included, an open
+transaction's own writes included. It is the change-feed read: the
+consumer keeps the largest instant of the last page as its cursor, and
+a claim whose record moved after it appears once, at its new instant.
+
+#+BEGIN_SRC lisp
+  (claims-touched-after graph 'region-state "2026-01-01T00:00:00Z")
+  ;; => the claims touched after that instant, oldest first;
+  ;;    second value T when :LIMIT cut the list
+  (claim-touched-at (first (claims-by-producer graph 'region-state "ingest")))
+  ;; => a LOCAL-TIME:TIMESTAMP, or NIL
+#+END_SRC
+
+The cursor is a ~TIMESTAMP~ or an RFC 3339 string; ~:LIMIT~ and
+~:OFFSET~ page as ~claims-by-producer~ does. The same read from Prolog
+is ~claim-touched-after/4~, which the compiler also produces from a
+feed's own text, ~(claim-touched-at ?c ?t) (instant> ?t cursor)~
+(~docs/rules.md~, "The touched-at route"); ~examples/example-spacetime.lisp~
+ends with both.
+
 ~:AS-OF~ (a TIMESTAMP) answers on the *transaction* axis
 (vivace-graph#300): each claim comes back as the *version* believed at
 that instant. An in-place update after the instant is unwound to the
@@ -6387,9 +6766,13 @@ facet:
                  :rule-version <string>      ; bumped when the rule changes
                  :precision-fn <fname-or-nil>
                  :confidence-fn <fname-or-nil>
-                 :method-fn <fname-or-nil>)
+                 :method-fn <fname-or-nil>
+                 :registry-slot <slot-name>      ; optional (#60)
+                 :geometry-fn <fname>)           ; optional (#60)
     | :none
 #+END_SRC
+
+~:registry-slot~ and ~:geometry-fn~ are optional and may be omitted. When a registry class declares several geometry slots, ~:registry-slot~ names the one the scan tests and measures — it is ~register-geometry~'s ~:slot~, and an unnamed scan of such a registry signals exactly as an unnamed spatial query does. When the /source/ itself has several geometries, ~:geometry-fn~ names the function of the record that returns the one to register; without it ~register-node~ uses ~node-geometry~. Present, each must be a non-keyword symbol.
 
 ~:precision-fn~, ~:confidence-fn~ and ~:method-fn~ are required KEYS
 whose VALUE may be ~nil~ — a source with no per-record measure of any
@@ -6642,6 +7025,12 @@ bounds. Without GEOS, ~register-geometry~ refuses an extended geometry
 outright (above) rather than approximating and then trying to confirm
 the approximation; build that step only if a backend ever needs it.
 
+*** Rules, forward evaluation and productions (~graph-db/rules~)
+
+The optional ~graph-db/rules~ system reads claims as Prolog facts and lets a store hold *rules*: versioned producers whose body is a guarded Prolog query over claims and whose head is one claim pattern. ~run-rules~ derives every rule to its fixpoint, strata in dependency order, and reconciles each rule's previous derivation: a claim derived again is kept, one no longer derived is *retracted* (never deleted) and re-opened when derived again, and a ~derived-from~ record names each derived claim's premises. ~retire-rule~ withdraws a stored rule's or production's conclusions: the record leaves scope and its claims and provenance are retracted, never deleted, in one transaction (#477). The full reference is ~docs/rules.md~.
+
+Since #456 a store can also opt in to *forward evaluation*: after ~(graph-db.rules:enable-forward-rules graph)~, every commit's claim writes become a weighted delta and the rules that read what changed run from it, in the committing thread, after the commit returns (the ~*after-commit-hooks*~ seam of Chapter 5) -- or, with ~:drain :caller~, on a thread the application chooses and wakes through ~:on-queue~ (#467). A positive delta derives through the fixpoint machinery seeded with the new claims; a retraction or deletion finds the derivations it supported through provenance and re-derives them with their heads bound; a recursive stratum that lost a premise re-runs in full. Concurrent commits queue their deltas on one per-graph queue that the running step drains, so a commit never waits on another's derivation. ~now/1~ and ~instant-offset/3~ let a body state a threshold against the evaluation instant, and an enabled store schedules its own re-evaluation at the flip instant. *Productions* (~def-production~, or a stored ~production~ record) add an action to a body: a match derives a durable ~firing~ claim keyed by the premises' identities and the action runs from a salience-ordered agenda with ~:added~ and ~:lost~ events. ~forward-rules-status~ reports the queue, the timers, any failure and the last step's elapsed time; a step reads in proportion to what it touches, never the touched rule's whole derivation (#457); ~run-rules~ remains the repair and must report nothing to do after any step.
+
 ** Chapter 19: Measuring Performance
 
 The repository carries two performance measurement systems, and they
@@ -6746,7 +7135,7 @@ This chapter provides a categorized reference for the most important exported sy
   Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. A ~location~ already carrying a ~.dirty~ marker is refused upfront with ~store-not-closed-cleanly-error~, before anything is created (GH #246). ~:index-backend~ (~:skip-list~, the default, or ~:bplus-tree~) selects the ordered-index engine for this graph's views/unique/spatial indexes; it defaults to the global ~*index-backend*~. Returns a `graph` object. See Chapter 3, "Ordered indexes and pluggable backends."
 
 - ~open-graph (name location &key index-backend initial-accepting-state ... )~ ::
-  Opens an existing graph database from ~location~. Fails with ~store-not-closed-cleanly-error~ if the database was not closed cleanly (i.e., if the ~.dirty~ file exists); delete the marker and reopen — ~open-graph~ then runs recovery itself (GH #246). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). ~:initial-accepting-state~ (default ~t~, GH #170) is the state the graph is left in once this call returns — used by ~shadow-store~'s reopen to come back ~:read-only~. The transaction manager itself always starts at ~:opening~ (review round 3), before the graph is registered anywhere, for the duration of ~open-graph~'s own internal rebuild/recovery steps; it flips to ~:initial-accepting-state~ only at the very end, once the graph is fully open. Returns a `graph` object.
+  Opens an existing graph database from ~location~. Fails with ~store-not-closed-cleanly-error~ if the database was not closed cleanly (i.e., if the ~.dirty~ file exists); delete the marker and reopen — ~open-graph~ then runs recovery itself (GH #246), which fails with ~transaction-file-id-mismatch~ on a ~tx/*.txn~ file whose header id disagrees with its filename (#422). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). ~:initial-accepting-state~ (default ~t~, GH #170) is the state the graph is left in once this call returns — used by ~shadow-store~'s reopen to come back ~:read-only~. The transaction manager itself always starts at ~:opening~ (review round 3), before the graph is registered anywhere, for the duration of ~open-graph~'s own internal rebuild/recovery steps; it flips to ~:initial-accepting-state~ only at the very end, once the graph is fully open. Returns a `graph` object.
 
 - ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
   Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device, and ~:system-clock~ (default ~*system-clock*~) to join the image-level epoch clock (GH #176).
@@ -7028,8 +7417,17 @@ This chapter provides a categorized reference for the most important exported sy
 - ~geometry-area (g)~ ::
   Area in SQUARED COORDINATE UNITS (squared degrees for lon/lat, not m²). Requires ~graph-db/geos~. ~geometry-geodesic-area (g)~ / ~geometry-geodesic-length (g)~ are the metric, GEOS-free alternatives — square metres and metres respectively; see "Area and length" above.
 
+- ~node-geometries (node)~ ::
+  Generic function returning every geometry a node occupies, as a list of ~(slot-name . geometry)~ in slot order — by default one entry per declared geometry slot holding a value. The write path, the rebuilds and the query refine read this, so a node with two bound geometry slots is in two indexes (#60). A class with an application ~node-geometry~ method yields that method's one geometry. Specialize it directly for a computed /plural/ geometry.
+
+- ~node-slot-geometry (node slot-name)~ ::
+  The geometry ~node~ holds under ~slot-name~ per ~node-geometries~, or ~nil~.
+
 - ~node-geometry (node)~ ::
-  Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
+  Generic function returning /one/ geometry and the slot it came from, as ~(values geometry slot-name)~ — the class's unnamed resolution: its one geometry slot, or what ~*spatial-unnamed-slot-policy*~ says when there are several (so it signals on a multi-slot class under ~:error~). Specialize it for a *computed* geometry: such a method is the authority for its class (it reports no slot, and its class is indexed — and scoped — under the most general class carrying the method), and on a single-slot class it may ~call-next-method~.
+
+- ~*spatial-unnamed-slot-policy*~ ::
+  ~:error~ (default) or ~:first-declared~: what an unnamed query, ~node-geometry~ or Prolog goal does on a class with several geometry slots. A transition switch, removed in the next major release.
 
 - ~(slot :type geometry :index t :spatial-precision N :spatial-max-cells M)~ (slot options) ::
   ~:index t~ opts a geometry slot into spatial indexing; optional
@@ -7040,19 +7438,22 @@ This chapter provides a categorized reference for the most important exported sy
 
 
 - *scope* (first argument to every query below) ::
-  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
+  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type; a named class brings its finalized subclasses. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
 
-- ~find-nodes-near (scope lat lon radius &key graph)~ ::
+- ~:slot~ (keyword on every query below) ::
+  The geometry slot the query tests, and the one a near query measures the distance to. Required on a class with several geometry slots, optional on one with a single slot; a slot the scope does not declare signals, and under ~:all~ classes lacking it are skipped (#60).
+
+- ~find-nodes-near (scope lat lon radius &key graph slot)~ ::
   Live nodes in ~scope~ within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
 
-- ~find-nearest-k (scope lat lon k &key graph max-radius)~ ::
+- ~find-nearest-k (scope lat lon k &key graph max-radius slot)~ ::
   The ~k~ nearest live nodes in ~scope~ to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
 
-- ~find-nodes-within (scope area &key graph)~ / ~find-nodes-intersecting (scope area &key graph)~ ::
-  Live nodes in ~scope~ whose location lies inside — respectively, overlaps — the ~area~ geometry.
+- ~find-nodes-within (scope area &key graph slot)~ / ~find-nodes-intersecting (scope area &key graph slot)~ ::
+  Live nodes in ~scope~ whose named geometry lies inside — respectively, overlaps — the ~area~ geometry.
 
 - ~(find-near ?node scope lat lon radius)~ / ~(find-nearest ?node scope lat lon k)~ / ~(find-within ?node scope area)~ / ~(find-intersects ?node scope area)~ ::
-  Prolog functors that yield matching nodes, composable with the rest of a query.
+  Prolog functors that yield matching nodes, composable with the rest of a query. Each has a slot-naming arity with the slot after the scope: ~find-near/6~, ~find-nearest/6~, ~find-within/4~, ~find-intersects/4~ (#60).
 
 - ~geohash-neighbor (cell dlon dlat)~ / ~geohash-neighbors (cell)~ ::
   Grid helpers: the cell ~dlon~/~dlat~ steps away (wraps the antimeridian, ~nil~ off a pole), and the 8 same-precision cells surrounding ~cell~.
@@ -7064,11 +7465,13 @@ This chapter provides a categorized reference for the most important exported sy
   ~spatial-index-precision-counts~, ~spatial-index-coarsest-precision~.
 
 - ~rebuild-spatial-indexes (graph)~ ::
-  Rebuild /every/ spatial index from scratch by scanning every live node with a
-  ~node-geometry~ and routing it into the ~(owner . slot)~ index its geometry slot
+  Rebuild /every/ spatial index from scratch by scanning every live node's
+  ~node-geometries~ and routing each into the ~(owner . slot)~ index its slot
   selects. Adopts the per-class scheme on a graph that predates it, or repairs.
   Run when the graph is quiescent (like ~regenerate-view~). Returns the number of
-  nodes indexed.
+  index entries written (a node with two bound geometry slots counts twice), and
+  forgets the class memos first, so a ~node-geometry~ method defined after a
+  class was first written is honoured (#60).
 
 - ~regenerate-spatial-index (graph owner-class slot)~ ::
   Drop and rebuild /one/ ~(owner . slot)~ index, re-deriving its precision
@@ -7087,16 +7490,11 @@ This chapter provides a categorized reference for the most important exported sy
   ~:spatial-precision~ its slot option now declares. Creates nothing — indexes are
   still created lazily, at the first geometry-valued write.
 
-- ~audit-spatial-slots (graph)~ ::
-  Read-only exhaustive sweep: reports each class carrying more than one
-  geometry-valued indexed slot — as ~(class winning-slot . inert-slots)~. The
-  counterpart to the write-path inert-slot warning (see "Making a node type
-  spatial"); wire it into a schema test suite or run it after a migration.
-
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /
-  ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes inside
-  ~area~, so it holds only its own region. See "Subset replication" above.
+  ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes any of
+  whose geometries lies inside ~area~, so it holds only its own region. See
+  "Subset replication" above.
 
 **** REST API
 - ~start-rest ( &optional port)~ ::

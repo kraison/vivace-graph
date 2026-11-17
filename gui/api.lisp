@@ -590,25 +590,10 @@ error is ITS plain-text 400 and this handler never runs (GH #278)."
             (graph-db:decode-json-string-keys string)))
     (error () :malformed)))
 
-(defun %clamp-row-cap (n)
-  "N clamped by *QUERY-DEFAULT-LIMIT*.  Mirrors RUN-QUERY-GOALS' own
-rule so a response can report the bound it was actually run under."
-  (if (and (integerp n) (plusp n))
-      (min n graph-db::*query-default-limit*)
-      graph-db::*query-default-limit*))
-
 (defun %query-row-cap (dsl)
   "The row cap RUN-PATTERN-QUERY will apply to DSL: its \"limit\"
-clamped by *QUERY-DEFAULT-LIMIT*."
-  (%clamp-row-cap (cdr (assoc :limit dsl))))
-
-(defun %query-probe-limit (cap)
-  "Rows to ask the runner for when the answer must show CAP of them.
-One past the cap tells a truncated result from an exactly-full page.
-At *QUERY-DEFAULT-LIMIT* there is no room to ask for one more -- the
-runner clamps there -- so the probe is the cap itself and an
-exactly-full page reads as truncated (GH #278)."
-  (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
+clamped by *QUERY-DEFAULT-LIMIT*, the one rule (GH #328)."
+  (graph-db:clamp-row-cap (cdr (assoc :limit dsl))))
 
 (defun %query-dsl-for-gui (dsl limit)
   "DSL with its \"format\" field dropped and \"limit\" forced to LIMIT.
@@ -687,7 +672,7 @@ Prolog endpoint (GH #278, #279, #322)."
         (t
          (handler-case
              (let* ((cap (%query-row-cap dsl))
-                    (probe (%query-probe-limit cap)))
+                    (probe (graph-db:probe-limit cap)))
                (%query-envelope
                 (graph-db::run-pattern-query
                  (%query-dsl-for-gui dsl probe) graph)
