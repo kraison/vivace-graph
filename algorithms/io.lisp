@@ -296,9 +296,13 @@ of types.  Without RENDER, returns the DOT file path."
                        (:radial "twopi") (:spring "fdp") (otherwise "dot")))
             (out-file (cl-ppcre:regex-replace "\\.[a-z]+$" file
                                               (format nil ".~A" format))))
+        ;; An argument list, not a shell command line: a path with a
+        ;; space, a quote or a ; in it is one argument (GH #461).
         (multiple-value-bind (output err status)
-            (trivial-shell:shell-command
-             (format nil "~A -T~A -o ~A ~A" program format out-file file))
+            (uiop:run-program (list program (format nil "-T~A" format)
+                                    "-o" out-file file)
+                              :output nil :error-output :string
+                              :ignore-error-status t)
           (declare (ignore output))
           (unless (= 0 status)
             (error "graphviz ~A exited ~A: ~A" program status err))

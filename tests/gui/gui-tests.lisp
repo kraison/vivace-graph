@@ -344,6 +344,26 @@ schema summary for the known fixture."
                     :key (lambda (v) (jref v :name))
                     :test #'string=)))))))
 
+(test on-disk-size-counts-files-in-nested-directories
+  "The on-disk size walks the graph's whole tree: a file two directories
+down adds exactly its length to the apparent bytes (GH #461, UIOP's
+walk in place of cl-fad's)."
+  (with-gui-fixture ()
+    (let* ((graph (lookup-graph *gui-graph-name*))
+           (before (nth-value 1 (graph-db.gui::%on-disk-size graph)))
+           (blob (merge-pathnames
+                  "size-probe/deeper/blob.bin"
+                  (uiop:ensure-directory-pathname
+                   (graph-db::location graph)))))
+      (ensure-directories-exist blob)
+      (with-open-file (s blob :direction :output
+                              :element-type '(unsigned-byte 8))
+        (write-sequence (make-array 12345 :element-type '(unsigned-byte 8)
+                                          :initial-element 7)
+                        s))
+      (is (= (+ before 12345)
+             (nth-value 1 (graph-db.gui::%on-disk-size graph)))))))
+
 (test wire-names-are-kebab
   "Schema names ship as the engine spells them and JSON keys stay
 camelCase; a type value the API emits is accepted verbatim by ?type=
