@@ -96,6 +96,18 @@ Two sources feed one maintenance path:
 `def-index` definitions applicable to `class`, returning `(owner-name slot-name canonicalizer)`
 descriptors — the single input to maintenance (cache per class, like `class-unique-slots`).
 
+**Built (GH #392):** `def-claim-classes` declares, per claim family, an
+ordered index on `transaction-extent-sexp` named `claim-touched-at`,
+with the canonicalizer `extent-sexp-touched-key` (the end's latest edge
+when bounded, else the start's earliest, as `(day sec nsec)`;
+`:unbounded` when neither is a timestamp; NIL, not indexed, for a claim
+predating the axis). Creation, `retract-claim` and a re-open are the
+index's own `tx-create`/`tx-update` maintenance. `claims-touched-after`
+and the Prolog `claim-touched-after/4` read it from a cursor, which
+enters `map-index`'s `:start` as a synthetic open extent at the cursor
+so the canonicalizer's domain stays a stored extent
+(`docs/superpowers/specs/2026-11-11-touched-at-index-design.md`).
+
 ## 5. Maintenance (apply, post-durability — no enforcement)
 
 Copy `unique-constraint.lisp`'s apply half verbatim, dropping enforcement and origin:
@@ -307,9 +319,3 @@ need general indexes to survive a lazy reopen.
 Multi-slot/composite keys (codec already polymorphic — `less-than` orders lists); true
 reverse-streaming cursors (`cursor-prev` / doubly-linked leaves); automatic index selection
 in the Prolog compiler; `:type`-driven order-preserving on-disk key encoding.
-
-An ordered index per claim family on the transaction extent's touched-at
-instant (the end when closed, else the start -- what `claim-touched-at/2`
-answers), maintained at creation and at `retract-claim`'s close, so a
-change-feed cursor goal is a range scan from the cursor rather than a walk
-of the namespace's history (GH #392, from #391).

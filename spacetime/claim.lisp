@@ -157,6 +157,26 @@ identity tuple (GH #296, design §2.2)."
       (flet ((key (x) (if (eq x :unbounded) x (%timestamp-key x))))
         (list (key (bound-earliest start)) (key (bound-latest start)))))))
 
+(defun %extent-touched-at (extent)
+  "The instant EXTENT's transaction record last changed: the END bound's
+latest edge when it is a TIMESTAMP, else the START bound's earliest; NIL
+when neither is (GH #392, design D1)."
+  (when extent
+    (let ((end (bound-latest (extent-end extent))))
+      (if (typep end 'local-time:timestamp)
+          end
+          (let ((start (bound-earliest (extent-start extent))))
+            (and (typep start 'local-time:timestamp) start))))))
+
+(defun extent-sexp-touched-key (sexp)
+  "The instant SEXP's transaction record last changed, as %TIMESTAMP-KEY's
+fixnums: the end's latest edge when bounded, else the start's earliest;
+:UNBOUNDED when neither is a timestamp; NIL for NIL.  The :CANONICALIZE
+behind the CLAIM-TOUCHED-AT index (GH #392, design D1)."
+  (when sexp
+    (let ((ts (%extent-touched-at (sexp->extent sexp))))
+      (if ts (%timestamp-key ts) :unbounded))))
+
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
                        :accessor claim-subject-namespace
@@ -488,6 +508,11 @@ write; ENDPOINT-MISMATCH on a wrong node does."
        ;; kept as the as-of path's relation source (GH #361 R6).
        (graph-db:def-index ,parent (relation) ,graph-name
                            :name claim-relation)
+       ;; The change-feed cursor (GH #392, design D1): the transaction
+       ;; extent ordered by the instant it last changed.
+       (graph-db:def-index ,parent (transaction-extent-sexp) ,graph-name
+                           :name claim-touched-at
+                           :canonicalize extent-sexp-touched-key)
        ;; Counting indexes (GH #361 §3.1): the vocabulary is a lookup.
        ;; The object index on BINARY, like CLAIM-OBJECT above.
        ;; CLAIM-CURRENT-P is stored as a symbol and funcalled at

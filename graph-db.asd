@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -183,7 +183,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -204,7 +204,7 @@
 web-free.  docs/guarded-query.md; GH #322."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/core)
   :pathname "query/"
   :serial t
@@ -220,7 +220,7 @@ web-free.  docs/guarded-query.md; GH #322."
 directly, web-free (GH #322)."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/query/"
   :serial t
@@ -238,7 +238,7 @@ directly, web-free (GH #322)."
 docs/rules.md; GH #304."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
@@ -258,7 +258,7 @@ docs/rules.md; GH #304."
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
                (:file "scope-tests") (:file "forward-tests")
-               (:file "explain-tests"))
+               (:file "explain-tests") (:file "touched-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)
@@ -273,7 +273,7 @@ docs/rules.md; GH #304."
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   :depends-on (:graph-db/replication
                :graph-db/query
                :hunchentoot
@@ -305,7 +305,7 @@ docs/rules.md; GH #304."
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.1.0"
+  :version "5.0.0"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
@@ -649,7 +649,8 @@ cl-temporal-extent."
                (:file "epoch-tests")                   ; GH #347
                (:file "vocabulary-tests")              ; GH #350
                (:file "endpoint-edge-tests")             ; GH #369
-               (:file "link-sweep-tests"))               ; GH #372
+               (:file "link-sweep-tests")               ; GH #372
+               (:file "touched-tests"))                 ; GH #392
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

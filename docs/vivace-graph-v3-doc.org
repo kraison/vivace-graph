@@ -6344,6 +6344,34 @@ cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
 ~claims-by-producer~ paginates the same way (vivace-graph#302).
 
+~claim-touched-at~ (a claim) is the instant its transaction record last
+changed: the retraction when retracted, else the recording; ~NIL~ for a
+claim predating the axis, a ~reaped-claim~, or an extent with no
+timestamp edge. ~claims-touched-after~ reads the family's *touched-at
+index*, an ordered index on the transaction extent that
+~def-claim-classes~ declares and every create, retraction and re-open
+maintains (vivace-graph#392; ~docs/general-index-design.md~ §4): the
+family's claims, both arities, touched strictly after a cursor,
+ascending by touched instant, retracted claims included, an open
+transaction's own writes included. It is the change-feed read: the
+consumer keeps the largest instant of the last page as its cursor, and
+a claim whose record moved after it appears once, at its new instant.
+
+#+BEGIN_SRC lisp
+  (claims-touched-after graph 'region-state "2026-01-01T00:00:00Z")
+  ;; => the claims touched after that instant, oldest first;
+  ;;    second value T when :LIMIT cut the list
+  (claim-touched-at (first (claims-by-producer graph 'region-state "ingest")))
+  ;; => a LOCAL-TIME:TIMESTAMP, or NIL
+#+END_SRC
+
+The cursor is a ~TIMESTAMP~ or an RFC 3339 string; ~:LIMIT~ and
+~:OFFSET~ page as ~claims-by-producer~ does. The same read from Prolog
+is ~claim-touched-after/4~, which the compiler also produces from a
+feed's own text, ~(claim-touched-at ?c ?t) (instant> ?t cursor)~
+(~docs/rules.md~, "The touched-at route"); ~examples/example-spacetime.lisp~
+ends with both.
+
 ~:AS-OF~ (a TIMESTAMP) answers on the *transaction* axis
 (vivace-graph#300): each claim comes back as the *version* believed at
 that instant. An in-place update after the instant is unwound to the

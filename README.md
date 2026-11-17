@@ -27,6 +27,25 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-11-17 — VivaceGraph 5.0.0 (breaking)
+
+A major release: 43 changes since 4.1.0. The spatial contract changes
+(#60): a node is indexed under every declared geometry slot, a spatial
+query names the slot it tests, and a geometry slot is one declared as
+such; the spatial sidecar goes to format 6 and the memory image to v9,
+re-derived once at the first open of a 4.x store, which is otherwise
+read as it is. `*spatial-unnamed-slot-policy*` `:first-declared` keeps
+an unnamed query working while a consumer ports (#449 removes it in
+6.0). No peer-protocol bump. With it ships the Prolog Engine board:
+first-argument clause indexing (#121), tabled predicates (#122),
+`aggregate-all/3`, `reachable/3` and `k-hop/4` (#123), `explain-goals`,
+`trace-prolog` and the four-port hook (#124), the compiled query cache
+(#376) and the touched-at index, so a change-feed cursor costs what
+changed (#392); rules gain forward evaluation at commit (#456) and
+`retire-rule` (#477). SBCL and CCL run the whole matrix green; on ECL
+two deep-recursion tests hang the image (#495), the rest is green.
+Requires cl-temporal-extent >= 0.3.0. See [`CHANGELOG.md`](CHANGELOG.md).
+
 ### Announcement, 2026-10-31 — VivaceGraph 4.1.0 (features and fixes)
 
 A minor release: 98 changes since 4.0.1, with no on-disk format change
