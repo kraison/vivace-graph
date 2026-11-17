@@ -11,6 +11,19 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshot retention** (#441): `snapshot` takes `:keep`, defaulting
+  to the new `*snapshot-keep*` (NIL, every file kept as before); an
+  integer N deletes the complete `snap-` files beyond the N newest once
+  the new one is in place, and returns them as a second value.
+  `close-graph` passes `:snapshot-keep` to the snapshot it takes. A
+  truncated or legacy file is neither counted nor deleted, a failed
+  write prunes nothing, and `in-progress/` is never touched. Nothing in
+  the engine read an older snapshot, yet nothing deleted one: a store
+  that closed at every deploy had 68 of them, 21 GB of a 22 GB
+  directory.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).

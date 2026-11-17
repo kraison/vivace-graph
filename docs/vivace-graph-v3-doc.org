@@ -3152,7 +3152,8 @@ VivaceGraph offers two functions for creating backups, but for most use cases, y
 The ~snapshot~ function is the recommended, safe, and consistent way to back up your graph.
 
 #+BEGIN_SRC lisp
-  ;; Usage: (snapshot graph &key include-deleted-p check-data-integrity-p)
+  ;; Usage: (snapshot graph &key include-deleted-p check-data-integrity-p
+  ;;                        (keep *snapshot-keep*))
   
   ;; Create a snapshot of the currently active graph.
   (snapshot *graph*)
@@ -3165,6 +3166,28 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 2.  *Checks Data Integrity (Opt-in):* With ~:check-data-integrity-p t~, ~snapshot~ first runs a full data integrity check on the graph: it iterates through every vertex and edge, attempting to deserialize its data from the heap, and if any corruption is found the snapshot is aborted with a list of the problematic nodes. This sweep deserializes the whole graph a *second* time, which on a large graph is the larger half of the snapshot's memory cost, so since vivace-graph#119 it is *off by default* — routine snapshots (including the one ~close-graph~ takes) skip it. Run ~check-data-integrity~ directly when you want the audit; ~replay~ still verifies restored data by default.
 
 3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`. Every line is printed under standard I/O syntax, not the caller's: a client that binds print limits around the call (a SWANK client, cl-mcp's remote-eval) cannot truncate the file, and a non-default float format cannot change what a double reads back as (vivace-graph#354). Only the caller's ~*package*~ is kept, so symbols print relative to it as ~recreate-graph~'s ~:package-name~ expects.
+
+**** Retention: ~:keep~ and ~*snapshot-keep*~
+
+Nothing read an older snapshot: crash recovery replays ~tx/*.txn~ and
+never looks in ~txn-log/~, and ~replay~ takes only the newest complete
+file. Yet nothing deleted one either, so a store that closed at every
+deploy kept one full copy of itself per close (vivace-graph#441: 68
+snapshots, 21 GB of a 22 GB directory). ~snapshot~ now takes ~:keep~,
+defaulting to ~*snapshot-keep*~: ~NIL~, the default, keeps every file as
+before; an integer N deletes the *complete* ~snap-~ files beyond the N
+newest by write date, once the new one is renamed into place, and
+returns them as its second value. ~close-graph~ passes its
+~:snapshot-keep~ (same default) to the snapshot it takes, so
+~(setf *snapshot-keep* 2)~ at startup is the whole opt-in. Three rules
+keep it safe: a truncated or legacy file is neither counted nor
+deleted, so it can never push a good snapshot out; a failed write
+prunes nothing; ~in-progress/~ is never touched.
+
+#+BEGIN_SRC lisp
+  (snapshot *graph* :keep 2)        ; => count, the files deleted
+  (let ((*snapshot-keep* 2)) (close-graph *graph*))
+#+END_SRC
 
 **** Heap sizing for snapshots
 
@@ -7151,8 +7174,8 @@ This chapter provides a categorized reference for the most important exported sy
 - ~checkpoint-memory-graph (graph)~ ::
   Forces an in-memory graph to write its checkpoint image and clear the journal *now*, without closing. Call after a ~peer-sync~ on a device so pulled (un-journaled) state survives a restart.
 
-- ~close-graph (graph &key snapshot-p)~ ::
-  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing. For an in-memory graph this writes the checkpoint image and clears the journal.
+- ~close-graph (graph &key snapshot-p snapshot-keep)~ ::
+  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing; ~snapshot-keep~ (default ~*snapshot-keep*~) is that snapshot's ~:keep~, the number of complete snapshots to leave under ~txn-log/~ (vivace-graph#441). For an in-memory graph this writes the checkpoint image and clears the journal.
 
 - ~lookup-graph (name)~ ::
   Retrieves a handle to an already opened graph by its keyword ~name~.

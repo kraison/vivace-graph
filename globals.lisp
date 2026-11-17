@@ -70,6 +70,12 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +db-version+ 1)
 
 (defvar *graph* nil)
+
+(defvar *snapshot-keep* nil
+  "How many complete snapshots SNAPSHOT leaves under txn-log/ once it has
+written its own: NIL (the default) keeps every one, as before; an integer
+N >= 1 deletes the complete snap- files beyond the N newest.  CLOSE-GRAPH
+passes it to the snapshot it takes.  GH #441.")
 (alexandria:define-constant +main-table-file+ "main.dat" :test 'equal)
 (alexandria:define-constant +meta-file+ "meta.dat" :test 'equal)
 (alexandria:define-constant +data-file+ "data.dat" :test 'equal)

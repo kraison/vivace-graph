@@ -203,6 +203,7 @@
            #:graph-stats
            #:check-data-integrity
            #:snapshot
+           #:*snapshot-keep*                                ; GH #441
            #:replay
            #:restore
            ;; Vector segments (dense-vector index + cosine kNN query layer).
