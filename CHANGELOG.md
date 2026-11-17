@@ -39,6 +39,14 @@ between releases; cutting a release renames it to the new version and dates it.
   programs with UIOP. `visualize :render` hands Graphviz the paths as
   arguments, so a path containing a space, a quote or a `;` now renders.
 
+### Changed
+
+- **`graph-db/core` no longer depends on cl-json** (#462), nor,
+  through it, does `graph-db/replication`. `graph-db/query` (the
+  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
+  `graph-db/gui` already did, so a consumer of `graph-db`,
+  `graph-db/query` or `graph-db/gui` loads it as before.
+
 ## [5.0.0] - 2026-11-17
 
 A **MAJOR** release: the spatial contract and two

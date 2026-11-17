@@ -30,7 +30,8 @@
                ;; ships with ASDF (GH #461).
                :local-time
                :ieee-floats
-               :cl-json
+               ;; No :cl-json: no core file reads or writes JSON; graph-db/query
+               ;; and graph-db declare it where they use it (GH #462).
                ;; log4cl's compile-time machinery breaks ECL cross-compilation;
                ;; the Android core build sets :graph-db-stub-log and uses the
                ;; no-op log-stub instead.  Desktop/SBCL keeps real log4cl.
@@ -205,7 +206,8 @@ web-free.  docs/guarded-query.md; GH #322."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "5.0.0"
-  :depends-on (:graph-db/core)
+  :depends-on (:graph-db/core
+               :cl-json)
   :pathname "query/"
   :serial t
   :components ((:file "package")
@@ -276,6 +278,7 @@ docs/rules.md; GH #304."
   :version "5.0.0"
   :depends-on (:graph-db/replication
                :graph-db/query
+               :cl-json
                :hunchentoot
                :ningle
                :clack
