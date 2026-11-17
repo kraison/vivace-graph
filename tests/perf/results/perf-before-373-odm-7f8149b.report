@@ -1,0 +1,26 @@
+;;;; graph-db perf report
+;;;; tag=373-before-3 impl=SBCL 2.6.6 scale=NORMAL generation=5 host=odm
+
+;; claim-writes-unlinked                  OPS 4000  SECONDS 4.306  OPS/S 929  
+;; claim-sweep-backfill                   SECONDS 24.159  
+;; claim-sweep-backfill-linked            EDGES 8000  
+;; claim-writes-linked                    OPS 4000  SECONDS 12.42  OPS/S 322  
+;; two-hop-related                        OPS 200  SECONDS 0.221  OPS/S 905  
+;; two-hop-node-claims                    OPS 200  SECONDS 0.039  OPS/S 5128  
+;; two-hop-claim-endpoint                 OPS 200  SECONDS 0.028  OPS/S 7142  
+;; two-hop-claims-touching                OPS 200  SECONDS 0.056  OPS/S 3571  
+;; two-hop-speedup-lisp                   RATIO 1.436  
+;; two-hop-speedup-prolog                 RATIO 0.253  
+
+(:PERF-REPORT :TAG "373-before-3" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION
+ 5 :HOST "odm" :ENTRIES
+ (("claim-writes-unlinked" :OPS 4000 :SECONDS 4.306 :OPS/S 929)
+  ("claim-sweep-backfill" :SECONDS 24.159)
+  ("claim-sweep-backfill-linked" :EDGES 8000)
+  ("claim-writes-linked" :OPS 4000 :SECONDS 12.42 :OPS/S 322)
+  ("two-hop-related" :OPS 200 :SECONDS 0.221 :OPS/S 905)
+  ("two-hop-node-claims" :OPS 200 :SECONDS 0.039 :OPS/S 5128)
+  ("two-hop-claim-endpoint" :OPS 200 :SECONDS 0.028 :OPS/S 7142)
+  ("two-hop-claims-touching" :OPS 200 :SECONDS 0.056 :OPS/S 3571)
+  ("two-hop-speedup-lisp" :RATIO 1.436)
+  ("two-hop-speedup-prolog" :RATIO 0.253)))

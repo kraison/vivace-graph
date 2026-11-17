@@ -247,6 +247,25 @@ GH #255.)
   the claim-first feed text over 20,000 claims with the cursor past
   95 % of them, 5.98 s (runs 1 and 2: 7.02, 6.16) for its 1,000 rows.
   The goal enumerates the namespace key by key and filters by instant.
+- **#373, the near endpoint checked once per adjacency read, the
+  before**: `results/perf-before-373-odm-7f8149b.report`, same host,
+  SBCL and generation, 2026-11-17, third of three runs,
+  `bench-claim-linking` alone through `run-perf-only`:
+  `two-hop-node-claims` 5128/s (4545, 5128), `two-hop-claim-endpoint`
+  7142/s (4545, 7142), `two-hop-claims-touching` 3571/s (3390, 3448),
+  `two-hop-related` 905/s (803, 930), `claim-sweep-backfill` 24.2 s
+  (24.5, 23.4). Every emitted edge paid two endpoint lookups.
+- **#373, after**: `results/perf-after-373-odm-ac77d49.report`, same
+  host, 2026-11-17, third of three runs: `two-hop-node-claims` 5000/s
+  (5128, 4878), `two-hop-claim-endpoint` 6666/s (6451, 6896),
+  `two-hop-claims-touching` 2500/s (3571, 3390), `two-hop-related`
+  901/s (881, 855), `claim-sweep-backfill` 24.7 s (24.1, 23.1).
+  **No measurable change**: the two-hop cases are 200 reads timed to
+  the millisecond, and the lookup saved was a warm node-cache hit of
+  about 200 ns since PR #377's id hash. The change stands as four
+  lookups per hop instead of ten, proved by the count test in
+  `tests/graph-tests.lisp`, not as a speed-up; what remains of the
+  edge path's cost on this bench is not the endpoint validation.
 - **Unit 7, the touched-at index, after** (#392):
   `results/perf-after-u7-odm-b7de121.report`, same host, SBCL and
   generation, 2026-11-12, third of three runs, the same bench and

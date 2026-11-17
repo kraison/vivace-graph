@@ -133,6 +133,59 @@ set, with the right endpoints and weight."
         (mark-deleted (first (outgoing-edges (lookup-vertex aid)))))
       (is (zerop (length (outgoing-edges (lookup-vertex aid))))))))
 
+(defmacro %count-endpoint-checks ((counter) &body body)
+  "BODY with %ACTIVE-ENDPOINT-STATUS counted into COUNTER; the swap
+needs the NOTINLINE declaim in edge.lisp (CLAUDE.md, engine traps)."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,counter 0)
+           (,orig (fdefinition 'graph-db::%active-endpoint-status)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db::%active-endpoint-status)
+                    (lambda (&rest args)
+                      (incf ,counter)
+                      (apply ,orig args)))
+              ,@body)
+         (setf (fdefinition 'graph-db::%active-endpoint-status) ,orig)))))
+
+(test adjacency-checks-the-near-endpoint-once-per-call
+  "GH #373: every edge an adjacency read emits went through
+ACTIVE-EDGE-P, which looked both endpoints up, though the near one is
+the vertex the ve-index was keyed on and the same for every edge of the
+call.  Five live out-edges cost six endpoint checks now, one near and
+five far, where they cost ten; what is emitted does not change."
+  (with-test-graph (g)
+    (let (aid)
+      (with-transaction ()
+        (let ((a (make-g-person :name "Hub")))
+          (setq aid (id a))
+          (dotimes (i 5)
+            (make-g-knows :from a :to (make-g-person
+                                       :name (format nil "Spoke ~D" i))))))
+      (%count-endpoint-checks (checks)
+        (is (= 5 (length (outgoing-edges (lookup-vertex aid)))))
+        (is (= 6 checks) "one check of the hub, one per spoke")))))
+
+(test adjacency-still-hides-an-edge-whose-far-endpoint-is-deleted
+  "GH #373: the near-endpoint shortcut leaves the far check in place,
+and a deleted near vertex still has no live edges."
+  (with-test-graph (g)
+    (let (aid bid)
+      (with-transaction ()
+        (let ((a (make-g-person :name "A"))
+              (b (make-g-person :name "B"))
+              (c (make-g-person :name "C")))
+          (setq aid (id a) bid (id b))
+          (make-g-knows :from a :to b)
+          (make-g-knows :from a :to c)))
+      (with-transaction () (mark-deleted (lookup-vertex bid)))
+      (is (= 1 (length (outgoing-edges (lookup-vertex aid)))))
+      (is (= 2 (length (outgoing-edges (lookup-vertex aid)
+                                       :include-deleted-p t))))
+      (with-transaction () (mark-deleted (lookup-vertex aid)))
+      (is (null (outgoing-edges (lookup-vertex aid)))
+          "a deleted near vertex has no live edges"))))
+
 (test update-vertex-slot
   "Copy-modify-save inside a transaction persists the new slot value."
   (with-test-graph (g)

@@ -69,6 +69,15 @@ between releases; cutting a release renames it to the new version and dates it.
   file that defined it, are defined in `globals.lisp` now. None was a
   `let` binding, so nothing behaved differently; the next one would be
   caught before it could.
+- **An adjacency read checks its near endpoint once** (#373).
+  `map-edges` keyed on a vertex, or on an endpoint pair, checked both
+  endpoints of every edge it emitted through `active-edge-p`, though
+  the keyed endpoint is the same for the whole call; it is checked
+  once now and passed as `:known-live`, so each emitted edge costs one
+  endpoint lookup, and a dead keyed vertex walks nothing. What is
+  emitted does not change. On `bench-claim-linking` the difference is
+  within noise (`docs/perf-baselines.md`): the lookup saved was a warm
+  cache hit.
 - **`not` over a lost derivation is documented and pinned** (#479).
   A retracted claim stays on record, so a plain `not` over a relation
   that rules derive stays blocked after the derivation is lost, and

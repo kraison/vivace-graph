@@ -322,6 +322,9 @@ Gates the v5 cross-store scan in %ACTIVE-ENDPOINT-STATUS (GH #208)."
            *graphs*)
   nil)
 
+;; NOTINLINE: a test counts the calls by swapping the definition
+;; (tests/graph-tests.lisp, GH #373; CLAUDE.md, engine traps).
+(declaim (notinline %active-endpoint-status))
 (defun %active-endpoint-status (id graph &optional class-hint)
   "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH,
 for ACTIVE-EDGE-P and COMPACT-EDGES.  STATUS is one of:
@@ -370,21 +373,30 @@ graph-class.lisp."
                    (values nil :missing))))
             (t (values nil :missing)))))))
 
-(defmethod active-edge-p ((edge edge) &key (graph *graph*))
-  (flet ((endpoint-active-p (id)
-           (multiple-value-bind (v status)
-               (%active-endpoint-status id graph
-                                        (class-name (class-of edge)))
-             (ecase status
-               (:found (not (deleted-p v)))
-               ;; Not disprovable without trusting the tag -> live
-               ;; (GH #208, #209); COMPACT-EDGES :TRUST-TAGS is the
-               ;; explicit opt-in.
-               ((:detached :unknown :absent-in-store) t)
-               (:missing nil)))))
-    (and (not (deleted-p edge))
-         (endpoint-active-p (from edge))
-         (endpoint-active-p (to edge)))))
+(defun %endpoint-live-p (id graph &optional class-hint)
+  "True when edge endpoint ID counts as live for ACTIVE-EDGE-P: found and
+not deleted, or not disprovable without trusting the tag (GH #208,
+#209); COMPACT-EDGES :TRUST-TAGS is the explicit opt-in."
+  (multiple-value-bind (v status)
+      (%active-endpoint-status id graph class-hint)
+    (ecase status
+      (:found (not (deleted-p v)))
+      ((:detached :unknown :absent-in-store) t)
+      (:missing nil))))
+
+(defmethod active-edge-p ((edge edge) &key (graph *graph*) known-live)
+  "True when EDGE is not deleted and both its endpoints are live.  An
+endpoint whose id is in KNOWN-LIVE, a list, is taken as live without a
+lookup: MAP-EDGES passes the vertex an adjacency read is keyed on, which
+it checked once for the call, so each emitted edge costs one endpoint
+lookup instead of two (GH #373)."
+  (let ((hint (class-name (class-of edge))))
+    (flet ((live-p (id)
+             (or (member id known-live :test #'id-equal)
+                 (%endpoint-live-p id graph hint))))
+      (and (not (deleted-p edge))
+           (live-p (from edge))
+           (live-p (to edge))))))
 
 (defmethod edge-exists-p (edge-type (vertex1 vertex) (vertex2 vertex)
                           &key (graph *graph*))
@@ -500,20 +512,26 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
       ;; GH #408: OV as in MAP-VERTICES -- the walks skip an id the open
       ;; transaction wrote, the overlay supplies its own live edges.
       (let ((as-of (%as-of-snapshot graph))
-            (ov (current-overlay graph)))
+            (ov (current-overlay graph))
+            ;; GH #373: the endpoints an adjacency read is keyed on are
+            ;; the same for every edge of the call; checked once below,
+            ;; so ACTIVE-EDGE-P looks only the other endpoint up.
+            (known-live nil))
         (flet ((emit (edge)
                  (when (and edge (written-p edge)
                             ;; Explicit :GRAPH, not dynamic *GRAPH* --
                             ;; the wrong-graph pattern (GH #208 unit).
                             (or include-deleted-p
-                                (active-edge-p edge :graph graph)))
+                                (active-edge-p edge :graph graph
+                                                    :known-live known-live)))
                    (if collect-p
                        (push (funcall fn edge) result)
                        (funcall fn edge))))
                (emit-own (edge)
                  ;; An own edge has no WRITTEN-P until commit.
                  (when (or include-deleted-p
-                           (active-edge-p edge :graph graph))
+                           (active-edge-p edge :graph graph
+                                               :known-live known-live))
                    (if collect-p
                        (push (funcall fn edge) result)
                        (funcall fn edge))))
@@ -524,47 +542,56 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
           (cond
             ;; a specific endpoint pair -> vev-index per type-id
             ((and to-vertex from-vertex)
-             (dolist (tid type-ids)
-               (when (keep-type tid)
-                 (let* ((vev-key (make-vev-key :in-id (id to-vertex)
-                                               :out-id (id from-vertex)
-                                               :type-id tid))
-                        (il (lookup-vev-index-list vev-key graph)))
-                   (when il
-                     (map-index-list
-                      (lambda (eid)
-                        (unless (own-p eid)
-                          (emit (lookup-edge eid :graph graph))))
-                      il :include-deleted-p (not (null as-of)))))))
-             (when ov
-               (mapc #'emit-own
-                     (overlay-edges-between
-                      ov (id from-vertex) (id to-vertex)
-                      (remove-if-not #'keep-type type-ids)
-                      :include-deleted-p include-deleted-p))))
+             (setq known-live
+                   (and (%endpoint-live-p (id from-vertex) graph)
+                        (%endpoint-live-p (id to-vertex) graph)
+                        (list (id from-vertex) (id to-vertex))))
+             (when (or include-deleted-p known-live)
+               (dolist (tid type-ids)
+                 (when (keep-type tid)
+                   (let* ((vev-key (make-vev-key :in-id (id to-vertex)
+                                                 :out-id (id from-vertex)
+                                                 :type-id tid))
+                          (il (lookup-vev-index-list vev-key graph)))
+                     (when il
+                       (map-index-list
+                        (lambda (eid)
+                          (unless (own-p eid)
+                            (emit (lookup-edge eid :graph graph))))
+                        il :include-deleted-p (not (null as-of)))))))
+               (when ov
+                 (mapc #'emit-own
+                       (overlay-edges-between
+                        ov (id from-vertex) (id to-vertex)
+                        (remove-if-not #'keep-type type-ids)
+                        :include-deleted-p include-deleted-p)))))
             ;; a vertex's adjacent edges -> ve-index (in/out) per type-id
             (vertex
-             (dolist (tid type-ids)
-               (when (keep-type tid)
-                 (let* ((ve-key (make-ve-key :id (id vertex) :type-id tid))
-                        (il (cond ((eq direction :out)
-                                   (lookup-ve-out-index-list ve-key graph))
-                                  ((eq direction :in)
-                                   (lookup-ve-in-index-list ve-key graph))
-                                  (t (error "Unknown direction: ~S"
-                                            direction)))))
-                   (when il
-                     (map-index-list
-                      (lambda (eid)
-                        (unless (own-p eid)
-                          (emit (lookup-edge eid :graph graph))))
-                      il :include-deleted-p (not (null as-of)))))))
-             (when ov
-               (mapc #'emit-own
-                     (overlay-edges-at
-                      ov (id vertex) direction
-                      (remove-if-not #'keep-type type-ids)
-                      :include-deleted-p include-deleted-p))))
+             ;; A dead near vertex has no live edge: nothing to walk.
+             (setq known-live (and (%endpoint-live-p (id vertex) graph)
+                                   (list (id vertex))))
+             (when (or include-deleted-p known-live)
+               (dolist (tid type-ids)
+                 (when (keep-type tid)
+                   (let* ((ve-key (make-ve-key :id (id vertex) :type-id tid))
+                          (il (cond ((eq direction :out)
+                                     (lookup-ve-out-index-list ve-key graph))
+                                    ((eq direction :in)
+                                     (lookup-ve-in-index-list ve-key graph))
+                                    (t (error "Unknown direction: ~S"
+                                              direction)))))
+                     (when il
+                       (map-index-list
+                        (lambda (eid)
+                          (unless (own-p eid)
+                            (emit (lookup-edge eid :graph graph))))
+                        il :include-deleted-p (not (null as-of)))))))
+               (when ov
+                 (mapc #'emit-own
+                       (overlay-edges-at
+                        ov (id vertex) direction
+                        (remove-if-not #'keep-type type-ids)
+                        :include-deleted-p include-deleted-p)))))
             ;; typed, no adjacency -> type-index per type-id
             (requested
              (dolist (tid type-ids)
