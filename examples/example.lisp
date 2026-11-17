@@ -176,6 +176,61 @@
             (slot-value product 'name)
             like-qty)))
 
+;;; Asserted clauses, tabling, aggregation and explain -----------------
+;;;
+;;; <- adds a clause to a user functor; a call with a bound first
+;;; argument tries only the clauses its first-argument index leaves
+;;; (GH #121).  Two customers are KIN when they like a common product,
+;;; and kinship is transitive.  That relation is cyclic (Joe is kin to
+;;; Jill, Jill to Joe), so the untabled recursion never finishes:
+;;; TABLE-FUNCTOR gives KIN/2 a table of answers per call for the length
+;;; of one query, evaluated to a fixpoint, and the query terminates with
+;;; each answer once (GH #122).  Write the recursive clause
+;;; LEFT-recursive, as here, for a closure over a large graph (manual,
+;;; "Tabled predicates").  Assert first, then query: an assert moves the
+;;; functor generation the compiled query cache is keyed by (GH #376).
+(<- (kin ?a ?b) (likes ?a ?p) (likes ?b ?p) (/= ?a ?b))
+(<- (kin ?a ?c) (kin ?a ?b) (kin ?b ?c))
+(table-functor 'kin 2)
+
+;; Everyone kin to Joe, each once: Jill through the oil they both like,
+;; and Joe himself, through Jill.
+(let ((joe (lookup-customer-by-email "joe@blow.com")))
+  (declare (special joe))
+  (select-flat (?x) (lisp ?joe joe) (kin ?joe ?x)))
+
+;; AGGREGATE-ALL/3 folds every solution of a goal (GH #123): COUNT,
+;; (SUM ?e), (MIN ?e), (MAX ?e), (BAG ?t), (SET ?t) and the witness forms
+;; (MIN ?e ?w) / (MAX ?e ?w).  How many customers like each product, and
+;; how much liking it draws in all.
+(select (:flat nil) (?product ?n ?total)
+  (is-a ?product product)
+  (aggregate-all count (likes ?c ?product) ?n)
+  (aggregate-all (sum ?w) (likes ?c ?product ?w) ?total))
+
+;; The engine's own tabled closures over one edge type: REACHABLE/3 is
+;; every vertex one or more edges away from a bound start, each once;
+;; K-HOP/4 the vertices at exactly k edges.
+(let ((joe (lookup-customer-by-email "joe@blow.com")))
+  (declare (special joe))
+  (list (select-flat (?p) (lisp ?joe joe) (reachable ?joe ?p likes))
+        (select-flat (?p) (lisp ?joe joe) (k-hop ?joe 1 ?p likes))))
+
+;; EXPLAIN-GOALS says what each goal will do without running it: the
+;; functor it resolves to, which arguments are bound at that point, and
+;; the access path -- the type index, the share of KIN's clauses the
+;; first-argument index leaves (", tabled"), the edge index (GH #124).
+;; TRACE-PROLOG prints the four ports of a running query, PROFILE-GOALS
+;; counts them; the manual's "Watching and explaining a query" shows both.
+(explain-goals '(?x ?p) '((is-a ?c customer) (kin ?c ?x) (likes ?x ?p))
+               :stream *standard-output*)
+
+;; A query sent as text through GRAPH-DB/QUERY's guarded runner runs
+;; interpreted on first sight and compiled from its second
+;; (QUERY-CACHE-STATS, CLEAR-QUERY-CACHE; manual, "The compiled query
+;; cache"; docs/guarded-query.md).  SELECT, as above, is compiled with
+;; the file that contains it.
+
 (map-reduced-view (lambda (key id value)
                     (declare (ignore id))
                     (let ((product (lookup-vertex key)))

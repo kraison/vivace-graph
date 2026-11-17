@@ -181,6 +181,15 @@ storage formats (#60).
 
 ### Changed
 
+- **The examples and the manual reach the engine units:**
+  `examples/example.lisp` walks asserted clauses, `table-functor`,
+  `aggregate-all/3`, `reachable/3`, `k-hop/4` and `explain-goals`;
+  `examples/example-spacetime.lisp` ends with a stored rule under
+  `run-rules` and forward evaluation, a retraction losing its
+  derivation, and the change feed read both ways; the manual's
+  Chapter 18 documents `claim-touched-at` and
+  `claims-touched-after` beside the other readers.
+
 - **`trace-prolog` prints the four ports** (#124), one line per
   call, exit, redo and fail indented by depth, plus the clause a
   dispatcher tries; `(trace-prolog 'name)` traces every arity of one
