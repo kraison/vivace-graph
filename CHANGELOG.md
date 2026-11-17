@@ -11,6 +11,25 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshot retention** (#441): `snapshot` takes `:keep`, defaulting
+  to the new `*snapshot-keep*` (NIL, every file kept as before); an
+  integer N deletes the complete `snap-` files beyond the N newest once
+  the new one is in place, and returns them as a second value.
+  `close-graph` passes `:snapshot-keep` to the snapshot it takes. A
+  truncated or legacy file is neither counted nor deleted, a failed
+  write prunes nothing, and `in-progress/` is never touched. Nothing in
+  the engine read an older snapshot, yet nothing deleted one: a store
+  that closed at every deploy had 68 of them, 21 GB of a 22 GB
+  directory.
+- **`claims-by-relation`** (#448): the exported reader of the
+  `(relation)` index every claim family has carried since #350, the twin
+  of `claims-by-producer`: both arities, retracted claims included, the
+  same `:as-of` / `:as-of-epoch` resolution and `:limit` / `:offset`
+  with the truncated flag. "Every claim with relation R" cost a walk of
+  every endpoint before; it costs the matching claims now.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).
@@ -41,6 +60,32 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **The build fails on a full warning** (#439):
+  `tests/check-build-warnings.sh` compiles the systems from a clean
+  FASL cache in a fresh image and exits non-zero on any `WARNING` from
+  this tree that is not a style warning; CI runs it before the suites.
+  The three it found, `*transaction*`, `*snapshot-reads-p*` and
+  `+spatial-insert-max-cells+`, each read by a file compiled before the
+  file that defined it, are defined in `globals.lisp` now. None was a
+  `let` binding, so nothing behaved differently; the next one would be
+  caught before it could.
+- **An adjacency read checks its near endpoint once** (#373).
+  `map-edges` keyed on a vertex, or on an endpoint pair, checked both
+  endpoints of every edge it emitted through `active-edge-p`, though
+  the keyed endpoint is the same for the whole call; it is checked
+  once now and passed as `:known-live`, so each emitted edge costs one
+  endpoint lookup, and a dead keyed vertex walks nothing. What is
+  emitted does not change. On `bench-claim-linking` the difference is
+  within noise (`docs/perf-baselines.md`): the lookup saved was a warm
+  cache hit.
+- **`not` over a lost derivation is documented and pinned** (#479).
+  A retracted claim stays on record, so a plain `not` over a relation
+  that rules derive stays blocked after the derivation is lost, and
+  `run-rules` agrees. `docs/rules.md` "Two negations" now says so and
+  gives the current-only idiom, `(not (if (claim ...) (claim-current
+  ?r)))`; three tests pin both forms under `:commit` and `:drain
+  :caller`, and that `standing-query-problems` admits both without a
+  reason, which is the call recorded there. No engine change.
 - **`graph-db/core` no longer depends on cl-json** (#462), nor,
   through it, does `graph-db/replication`. `graph-db/query` (the
   pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and

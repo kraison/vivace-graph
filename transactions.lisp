@@ -10,7 +10,8 @@
                 validate-value-constraints validate-cardinality-constraints
                 validate-domain-range-constraints))
 
-(defvar *transaction* nil)
+;; *TRANSACTION* is defvar'd in globals.lisp: vertex.lisp, edge.lisp and
+;; primitive-node.lisp read it and compile before this file (GH #439).
 
 (defvar *commit-validators* '()
   "Functions of (TX GRAPH), run in %COMMIT's manager-locked pre-durability
@@ -705,9 +706,8 @@ irrelevant to reaping)."
 ;;; that was live as of the reader's snapshot.  The reaper's floor retains every
 ;;; version an active transaction could need, so the chain is guaranteed present.
 
-(defvar *snapshot-reads-p* t
-  "When true, transactional LOOKUP-OBJECT resolves the version visible at the
-transaction's start epoch (snapshot isolation).  Prototype toggle.")
+;; *SNAPSHOT-READS-P* is defvar'd in globals.lisp: LOOKUP-OBJECT above reads
+;; it before this point in the file (GH #439).
 
 (define-condition version-reaped-error (error)
   ((id :initarg :id :reader version-reaped-id)

@@ -223,6 +223,53 @@ answering NIL, which is also the correct answer for 'wrote nothing'."
     (signals unknown-claim-family
       (claims-by-producer g 'no-such-claim "rule-a"))))
 
+(test claims-by-relation-finds-both-arities-and-only-that-relation
+  "GH #448: the (relation) index every family declares had no exported
+reader.  CLAIM-CLASS is the PARENT, so one call covers unary and binary,
+as CLAIMS-BY-PRODUCER does; NIL is the real answer for a relation no
+claim carries."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (make-b :relation "runs" :object "o1")
+      (make-u :relation "runs")
+      (make-b :relation "hosts" :object "o2"))
+    (is (= 2 (length (claims-by-relation g 'ct-claim "runs"))))
+    (is (= 1 (length (claims-by-relation g 'ct-claim "hosts"))))
+    (is (null (claims-by-relation g 'ct-claim "owns")))))
+
+(test claims-by-relation-includes-retracted-claims-and-pages
+  "GH #448: retracted claims stay on record and are returned, as the
+producer reader returns them; :LIMIT / :OFFSET page with the truncated
+flag."
+  (with-claim-graph (g)
+    (let (victim)
+      (with-transaction ()
+        (make-b :relation "runs" :object "o1")
+        (make-b :relation "runs" :object "o2")
+        (setq victim (make-b :relation "runs" :object "o3")))
+      (with-transaction () (retract-claim victim))
+      (let ((all (claims-by-relation g 'ct-claim "runs")))
+        (is (= 3 (length all)))
+        (is (= 1 (count-if-not #'claim-current-p all))))
+      (multiple-value-bind (page more) (claims-by-relation g 'ct-claim "runs"
+                                                           :limit 2)
+        (is (= 2 (length page)))
+        (is-true more))
+      (multiple-value-bind (page more) (claims-by-relation g 'ct-claim "runs"
+                                                           :limit 2 :offset 2)
+        (is (= 1 (length page)))
+        (is-false more)))))
+
+(test claims-by-relation-signals-on-an-unregistered-parent
+  "Same contract as CLAIMS-BY-PRODUCER: an unknown family signals rather
+than answering NIL, and :AS-OF with :AS-OF-EPOCH is refused."
+  (with-claim-graph (g)
+    (signals unknown-claim-family
+      (claims-by-relation g 'no-such-claim "runs"))
+    (signals error
+      (claims-by-relation g 'ct-claim "runs"
+                          :as-of (local-time:now) :as-of-epoch 1))))
+
 (test a-transaction-reads-its-own-retraction-and-assertion
   "GH #324: retract-then-assert in one WITH-TRANSACTION -- the idiom
 RETRACT-CLAIM's docstring recommends -- reads back inside the

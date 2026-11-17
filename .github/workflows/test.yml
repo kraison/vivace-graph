@@ -48,6 +48,10 @@ jobs:
       # three suites are 71% of this step's wall time for 8% of its checks.
       # The other lanes below run either way -- together they are ~4
       # minutes, so there is nothing to tier there.
+      - name: build warnings (tests/check-build-warnings.sh, GH #439)
+        run: |
+          CL_SOURCE_REGISTRY="$PWD//:$HOME/ci-deps-vivace-graph/cl-temporal-extent/:" \
+            tests/check-build-warnings.sh
       - name: main suite (12GiB heap per tests/README.md)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then

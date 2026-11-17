@@ -65,6 +65,7 @@
    #:claim-current-p #:retract-claim                   ; GH #162
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
+   #:claims-by-relation                               ; GH #448
    #:claim-touched-at #:claims-touched-after          ; GH #392
    #:canonical-relation-p #:canonical-producer-p      ; GH #160
    #:canonical-namespace-p                             ; GH #327

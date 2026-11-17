@@ -17,14 +17,9 @@
 ;;; (SPATIAL-INDEX-ADDRESS) is what a host persists to reopen the index, exactly
 ;;; as views persist their skip-list pointer.
 
-;; An insert covers its geometry with at most this many cells.  A SAFETY NET,
-;; not a selectivity knob -- per-index precision is that knob.  Sized so nothing
-;; that works today changes behaviour: a site-scale 0.05 degree polygon is ~1,444
-;; cells at p=7 and a city-scale 0.1 degree one ~5,476, both well under.  Per
-;; index and PERSISTED (graph.lisp), never a mutable global: SPATIAL-INDEX-REMOVE
-;; recomputes cells from the geometry, so a cap that drifted between an insert and
-;; its matching remove would orphan entries permanently.
-(alexandria:define-constant +spatial-insert-max-cells+ 16384 :test '=)
+;; +SPATIAL-INSERT-MAX-CELLS+ itself is defined in globals.lisp: the GRAPH
+;; class's slot :initform reads it, and graph-class.lisp compiles first
+;; (GH #439).
 
 (defstruct (spatial-index (:constructor %make-spatial-index) (:predicate spatial-index-p))
   skip-list
