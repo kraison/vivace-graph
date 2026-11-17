@@ -135,7 +135,9 @@ Scratch locations differ between the two generations of tests:
   - a special variable that an earlier-compiled file binds must be
     `defvar`ed in `globals.lisp` or earlier in `graph-db.asd`'s chain; a
     later `defvar` leaves those bindings lexical and silently inert
-    (`*record-reads*`, GH #92);
+    (`*record-reads*`, GH #92); `tests/check-build-warnings.sh` fails on
+    the undefined-variable warning that announces one, and CI runs it
+    (#439);
   - FiveAM test names are symbols, and a suite's files share one package
     (`graph-db/test`, `graph-db/rules-test`), so a reused name silently
     replaces the first test, and a reused helper `defun` or

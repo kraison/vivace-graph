@@ -60,6 +60,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **The build fails on a full warning** (#439):
+  `tests/check-build-warnings.sh` compiles the systems from a clean
+  FASL cache in a fresh image and exits non-zero on any `WARNING` from
+  this tree that is not a style warning; CI runs it before the suites.
+  The three it found, `*transaction*`, `*snapshot-reads-p*` and
+  `+spatial-insert-max-cells+`, each read by a file compiled before the
+  file that defined it, are defined in `globals.lisp` now. None was a
+  `let` binding, so nothing behaved differently; the next one would be
+  caught before it could.
 - **`graph-db/core` no longer depends on cl-json** (#462), nor,
   through it, does `graph-db/replication`. `graph-db/query` (the
   pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
