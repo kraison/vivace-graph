@@ -11,11 +11,6 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
-## [5.0.0] - 2026-11-17
-
-A **MAJOR** release: the spatial contract and two
-storage formats (#60).
-
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).
@@ -43,6 +38,11 @@ storage formats (#60).
   slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
   programs with UIOP. `visualize :render` hands Graphviz the paths as
   arguments, so a path containing a space, a quote or a `;` now renders.
+
+## [5.0.0] - 2026-11-17
+
+A **MAJOR** release: the spatial contract and two
+storage formats (#60).
 
 ### Added
 
