@@ -50,6 +50,17 @@ between releases; cutting a release renames it to the new version and dates it.
   over-covered at the old grid, correct but slower. Lazy and eager opens
   alike.
 
+- **Time travel follow-ups** (#356): `latest-epoch` signals
+  `as-of-refused :no-version-history` for a graph with no transaction
+  manager or a memory graph, where it signalled `unbound-slot` or
+  answered an epoch `with-as-of` then refused; `create-transaction`'s
+  start-epoch guard runs before a sequence number is consumed and
+  signals `as-of-refused :future-epoch`. `:if-reaped :skip` is pinned
+  on every per-call read path (`lookup-vertex`, `lookup-edge`,
+  `map-vertices`, `select :as-of`), an absence does not count as a
+  skip, and the counter counts reads, not nodes, as the doc says.
+  `docs/time-travel.md` names the peer-purge bound.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).
