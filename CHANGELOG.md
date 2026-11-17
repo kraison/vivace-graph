@@ -61,6 +61,18 @@ between releases; cutting a release renames it to the new version and dates it.
   skip, and the counter counts reads, not nodes, as the doc says.
   `docs/time-travel.md` names the peer-purge bound.
 
+- **Count-index follow-ups** (#363): `make-graph` installs the
+  declared count maps as `open-graph` does, so a store created
+  in-session no longer marks them stale at its first commit and pays a
+  full scan at its first count query. The four canonicalise loops of
+  the secondary and count indexes are one helper. Tests cover
+  `map-count-index` on the B+ tree backend and a memory graph, a
+  prefix of exactly `:depth` components, a depth-2 listing with no
+  prefix, and `:canonicalize` on a count index against the
+  case-sensitive secondary index on the same owner; `def-count-index`'s
+  docstring says a changed canonicalizer across a close is not detected
+  at open, unlike a changed `:current-p`.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).

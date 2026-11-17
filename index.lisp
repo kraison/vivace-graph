@@ -416,16 +416,25 @@ component as +NULL-COMPONENT+, so rows do sit under it.  Gating on the given
 components alone conflated the two and lost those rows (the query-side mirror
 of %INDEX-TUPLE-KEY, GH #107)."
   (let* ((arity (length (slot-index-slot-names six)))
-         (cans (slot-index-canonicalizers six))
-         (vals (if (= arity 1) (list value) value))
-         (any nil)
-         (key (loop for v in vals
-                    for i from 0
-                    collect (cond ((null v) +null-component+)
-                                  (t (setf any t)
-                                     (let ((c (nth i cans)))
-                                       (if c (funcall c v) v)))))))
-    (when (or any (< (length vals) arity)) key)))
+         (vals (if (= arity 1) (list value) value)))
+    (multiple-value-bind (key any)
+        (%canonical-components vals (slot-index-canonicalizers six))
+      (when (or any (< (length vals) arity)) key))))
+
+(defun %canonical-components (vals cans)
+  "VALS as index components: +NULL-COMPONENT+ for a NIL, else the value
+through its position's canonicalizer in CANS, a list with NIL where
+none applies.  Second value true when any component was non-null.  The
+one loop behind %INDEX-TUPLE-KEY, %INDEX-KEY, %COUNT-TUPLE and
+%COUNT-QUERY-KEY (GH #363)."
+  (let ((any nil))
+    (values (loop for v in vals
+                  for i from 0
+                  collect (cond ((null v) +null-component+)
+                                (t (setf any t)
+                                   (let ((c (nth i cans)))
+                                     (if c (funcall c v) v)))))
+            any)))
 
 (defun %index-tuple-key (six node)
   "The value components of NODE's key for SIX: per-position canonicalizer
@@ -433,16 +442,10 @@ applied, +NULL-COMPONENT+ substituted for a null component so the row stays
 findable by a prefix scan of its populated parts.  NIL only when EVERY
 component is null -- nothing to index (the write-side mirror of
 %INDEX-KEY, GH #107)."
-  (let* ((slots (slot-index-slot-names six))
-         (cans  (slot-index-canonicalizers six))
-         (any nil)
-         (key (loop for s in slots
-                    for i from 0
-                    for v = (slot-value node s)
-                    collect (cond ((null v) +null-component+)
-                                  (t (setf any t)
-                                     (let ((c (nth i cans)))
-                                       (if c (funcall c v) v)))))))
+  (multiple-value-bind (key any)
+      (%canonical-components
+       (mapcar (lambda (s) (slot-value node s)) (slot-index-slot-names six))
+       (slot-index-canonicalizers six))
     (when any key)))
 
 (defun %tuple-indexable-p (node slot-names)

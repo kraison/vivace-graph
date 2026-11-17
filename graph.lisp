@@ -655,7 +655,12 @@ condition unchanged."
       ;; consult-only commit path now relies on (GH #129).  After the slave
       ;; replay above, so a subset replay is covered.
       (let ((*graph* graph))
-        (install-unique-tuple-constraints graph))
+        (install-unique-tuple-constraints graph)
+        ;; The counting indexes too (GH #363): an empty BUILT map per
+        ;; declaration, as OPEN-GRAPH leaves them, so the first commit
+        ;; counts into it instead of marking the maps stale and the first
+        ;; count query pays no scan.
+        (install-count-indexes graph))
       graph)))
 
 (defun make-graph (name location &key master-p slave-p master-host
