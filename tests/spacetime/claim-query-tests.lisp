@@ -382,6 +382,11 @@ restored in UNWIND-PROTECT."
                          g2 'ct-claim
                          '(graph-db.spacetime::relation) "likes")))
                  (ignore-errors (close-graph g2 :snapshot-p nil))))
+             ;; Load-bearing order (GH #359): CLOSE-GRAPH deregisters a
+             ;; store from *GRAPHS* before it saves the index sidecar
+             ;; (graph.lisp), so this declaration finds no open graph of
+             ;; the name and builds nothing itself; the index g3 sees is
+             ;; its own open-time build, which is what is asserted.
              (graph-db:def-index ct-claim (graph-db.spacetime::relation)
                  :graph-db-claim-test :name claim-relation)
              (let ((g3 (open-graph *claim-graph-name* path)))

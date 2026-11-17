@@ -6642,7 +6642,11 @@ those. Names come from index membership, which is live: ~:as-of~ and
 ~with-as-of~ extent the listing falls back to the distinct-prefix walk
 of GH #350 -- the only mechanism that can answer at an epoch -- and
 costs what it cost before the counting indexes existed (Chapter 12,
-"Reading as of an epoch"). The ~claim-relation~ secondary index stays
+"Reading as of an epoch"); the extent's ~:if-reaped~ policy applies
+to that walk too, so under the default ~:error~ its confirmation of a
+name can signal ~version-reaped-error~ mid-listing when a claim it
+resolves is past the retention window, where ~:skip~ lists on
+(vivace-graph#359). The ~claim-relation~ secondary index stays
 as that walk's relation source; a family created before the counting
 indexes existed builds them at its next open. On a device, a
 replication pull -- state-sync or an authored pull alike -- marks the

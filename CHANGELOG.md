@@ -30,6 +30,17 @@ between releases; cutting a release renames it to the new version and dates it.
   with the truncated flag. "Every claim with relation R" cost a walk of
   every endpoint before; it costs the matching claims now.
 
+### Fixed
+
+- **`map-index-prefixes` checks its arity and `:start` before reading**
+  (#359): a bad `:arity`, or a `:start` longer than it, on a declared
+  index with no entries answered NIL and signalled only once an entry
+  existed; both signal `query-precondition-error` now, from the slot
+  designator alone. The walk's tests run on the B+ tree backend and on
+  a memory graph as well as the heap skip-list; its docstrings say that
+  prefixes are the stored, canonicalized components, that `:start` is
+  canonicalized the same way, and that K prefixes cost K+1 seeks.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).

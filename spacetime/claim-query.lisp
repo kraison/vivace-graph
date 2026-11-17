@@ -780,6 +780,10 @@ answer; the hand-rolled overlay that once sat here went with GH #411."
       (block walk
         (graph-db:map-index-prefixes
          (lambda (prefix)
+           ;; The raw (FIRST START) against the reported STORED component:
+           ;; on a canonicalizing index the two could differ and the walk
+           ;; would stop on its first prefix.  Claim indexes declare no
+           ;; canonicalizer, so unreachable here (GH #359).
            (when (and start (not (equal (first prefix) (first start))))
              (return-from walk))
            (admit prefix))
