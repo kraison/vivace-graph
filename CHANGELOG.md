@@ -9,6 +9,8 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
+## [Unreleased]
+
 ## [5.0.0] - 2026-11-17
 
 A **MAJOR** release: the spatial contract and two
