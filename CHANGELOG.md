@@ -69,6 +69,14 @@ between releases; cutting a release renames it to the new version and dates it.
   file that defined it, are defined in `globals.lisp` now. None was a
   `let` binding, so nothing behaved differently; the next one would be
   caught before it could.
+- **`not` over a lost derivation is documented and pinned** (#479).
+  A retracted claim stays on record, so a plain `not` over a relation
+  that rules derive stays blocked after the derivation is lost, and
+  `run-rules` agrees. `docs/rules.md` "Two negations" now says so and
+  gives the current-only idiom, `(not (if (claim ...) (claim-current
+  ?r)))`; three tests pin both forms under `:commit` and `:drain
+  :caller`, and that `standing-query-problems` admits both without a
+  reason, which is the call recorded there. No engine change.
 - **`graph-db/core` no longer depends on cl-json** (#462), nor,
   through it, does `graph-db/replication`. `graph-db/query` (the
   pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and

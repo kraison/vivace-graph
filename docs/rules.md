@@ -971,6 +971,29 @@ things (D2 of the forward-rules design,
 Say the second when the store records searches; say the first when
 silence is the only evidence there is.
 
+**A retracted claim is still on record, so it still blocks `not`**
+(#479). Over a relation that rules derive and may lose, that makes
+plain `not` depend on history: once a blocker has ever been derived,
+its retraction (a lost derivation is retracted, never deleted) leaves
+the record in place and the `not` stays false, and `run-rules` agrees,
+so nothing reports it. An author who means "no *current* claim of this
+shape", the stratified-negation reading, writes the test inside the
+negation:
+
+```lisp
+(not (if (claim ?r rt-claim "cell" ?n "rival" "cell" ?m)
+         (claim-current ?r)))
+```
+
+which fires again the moment the blocker is retracted, under
+`run-rules`, `:drain :commit` and `:drain :caller` alike
+(`tests/rules/forward-tests.lisp`, the `nb-` rules pin both forms).
+`standing-query-problems` admits both and gives no reason for the
+plain form over a derived relation: closed-world over the record is a
+legitimate meaning, and the lint cannot know which one the author
+wants. `claim-absent` is neither: it reads a recorded search, not a
+lost derivation.
+
 ## Recursive rules
 
 A rule may read its own head relation, directly or through other
