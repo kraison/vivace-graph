@@ -990,35 +990,67 @@ Returns the count.  Callers prove the probe live with a control."
            *ix-seeks*)
       (remove-method gf method))))
 
+(defun %ix-prefix-walk-assertions (g)
+  "The prefix-walk assertions of spec §2 over G, whichever backend: each
+distinct leading prefix once, in index order, at arity 1 and 2; :START
+begins at the first prefix at or after it.  The hop depends on
+range-cursor start inclusivity, one implementation per backend
+(GH #359)."
+  (with-transaction ()
+    (dolist (row '(("ops" "e1" "at") ("ops" "e1" "by") ("ops" "e2" "at")
+                   ("hr" "p1" "at") ("hr" "p1" "at") ("zz" "q" "at")))
+      (make-ix-claim :ns (first row) :key (second row)
+                     :rel (third row))))
+  (flet ((walk (arity &optional start)
+           (let ((out '()))
+             (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
+                                 '(ns key rel) :arity arity :start start)
+             (nreverse out))))
+    (is (equal '(("hr") ("ops") ("zz")) (walk 1)))
+    (is (equal '(("hr" "p1") ("ops" "e1") ("ops" "e2") ("zz" "q"))
+               (walk 2))
+        "two claims share (hr p1): one prefix")
+    (is (equal '(("hr" "p1" "at") ("ops" "e1" "at") ("ops" "e1" "by")
+                 ("ops" "e2" "at") ("zz" "q" "at"))
+               (walk 3))
+        "full arity: the +max-key+ hop collapses duplicate tuples")
+    (is (equal '(("ops") ("zz")) (walk 1 '("ops"))) ":start inclusive")
+    (is (equal '(("ops" "e1") ("ops" "e2") ("zz" "q"))
+               (walk 2 '("ops")))
+        "a :start shorter than the arity starts at its first prefix")
+    (is (null (walk 1 '("zzz"))) "past the last prefix: nothing")
+    (signals query-precondition-error (walk 4))
+    (signals query-precondition-error (walk 1 '("a" "b")))))
+
 (test map-index-prefixes-reports-each-distinct-prefix-once-in-order
-  "Spec §2: each distinct leading prefix once, in index order, at arity
-1 and 2; :START begins at the first prefix at or after it."
+  "Spec §2 on the heap skip-list backend."
+  (with-ix-graph (g) (%ix-prefix-walk-assertions g)))
+
+(test map-index-prefixes-walks-the-bplus-tree-backend
+  "GH #359: the same walk on the B+ tree backend, whose range cursor is
+its own implementation (%BPT-LEAF-AT)."
+  (with-ix-graph (g :backend :bplus-tree) (%ix-prefix-walk-assertions g)))
+
+(test map-index-prefixes-walks-a-memory-graph
+  "GH #359: the same walk on a memory graph (mem-skip-list.lisp)."
+  (with-ix-memory-graph (g) (%ix-prefix-walk-assertions g)))
+
+(test map-index-prefixes-checks-arity-and-start-before-reading
+  "GH #359: a bad :ARITY or an over-long :START on a declared index with
+no entries signals the same QUERY-PRECONDITION-ERROR it signals once an
+entry exists, instead of answering NIL; the arity comes from the slot
+designator, not from the data."
   (with-ix-graph (g)
-    (with-transaction ()
-      (dolist (row '(("ops" "e1" "at") ("ops" "e1" "by") ("ops" "e2" "at")
-                     ("hr" "p1" "at") ("hr" "p1" "at") ("zz" "q" "at")))
-        (make-ix-claim :ns (first row) :key (second row)
-                       :rel (third row))))
     (flet ((walk (arity &optional start)
-             (let ((out '()))
-               (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
-                                   '(ns key rel) :arity arity :start start)
-               (nreverse out))))
-      (is (equal '(("hr") ("ops") ("zz")) (walk 1)))
-      (is (equal '(("hr" "p1") ("ops" "e1") ("ops" "e2") ("zz" "q"))
-                 (walk 2))
-          "two claims share (hr p1): one prefix")
-      (is (equal '(("hr" "p1" "at") ("ops" "e1" "at") ("ops" "e1" "by")
-                   ("ops" "e2" "at") ("zz" "q" "at"))
-                 (walk 3))
-          "full arity: the +max-key+ hop collapses duplicate tuples")
-      (is (equal '(("ops") ("zz")) (walk 1 '("ops"))) ":start inclusive")
-      (is (equal '(("ops" "e1") ("ops" "e2") ("zz" "q"))
-                 (walk 2 '("ops")))
-          "a :start shorter than the arity starts at its first prefix")
-      (is (null (walk 1 '("zzz"))) "past the last prefix: nothing")
+             (map-index-prefixes #'identity g 'ix-claim '(ns key rel)
+                                 :arity arity :start start)))
+      (is (null (walk 1)) "declared, empty: no prefixes")
       (signals query-precondition-error (walk 4))
-      (signals query-precondition-error (walk 1 '("a" "b"))))))
+      (signals query-precondition-error (walk 0))
+      (signals query-precondition-error (walk 1 '("a" "b")))
+      (signals query-precondition-error
+        (map-index-prefixes #'identity g 'ix-claim '(ns key rel)
+                            :arity 2 :start '("a" "b" "c"))))))
 
 (test map-index-prefixes-seeks-once-per-prefix
   "Spec §2.1: seek-and-skip -- K distinct prefixes cost K+1 seeks

@@ -375,6 +375,63 @@ values -- exactly what an imprecise ingest source time produces."
 
 ;;; --- Retraction: closing the transaction period (GH #162) ---------------
 
+(test reopening-a-retracted-claim-opens-a-fresh-period
+  "GH #396: REOPEN-CLAIM is RETRACT-CLAIM's inverse and its mirror: the
+same fact asserted again later gets a fresh open transaction period
+[AT, open) -- the closed one survives only in MVCC, #148's recorded
+limitation -- in an ambient transaction when one is open, its own
+otherwise; a current claim is left as it is."
+  (with-claim-graph (g)
+    (with-transaction () (make-u-at :subject "s1"
+                                    :recorded-at (ts 2026 1 1)))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (is (eq c (reopen-claim c)) "current already: nothing written")
+      (retract-claim c :at (ts 2026 8 31 12))
+      (let* ((r (first (claims-touching g 'ct-claim :ns "s1")))
+             (again (reopen-claim r :at (ts 2026 9 1)))
+             (e (claim-transaction-extent again)))
+        (is-false (claim-current-p r) "the retracted version")
+        (is-true (claim-current-p again))
+        (is-true (local-time:timestamp= (ts 2026 9 1)
+                                        (bound-earliest (extent-start e)))
+                 "re-opened exactly at AT")
+        (is-false (bound-exact-p (extent-end e)) "and open-ended")
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "s1")))
+            "the same claim, not a second one")
+        (is-true (claim-current-p
+                  (first (claims-touching g 'ct-claim :ns "s1"))))))
+    ;; The extent's transition rule (TRANSACTION-EXTENT-STEP) is judged
+    ;; against the committed version: a reopen before the close is
+    ;; refused; a retract and a reopen of a committed CURRENT claim
+    ;; inside one transaction net to an open-to-open step with a moved
+    ;; start, refused too; from a committed retraction the same sequence
+    ;; nets to a legal closed-to-open step.  Reopening a committed
+    ;; retraction joins an ambient transaction with other writes as a
+    ;; unit.  Every step re-reads the claim: the objects held across a
+    ;; save are earlier versions.
+    (flet ((current-claim ()
+             (first (claims-touching g 'ct-claim :ns "s1"))))
+      (retract-claim (current-claim) :at (ts 2026 9 2))
+      (is-false (claim-current-p (current-claim)) "control: retracted")
+      (signals graph-db:value-constraint-violation
+        (reopen-claim (current-claim) :at (ts 2026 9 1)))
+      (is-false (claim-current-p (current-claim))
+                "a reopen before the close wrote nothing")
+      (with-transaction ()
+        (reopen-claim (current-claim) :at (ts 2026 9 3))
+        (make-u-at :subject "s2" :recorded-at (ts 2026 9 3)))
+      (is-true (claim-current-p (current-claim)))
+      (is (= 1 (length (claims-touching g 'ct-claim :ns "s2"))))
+      (signals graph-db:value-constraint-violation
+        (with-transaction ()
+          (retract-claim (current-claim) :at (ts 2026 9 4))
+          (reopen-claim (current-claim) :at (ts 2026 9 5))))
+      (is-true (local-time:timestamp=
+                (ts 2026 9 3)
+                (bound-earliest (extent-start (claim-transaction-extent
+                                               (current-claim)))))
+               "the refused transaction moved nothing"))))
+
 (test retracting-a-claim-closes-its-period-and-keeps-it
   "GH #162.  A retracted claim is the record of what was believed until
 when: its transaction period closes at AT, the recorded-at start survives,

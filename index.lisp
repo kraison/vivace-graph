@@ -416,16 +416,25 @@ component as +NULL-COMPONENT+, so rows do sit under it.  Gating on the given
 components alone conflated the two and lost those rows (the query-side mirror
 of %INDEX-TUPLE-KEY, GH #107)."
   (let* ((arity (length (slot-index-slot-names six)))
-         (cans (slot-index-canonicalizers six))
-         (vals (if (= arity 1) (list value) value))
-         (any nil)
-         (key (loop for v in vals
-                    for i from 0
-                    collect (cond ((null v) +null-component+)
-                                  (t (setf any t)
-                                     (let ((c (nth i cans)))
-                                       (if c (funcall c v) v)))))))
-    (when (or any (< (length vals) arity)) key)))
+         (vals (if (= arity 1) (list value) value)))
+    (multiple-value-bind (key any)
+        (%canonical-components vals (slot-index-canonicalizers six))
+      (when (or any (< (length vals) arity)) key))))
+
+(defun %canonical-components (vals cans)
+  "VALS as index components: +NULL-COMPONENT+ for a NIL, else the value
+through its position's canonicalizer in CANS, a list with NIL where
+none applies.  Second value true when any component was non-null.  The
+one loop behind %INDEX-TUPLE-KEY, %INDEX-KEY, %COUNT-TUPLE and
+%COUNT-QUERY-KEY (GH #363)."
+  (let ((any nil))
+    (values (loop for v in vals
+                  for i from 0
+                  collect (cond ((null v) +null-component+)
+                                (t (setf any t)
+                                   (let ((c (nth i cans)))
+                                     (if c (funcall c v) v)))))
+            any)))
 
 (defun %index-tuple-key (six node)
   "The value components of NODE's key for SIX: per-position canonicalizer
@@ -433,16 +442,10 @@ applied, +NULL-COMPONENT+ substituted for a null component so the row stays
 findable by a prefix scan of its populated parts.  NIL only when EVERY
 component is null -- nothing to index (the write-side mirror of
 %INDEX-KEY, GH #107)."
-  (let* ((slots (slot-index-slot-names six))
-         (cans  (slot-index-canonicalizers six))
-         (any nil)
-         (key (loop for s in slots
-                    for i from 0
-                    for v = (slot-value node s)
-                    collect (cond ((null v) +null-component+)
-                                  (t (setf any t)
-                                     (let ((c (nth i cans)))
-                                       (if c (funcall c v) v)))))))
+  (multiple-value-bind (key any)
+      (%canonical-components
+       (mapcar (lambda (s) (slot-value node s)) (slot-index-slot-names six))
+       (slot-index-canonicalizers six))
     (when any key)))
 
 (defun %tuple-indexable-p (node slot-names)
@@ -1180,18 +1183,35 @@ One seek, and one step per own id skipped (GH #409)."
         repeat arity
         collect (if (eq v +null-component+) nil v)))
 
+(defun %ix-check-prefix-walk (slot-name arity start)
+  "The preconditions of a prefix walk, from the slot designator alone so
+a declared index with no entries refuses a bad call as a full one does
+(GH #359): ARITY within 1..N, START of at most ARITY components.
+Returns N."
+  (let ((n (length (%normalize-slots slot-name))))
+    (unless (<= 1 arity n)
+      (error 'query-precondition-error
+             :reason (format nil "Index on ~S has arity ~D; cannot ~
+walk prefixes of ~D" (%normalize-slots slot-name) n arity)))
+    (let ((vals (if (listp start) start (list start))))
+      (when (> (length vals) arity)
+        (error 'query-precondition-error
+               :reason (format nil "A :START of ~D component(s) for ~
+a prefix walk at arity ~D" (length vals) arity))))
+    n))
+
 (defun %ix-start-key (six start arity)
-  "START as the canonical key a walk at ARITY begins from: NIL maps to
-+NULL-COMPONENT+ and canonicalizers apply (%INDEX-KEY); the head key
-when START is NIL.  Signals on more than ARITY components."
+  "START as the canonical key a walk at ARITY begins from; the head key
+when START is NIL.  A NIL START and a NIL component are different
+things: the first means the head, the second maps to +NULL-COMPONENT+.
+A list START is always a component tuple, so on an arity-1 index whose
+slot holds lists a list is not one value.  Canonicalizers apply
+(%INDEX-KEY), so START is compared as the stored keys are.
+%IX-CHECK-PREFIX-WALK has refused more than ARITY components."
   (let ((n (length (slot-index-slot-names six))))
     (if (null start)
         (%index-head-key n)
         (let ((vals (if (listp start) start (list start))))
-          (when (> (length vals) arity)
-            (error 'query-precondition-error
-                   :reason (format nil "A :START of ~D component(s) for ~
-a prefix walk at arity ~D" (length vals) arity)))
           (or (%index-key six (if (= n 1) (first vals) vals))
               ;; Full arity, every component null: still a real prefix
               ;; here, unlike an equality lookup (GH #107).
@@ -1202,21 +1222,23 @@ a prefix walk at arity ~D" (length vals) arity)))
                            &key (arity 1) start)
   "Call FN with each distinct leading prefix of ARITY components held by
 the index on CLASS-NAME.SLOT-NAME -- a list, NIL for a null component --
-in index order, once each.  START (a value, or a tuple of at most ARITY
-components) begins at the first prefix at or after it.  One seek per
-distinct prefix, never a scan (GH #350).  Inside an open transaction
-the prefixes are those it will commit: the walk skips its own ids and
-its own nodes' prefixes are merged in, each once (GH #409).  Trap:
-membership is live and a walk is not an atomic snapshot; resolve a
-prefix's nodes when a snapshot or a deletion matters."
+in index order, once each.  The prefixes are the STORED components: on
+an index declared with :CANONICALIZE they are the canonical values, and
+START is canonicalized the same way before the walk begins.  START (a
+value, or a tuple of at most ARITY components) begins at the first
+prefix at or after it.  K distinct prefixes cost K+1 seeks, the last
+the terminating one, never a scan (GH #350).  A bad ARITY or START
+signals QUERY-PRECONDITION-ERROR on an empty index too (GH #359).
+Inside an open transaction the prefixes are those it will commit: the
+walk skips its own ids and its own nodes' prefixes are merged in, each
+once (GH #409).  Trap: membership is live and a walk is not an atomic
+snapshot; resolve a prefix's nodes when a snapshot or a deletion
+matters."
+  (%ix-check-prefix-walk slot-name arity start)
   (let* ((*graph* graph)
          (six (%index-for-read graph class-name slot-name)))
     (when six                   ; NIL => declared but empty => no prefixes
       (let ((n (length (slot-index-slot-names six))))
-        (unless (<= 1 arity n)
-          (error 'query-precondition-error
-                 :reason (format nil "Index on ~S has arity ~D; cannot ~
-walk prefixes of ~D" (slot-index-slot-names six) n arity)))
         (let* ((hi (%index-tail-key n))
                (lo (%ix-start-key six start arity))
                ;; GH #409: the own members at or past LO, in composite

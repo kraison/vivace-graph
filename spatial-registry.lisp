@@ -440,24 +440,28 @@ indexes are CREATED at, not a statement about the existing ones, and OPEN-GRAPH
 documents that they reopen at their own persisted precision.  Were the default to
 count, reopening a graph created with :SPATIAL-PRECISION 5 and merely forgetting
 the keyword would silently re-grid every index in it."
-  ;; The registry is :SYNCHRONIZED, so its lock is held for the whole MAPHASH:
-  ;; collect the KEYS first and resolve the declarations outside, so nothing that
-  ;; can signal (%CHECK-SPATIAL-PRECISION) or otherwise re-enter runs under it.
-  ;; The regenerate below already had to be staged this way for a second reason --
-  ;; REGENERATE-SPATIAL-INDEX remhashes and re-adds its key, and mutating a
-  ;; hash-table under MAPHASH is undefined.
+  (dolist (s (%stale-spatial-indexes graph))
+    (destructuring-bind (owner slot was now) s
+      (log:info "Spatial index ~S.~S declares precision ~D but was written at ~
+                 ~D; rebuilding that index." owner slot now was)
+      (regenerate-spatial-index graph owner slot)))
+  nil)
+
+(defun %stale-spatial-indexes (graph)
+  "GRAPH's spatial indexes whose persisted precision differs from the one
+their slot option declares, as (OWNER SLOT PERSISTED DECLARED) lists; the
+shared half of INSTALL-SPATIAL-INDEXES and its memory-graph twin
+(GH #66).  The registry is :SYNCHRONIZED, so its lock is held for the
+whole MAPHASH: the keys are collected first and the declarations
+resolved outside, so nothing that can signal (%CHECK-SPATIAL-PRECISION)
+or re-enter runs under it, and a caller's REGENERATE, which remhashes
+and re-adds its key, never mutates the table under MAPHASH."
   (let ((entries '()) (stale '()))
     (maphash (lambda (key idx)
                (push (cons key (spatial-index-precision idx)) entries))
              (spatial-indexes graph))
-    (dolist (e entries)
+    (dolist (e entries (nreverse stale))
       (destructuring-bind (key . persisted) e
         (let ((declared (%declared-spatial-precision (car key) (cdr key))))
           (when (and declared (not (eql declared persisted)))
-            (push (list (car key) (cdr key) persisted declared) stale)))))
-    (dolist (s stale)
-      (destructuring-bind (owner slot was now) s
-        (log:info "Spatial index ~S.~S declares precision ~D but was written at ~
-                   ~D; rebuilding that index." owner slot now was)
-        (regenerate-spatial-index graph owner slot))))
-  nil)
+            (push (list (car key) (cdr key) persisted declared) stale)))))))

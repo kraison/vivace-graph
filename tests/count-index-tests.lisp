@@ -20,9 +20,9 @@ is not current."
   :name ix-count-ns-key :current-p ix-live-p)
 (def-count-index ix-claim (rel) :graph-db-index-test :name ix-count-rel)
 
-;; Declared and deliberately never built: nothing builds a count map at
-;; MAKE-GRAPH until Task 4, so this one pins spec §2.5's
-;; declared-but-unbuilt branch (facts G12).  Never pass (ns) to %CIX.
+;; Declared for spec §2.5's declared-but-unbuilt branch (facts G12): the
+;; test that pins it drops the map MAKE-GRAPH installs (GH #363) first.
+;; Never pass (ns) to %CIX.
 (def-count-index ix-claim (ns) :graph-db-index-test :name ix-count-unbuilt)
 
 (defun %cix (g slots)
@@ -47,8 +47,10 @@ declaration the test wants unbuilt."
            g (graph-db::%count-spec-for 'ix-claim slots g)))))
 
 (defun %drop-count-maps (g)
-  "Drop G's built count maps, freeing their heap pages: the state a
-reopened graph is in until Task 4 installs count indexes at open."
+  "Drop G's built count maps, freeing their heap pages: the state of a
+store whose maps nothing has built yet (a pre-#361 sidecar, a lazy
+memory graph), which MAKE-GRAPH and OPEN-GRAPH no longer leave a disk
+graph in (GH #363)."
   (let ((reg (graph-db::count-indexes g)))
     (when reg
       (maphash (lambda (k cix)
@@ -169,13 +171,79 @@ lookup would signal on the arity."
   "Spec §2.5, facts G12: a count index that is declared but has no built
 map answers 0 0 and calls FN zero times rather than signalling -- a lazy
 memory graph forever, and any graph whose maps nothing has built yet
-(the write path builds none, GH #361).  This graph has no writes at all,
-so nothing is stale either.  IX-COUNT-UNBUILT is never given to %CIX."
+(the write path builds none, GH #361).  MAKE-GRAPH installs the maps
+since GH #363, so they are dropped first; this graph has no writes at
+all, so nothing is stale either.  IX-COUNT-UNBUILT is never given to %CIX."
   (with-ix-graph (g)
+    (%drop-count-maps g)
     (is (null (graph-db::%require-count-index g 'ix-claim '(ns)))
         "declared but unbuilt resolves to NIL, it does not signal")
     (is (equal '(0 0) (%count-of g '(ns) "x")))
     (is (null (%entries g '(ns))) "MAP-COUNT-INDEX calls FN zero times")))
+
+(test make-graph-installs-the-declared-count-maps
+  "GH #363: MAKE-GRAPH ran no INSTALL-COUNT-INDEXES, only OPEN-GRAPH did,
+so on a store created in-session the first commit marked the maps stale
+and the first count query paid a full scan.  A fresh graph now holds an
+empty, BUILT map per declaration, as it holds its unique indexes, and
+the first lookup after a commit scans nothing."
+  (with-ix-graph (g)
+    (let ((cix (graph-db::%require-count-index g 'ix-claim '(ns key))))
+      (is-true cix "the map exists at make-graph")
+      (is-true (and cix (graph-db::count-index-built-p cix))))
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (is-false (graph-db::count-indexes-stale-p g)
+              "the commit counted into the map instead of marking stale")
+    (is (= 0 (%count-builds (lambda () (%count-of g '(ns key) '("ops")))))
+        "no scan on the first lookup")
+    (is (equal '(1 1) (%count-of g '(ns key) '("ops"))))))
+
+(defun %count-listing-assertions (g)
+  "GH #363: MAP-COUNT-INDEX's listings on whichever backend G runs: depth
+1 with no prefix; depth 2 with a prefix of exactly DEPTH components (LO
+= HI, one key); depth 2 with no prefix (HI padded with two sentinels)."
+  (with-transaction ()
+    (make-ix-claim :ns "ops" :key "e1" :rel "at")
+    (make-ix-claim :ns "ops" :key "e2" :rel "at")
+    (make-ix-claim :ns "hr" :key "p1" :rel "at"))
+  (is (equal '((("hr") 1 1) (("ops") 2 2)) (%entries g '(ns key))))
+  (is (equal '((("ops" "e1") 1 1))
+             (%entries g '(ns key) :depth 2 :prefix '("ops" "e1")))
+      "a prefix of exactly DEPTH components: one key")
+  (is (equal '((("hr" "p1") 1 1) (("ops" "e1") 1 1) (("ops" "e2") 1 1))
+             (%entries g '(ns key) :depth 2))
+      "depth 2, no prefix: every key"))
+
+(test map-count-index-lists-on-every-backend
+  "GH #363: the listings above on the heap skip-list, the B+ tree
+backend and a memory graph."
+  (with-ix-graph (g) (%count-listing-assertions g))
+  (with-ix-graph (g :backend :bplus-tree) (%count-listing-assertions g))
+  (with-ix-memory-graph (g) (%count-listing-assertions g)))
+
+(test a-count-index-canonicalizer-keys-apart-from-the-secondary-index
+  "GH #363: :CANONICALIZE on a count index was accepted but untested, and
+the coexistence fixture had only lowercase values, so the two kinds'
+canonicalizers could not be told apart.  One uppercase key: the count
+index declared with STRING-DOWNCASE folds \"E1\" and \"e1\" into one
+counter, the secondary index on the same owner keeps them apart."
+  (with-ix-graph (g)
+    (unwind-protect
+         (progn
+           (def-count-index ix-claim (key rel) :graph-db-index-test
+             :name ix-count-key-rel :canonicalize string-downcase)
+           (with-transaction ()
+             (make-ix-claim :ns "ops" :key "E1" :rel "at")
+             (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+           (is (equal '(2 nil) (%count-of g '(key rel) '("e1"))))
+           (is (equal '(2 nil) (%count-of g '(key rel) '("E1")))
+               "the query side canonicalizes too")
+           (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel)
+                                          '("ops" "E1") :prefix t)))
+               "the secondary index on the same owner is case-sensitive"))
+      (undef-count-index ix-claim :graph-db-index-test
+                         :name ix-count-key-rel))))
 
 (test count-adjust-crosses-a-serialization-boundary
   "Facts G5: SERIALIZE's integer width grows at 256 and at 65536; the

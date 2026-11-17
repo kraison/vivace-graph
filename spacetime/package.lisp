@@ -63,6 +63,7 @@
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
    #:claim-current-p #:retract-claim                   ; GH #162
+   #:reopen-claim                                     ; GH #396
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:claims-by-relation                               ; GH #448
