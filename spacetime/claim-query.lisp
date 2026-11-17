@@ -576,13 +576,32 @@ CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
+  (%claims-by-index graph claim-class '(producer) producer
+                    limit offset as-of as-of-epoch))
+
+(defun claims-by-relation (graph claim-class relation
+                           &key limit offset as-of as-of-epoch)
+  "Every claim of CLAIM-CLASS (the PARENT; both arities) whose relation is
+RELATION, a canonical string, retracted claims included; NIL when none
+carries it.  The twin of CLAIMS-BY-PRODUCER over the (relation) index
+every family declares (GH #350), so the cost is the matching claims, not
+the store: the same :AS-OF / :AS-OF-EPOCH resolution, the same :LIMIT /
+:OFFSET with the truncated flag as the second value, and
+UNKNOWN-CLAIM-FAMILY for an unregistered class (GH #448)."
+  (%claims-by-index graph claim-class '(relation) relation
+                    limit offset as-of as-of-epoch))
+
+(defun %claims-by-index (graph claim-class slots key
+                         limit offset as-of as-of-epoch)
+  "CLAIMS-BY-PRODUCER and CLAIMS-BY-RELATION: the family's claims filed
+under KEY in its secondary index on SLOTS, resolved and paged."
   (check-type as-of-epoch (or null unsigned-byte))
   (when (and as-of as-of-epoch)
     (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
   (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((family (claim-family claim-class))
          (all (graph-db:index-lookup graph (claim-family-parent family)
-                                     '(producer) producer)))
+                                     slots key)))
     (cond (as-of
            (setf all (loop for c in all
                            for v = (%claim-as-of graph c as-of)

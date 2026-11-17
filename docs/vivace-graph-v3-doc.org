@@ -6365,7 +6365,13 @@ candidates. A family also declares a fifth index, ~claim-relation~ on
 the second return value is ~T~ exactly when more claims existed past the
 cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
-~claims-by-producer~ paginates the same way (vivace-graph#302).
+~claims-by-producer~ paginates the same way (vivace-graph#302), and so
+does ~claims-by-relation~ (vivace-graph#448), its twin over the
+~claim-relation~ index: every claim of the family carrying one relation,
+both arities, retracted claims included, with the same ~:as-of~ /
+~:as-of-epoch~ resolution. Before it, "every claim with relation R"
+cost a walk of every endpoint; a service polling the newest stamp among
+240 such claims paid for 9,423 at each call.
 
 ~claim-touched-at~ (a claim) is the instant its transaction record last
 changed: the retraction when retracted, else the recording; ~NIL~ for a
@@ -6612,6 +6618,7 @@ indexes, in index order, without walking its claims:
   (claim-namespaces graph 'site-claim)                 ; (:device :sym ...)
   (claim-namespaces graph 'site-claim :role :object :counts t)
   (claim-relations graph 'site-claim :counts t)        ; (("wifi-drop" . 12) ...)
+  (claims-by-relation graph 'site-claim "wifi-drop")   ; the 12 claims themselves
   (claim-keys graph 'site-claim :device :limit 50)     ; ("d1" "d42" ...), more-p
 #+END_SRC
 

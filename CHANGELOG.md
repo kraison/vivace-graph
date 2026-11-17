@@ -23,6 +23,12 @@ between releases; cutting a release renames it to the new version and dates it.
   the engine read an older snapshot, yet nothing deleted one: a store
   that closed at every deploy had 68 of them, 21 GB of a 22 GB
   directory.
+- **`claims-by-relation`** (#448): the exported reader of the
+  `(relation)` index every claim family has carried since #350, the twin
+  of `claims-by-producer`: both arities, retracted claims included, the
+  same `:as-of` / `:as-of-epoch` resolution and `:limit` / `:offset`
+  with the truncated flag. "Every claim with relation R" cost a walk of
+  every endpoint before; it costs the matching claims now.
 
 ### Security
 
