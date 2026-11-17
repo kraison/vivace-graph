@@ -255,7 +255,7 @@ GH #255.)
   7142/s (4545, 7142), `two-hop-claims-touching` 3571/s (3390, 3448),
   `two-hop-related` 905/s (803, 930), `claim-sweep-backfill` 24.2 s
   (24.5, 23.4). Every emitted edge paid two endpoint lookups.
-- **#373, after**: `results/perf-after-373-odm-ac77d49.report`, same
+- **#373, after**: `results/perf-after-373-odm-f4b0c1b.report`, same
   host, 2026-11-17, third of three runs: `two-hop-node-claims` 5000/s
   (5128, 4878), `two-hop-claim-endpoint` 6666/s (6451, 6896),
   `two-hop-claims-touching` 2500/s (3571, 3390), `two-hop-related`
