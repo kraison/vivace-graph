@@ -29,6 +29,8 @@
                :cl-fad
                :local-time
                :ieee-floats
+               ;; No :cl-json: no core file reads or writes JSON; graph-db/query
+               ;; and graph-db declare it where they use it (GH #462).
                ;; log4cl's compile-time machinery breaks ECL cross-compilation;
                ;; the Android core build sets :graph-db-stub-log and uses the
                ;; no-op log-stub instead.  Desktop/SBCL keeps real log4cl.
@@ -92,7 +94,7 @@
                (:file "type-index" :depends-on ("vev-index"))
                (:file "graph" :depends-on
                       ("ve-index" "vev-index" "type-index" "linear-hash" "allocator"
-                                  "spatial-index" "posix"))
+                       "spatial-index" "posix"))
                (:file "stats" :depends-on ("graph"))
                ;; "type-registry" for ASSIGN-TYPE-ID / ENSURE-TYPE-REGISTRY
                ;; (#186); it only built before because that component happens
@@ -136,7 +138,7 @@
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
                       ("schema" "edge" "vertex" "views" "transactions"
-                                "tx-overlay"))
+                       "tx-overlay"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
@@ -226,9 +228,9 @@ directly, web-free (GH #322)."
   :components ((:file "package") (:file "suite") (:file "guard-tests")
                (:file "compiled-cache-tests"))
   :perform (test-op (op c)
-                    (unless (uiop:symbol-call :graph-db/query-test
-                                              :run-query-tests)
-                      (error "graph-db query tests failed."))))
+             (unless (uiop:symbol-call :graph-db/query-test
+                                       :run-query-tests)
+               (error "graph-db query tests failed."))))
 
 ;; Rules as versioned producers (GH #304): S1 makes claims Prolog facts.
 (defsystem graph-db/rules
@@ -259,9 +261,9 @@ docs/rules.md; GH #304."
                (:file "scope-tests") (:file "forward-tests")
                (:file "explain-tests"))
   :perform (test-op (op c)
-                    (unless (uiop:symbol-call :graph-db/rules-test
-                                              :run-rules-tests)
-                      (error "graph-db rules tests failed."))))
+             (unless (uiop:symbol-call :graph-db/rules-test
+                                       :run-rules-tests)
+               (error "graph-db rules tests failed."))))
 
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
@@ -309,7 +311,7 @@ and read-only neighborhood exploration."
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
   :depends-on (:graph-db :ningle :clack :cl-json :lack-component
-                         :flexi-streams)
+               :flexi-streams)
   :pathname "gui/"
   :serial t
   :components ((:file "package")
@@ -382,8 +384,8 @@ and read-only neighborhood exploration."
                (:file "isolation-tests")
                (:file "durability-tests"))
   :perform (test-op (op c)
-                    (unless (uiop:symbol-call :graph-db/acid-test :run-acid-tests)
-                      (error "graph-db ACID tests failed."))))
+              (unless (uiop:symbol-call :graph-db/acid-test :run-acid-tests)
+                (error "graph-db ACID tests failed."))))
 
 (defsystem graph-db/stress-test
   :name "VivaceGraph stress test suite"
@@ -407,7 +409,7 @@ and read-only neighborhood exploration."
   :name "VivaceGraph concurrent stress test suite"
   :description "Multi-threaded scale and stability tests for graph-db."
   :depends-on (:graph-db :graph-db/test-scratch :fiveam
-                         :bordeaux-threads)
+               :bordeaux-threads)
   :pathname "tests/concurrent-stress/"
   :serial t
   :components ((:file "package")
@@ -429,7 +431,7 @@ and read-only neighborhood exploration."
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
   :depends-on (:graph-db :graph-db/spacetime :graph-db/rules
-                         :graph-db/test-scratch :bordeaux-threads)
+               :graph-db/test-scratch :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
@@ -457,7 +459,7 @@ and read-only neighborhood exploration."
   ;; fbound, so the profiler registered a single :GEOS function and the
   ;; real-world coverage workload could not run at all.
   :depends-on (:graph-db :graph-db/geos :cl-ppcre :alexandria :parse-float
-                         :cl-typesetting :cl-pdf :cl-pdf-parser)
+               :cl-typesetting :cl-pdf :cl-pdf-parser)
   :pathname "profiling/"
   :serial t
   :components ((:file "package")
@@ -560,7 +562,7 @@ and read-only neighborhood exploration."
   :name "VivaceGraph GEOS test suite"
   :description "FiveAM tests for the optional GEOS integration."
   :depends-on (:graph-db/geos :graph-db/test-scratch :fiveam
-                              :bordeaux-threads)
+               :bordeaux-threads)
   :pathname "tests/geos/"
   :serial t
   :components ((:file "package")
@@ -586,7 +588,7 @@ and read-only neighborhood exploration."
   :description "The claim record and source-onboarding contract over
 cl-temporal-extent."
   :depends-on (:graph-db/core :local-time
-                              (:version :cl-temporal-extent "0.3.0"))
+               (:version :cl-temporal-extent "0.3.0"))
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")
@@ -626,7 +628,7 @@ cl-temporal-extent."
   ;; GRAPH-DB/QUERY: endpoint-edge-tests.lisp drives RELATED/3 and
   ;; CLAIMED/4 through RUN-GUARDED-PROLOG (GH #369, spec sec.6.3).
   :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos
-                                   :graph-db/query :graph-db/test-scratch :fiveam)
+               :graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -660,7 +662,7 @@ cl-temporal-extent."
   ;; :graph-db/perf-test is load-only here: perf/check-tests exercises the
   ;; pure check-perf comparison logic (GH #253); no benchmark ever runs.
   :depends-on (:graph-db :graph-db/test-scratch :graph-db/perf-test
-                         :fiveam :drakma)
+               :fiveam :drakma)
   :pathname "tests/"
   :serial t
   :components ((:file "package")
