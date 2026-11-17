@@ -7042,6 +7042,18 @@ is ~nil~ for it, and ~claims-touching~ returns it unless called with
 start is not fabricated. Retracting twice is a no-op: a daily sweep must
 not walk the end forward.
 
+~reopen-claim~ is its inverse (vivace-graph#396): the same fact asserted
+again later gets a fresh open period ~[at, open)~, the closed one
+surviving only in version history. It is what ~register-node~ and the
+rules engine do internally when an identity tuple's retracted claim is
+asserted again, exported for a tenant's own idempotent upsert. A
+current claim is left as it is, and like ~retract-claim~ it joins an
+ambient transaction. The extent's transition rule is judged against the
+committed version at commit: ~:at~ may not precede the retraction, and a
+retract and a reopen of a committed *current* claim inside a single
+transaction are refused as a moved start, so reopen a retraction that
+has committed.
+
 Why transaction time and not validity time: registration derives from
 the subject's *current* geometry and cannot tell a correction ("it was
 never there") from a move ("it was there until T"). "We no longer derive

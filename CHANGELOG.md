@@ -23,6 +23,13 @@ between releases; cutting a release renames it to the new version and dates it.
   the engine read an older snapshot, yet nothing deleted one: a store
   that closed at every deploy had 68 of them, 21 GB of a 22 GB
   directory.
+- **`reopen-claim`** (#396): `retract-claim`'s inverse, exported from
+  `graph-db.spacetime`: a fresh open transaction period at `:at`
+  (default now) for a retracted claim, the way `register-node` and the
+  rules engine re-open one; a current claim is left as it is; joins an
+  ambient transaction. `:at` may not precede the retraction, and a
+  retract and a reopen of a committed current claim in one transaction
+  are refused by the extent's transition rule.
 - **`claims-by-relation`** (#448): the exported reader of the
   `(relation)` index every claim family has carried since #350, the twin
   of `claims-by-producer`: both arities, retracted claims included, the

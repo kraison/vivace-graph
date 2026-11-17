@@ -154,9 +154,11 @@ cache is refreshed by its commit."
                                :relation "runs")
         :key #'claim-object-key :test #'string=))
 
-(defun reopen-claim (g claim)
+(defun reopen-claim-in (g claim)
   "CLAIM asserted again: its transaction period re-opened as of now, in
-its own transaction.  Returns nothing."
+its own transaction on G.  Returns nothing.  Not named REOPEN-CLAIM:
+that is the exported function since GH #396, and this package uses
+GRAPH-DB.SPACETIME, so a DEFUN of that name here would redefine it."
   (with-transaction ((graph-db::transaction-manager g))
     (let ((c (copy (graph-db:lookup-vertex (graph-db:id claim)))))
       (setf (claim-transaction-extent-sexp c)
@@ -206,7 +208,7 @@ store at the fixpoint."
           (before (graph-db:id (derived-object g "web-hosts" "h2"))))
       (retract-claim premise)
       (is (null (derived-object g "web-hosts" "h2")))
-      (reopen-claim g premise)
+      (reopen-claim-in g premise)
       (let ((after (derived-object g "web-hosts" "h2")))
         (is (not (null after)))
         (when after
@@ -1533,7 +1535,7 @@ instantiation is unchanged, delivers nothing."
         (let ((before (guarded-rows *recorded-at-body* g)))
           (sleep 1.1)
           (retract-claim (up-claim-by g "h1" "scan-t"))
-          (reopen-claim g (up-claim-by g "h1" "scan-t"))
+          (reopen-claim-in g (up-claim-by g "h1" "scan-t"))
           (is (= 1 (length before)))
           (is (not (equal before (guarded-rows *recorded-at-body* g))))
           (is (= 1 (length (matches "rec"))))

@@ -554,6 +554,30 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (graph-db::*transaction* (%retract))
           (t (graph-db:with-transaction () (%retract))))))
 
+(defun reopen-claim (claim &key (at (%st-now)))
+  "Open a fresh transaction period for CLAIM at AT, [AT, open): the same
+fact asserted again later, RETRACT-CLAIM's inverse (GH #396).  The
+closed period it replaces survives only in MVCC, the #148 design's
+recorded limitation (no retention of superseded periods).  A current
+claim is left as it is.  JOINS an ambient transaction when one is open
+and opens its own otherwise, as RETRACT-CLAIM does.  Trap: the extent's
+transition rule (TRANSACTION-EXTENT-STEP) is judged against the
+COMMITTED version at commit, so AT must be no earlier than the
+retraction, and a retract and a reopen of a committed CURRENT claim
+inside one transaction net to a moved start and are refused; reopen a
+retraction that has committed.  Returns the saved copy, or CLAIM itself when
+nothing was written.  REGISTER-NODE and the rules engine re-open this
+way themselves."
+  (flet ((%reopen ()
+           (let ((c (graph-db:copy claim)))
+             (setf (claim-transaction-extent-sexp c)
+                   (extent->sexp (%open-transaction-extent at)))
+             (graph-db:save c)
+             c)))
+    (cond ((claim-current-p claim) claim)
+          (graph-db::*transaction* (%reopen))
+          (t (graph-db:with-transaction () (%reopen))))))
+
 (defun claims-by-producer (graph claim-class producer
                            &key limit offset as-of as-of-epoch)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
