@@ -41,6 +41,15 @@ between releases; cutting a release renames it to the new version and dates it.
   prefixes are the stored, canonicalized components, that `:start` is
   canonicalized the same way, and that K prefixes cost K+1 seeks.
 
+- **A memory graph re-grids a spatial index whose declared precision
+  changed** (#66): `open-memory-graph` compares each restored index's
+  persisted precision with its slot's `:spatial-precision` and, when one
+  differs, runs the lazy-aware spatial rebuild of #65, which materializes
+  only the geometry-bearing classes' nodes. The on-disk backend has done
+  this since 3.0.0; a memory index reopened at its persisted precision and
+  over-covered at the old grid, correct but slower. Lazy and eager opens
+  alike.
+
 ### Security
 
 - **A REST login no longer hands the password to `/bin/sh`** (#461).
