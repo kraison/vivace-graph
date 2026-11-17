@@ -74,9 +74,14 @@ so their touched instants differ (%ST-NOW is monotonic)."
            (cursor (claim-touched-at k2)))
       (is (equalp (list (id k3))
                   (mapcar #'id (claims-touched-after g 'ct-claim cursor))))
+      ;; Nanosecond precision: %ST-NOW separates two claims recorded in
+      ;; one clock tick by a nanosecond (a whole second on ECL), and a
+      ;; cursor spelt to microseconds would fall before K2 (#494).
       (let ((text (local-time:format-timestring
                    nil cursor
-                   :format local-time:+rfc3339-format+
+                   :format '((:year 4) #\- (:month 2) #\- (:day 2) #\T
+                             (:hour 2) #\: (:min 2) #\: (:sec 2) #\.
+                             (:nsec 9) #\Z)
                    :timezone local-time:+utc-zone+)))
         (is (equalp (list (id k3))
                     (mapcar #'id (claims-touched-after
