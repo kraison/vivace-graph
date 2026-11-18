@@ -2931,9 +2931,12 @@ RUN-RULES is quiet."
       (let ((report (graph-db.rules:run-rule g "flag")))
         (is (= 2 (graph-db.rules:rule-report-kept report)))
         (is (zerop (graph-db.rules:rule-report-derived report))))
-      (is (equal ids
-                 (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
-                       #'string< :key #'princ-to-string)))
+      ;; EQUALP: ids are byte vectors, and EQUAL on vectors is identity;
+      ;; the node cache made EQUAL pass on SBCL by handing back the same
+      ;; objects, and ECL re-read the claims after the re-open (GH #497).
+      (is (equalp ids
+                  (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
+                        #'string< :key #'princ-to-string)))
       (is (= 2 (length (derived g 'rt-claim "alarm"))))
       (is (= 4 (length (matches "watch" :added))))
       (is (= 2 (length (producer-records g "rule/flag"))))
