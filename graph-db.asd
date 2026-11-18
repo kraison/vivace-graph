@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -184,7 +184,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -205,7 +205,7 @@
 web-free.  docs/guarded-query.md; GH #322."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/core
                :cl-json)
   :pathname "query/"
@@ -222,7 +222,7 @@ web-free.  docs/guarded-query.md; GH #322."
 directly, web-free (GH #322)."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/query/"
   :serial t
@@ -240,7 +240,7 @@ directly, web-free (GH #322)."
 docs/rules.md; GH #304."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
@@ -275,7 +275,7 @@ docs/rules.md; GH #304."
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/replication
                :graph-db/query
                :cl-json
@@ -308,7 +308,7 @@ docs/rules.md; GH #304."
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
