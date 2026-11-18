@@ -125,11 +125,19 @@ the short replies of htpasswd and openssl, not a chatty program."
          (let ((in (uiop:process-info-input process)))
            (write-string secret in)
            (terpri in)
-           (close in)
+           (finish-output in)
+           ;; ECL hands back ONE two-way stream for both directions, and
+           ;; CLOSE on a two-way stream closes neither component, so the
+           ;; child never saw EOF and `openssl passwd -stdin` never
+           ;; answered (GH #497).  Close the half that is its stdin.
+           (close (if (typep in 'two-way-stream)
+                      (two-way-stream-output-stream in)
+                      in))
            (values (uiop:slurp-stream-string
                     (uiop:process-info-output process))
-                   (uiop:slurp-stream-string
-                    (uiop:process-info-error-output process))
+                   ;; No separate stderr stream on ECL: NIL here.
+                   (let ((err (uiop:process-info-error-output process)))
+                     (if err (uiop:slurp-stream-string err) ""))
                    (uiop:wait-process process)))
       (uiop:close-streams process))))
 
