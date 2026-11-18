@@ -84,6 +84,18 @@ suite's fast tier and every other lane in full (see below).
   for `perf/check-tests`, and that system's `bench-claim-linking` needs
   a claim family -- so the main lane needs those deps resolvable; it
   runs no gui test, so the inventory tripwire is unaffected.
+- **The build must raise no full warning** (GH #439).  Before the
+  suites, `tests/check-build-warnings.sh` compiles `graph-db`,
+  `graph-db/spacetime`, `graph-db/rules`, `graph-db/gui` and
+  `graph-db/algorithms-io` from a clean FASL cache in a fresh SBCL and
+  fails on any `WARNING` from this tree that is not a `STYLE-WARNING`:
+  an undefined variable or function, a type conflict, a redefinition.
+  The suites load with warnings muted (`ql:quickload :silent t`), which
+  is how an undefined-variable warning lived unseen from a333102 until
+  a CCL lane found it (#435); an undefined *variable* is also the sign
+  of CLAUDE.md's #92 trap, a special read or bound in a file compiled
+  before its `defvar`.  Run it by hand after moving a file in
+  `graph-db.asd`'s chain or adding a special: it takes about a minute.
 - The geos lane needs `libgeos_c` on the runner host; the suite
   SKIPS (green) where it is absent, so a green geos lane on a
   bare host proves nothing -- keep the library installed.

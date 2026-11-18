@@ -844,6 +844,57 @@ it was RESTORED from the sidecar, not repopulated from live nodes")
             ((extent :type geometry :index t :spatial-precision 6))
             :graph-db-integration-test))))))
 
+(defun %mem-regrid-assertions (lazy)
+  "GH #66: a memory graph reopened under a changed :SPATIAL-PRECISION
+declaration re-grids that index at open, as the on-disk backend has
+since 3.0.0, through the lazy-aware rebuild of GH #65; an index nobody
+redeclared keeps its persisted precision.  LAZY opens with fault-on-access
+nodes, which the rebuild materializes only for geometry-bearing classes."
+  (handler-bind ((warning #'muffle-warning))
+    (with-temp-directory (dir)
+      (let ((path (namestring dir)) zone-id)
+        (let ((g (graph-db::make-memory-graph *integration-graph-name* path)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq zone-id (id (make-scope-restale
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0))))
+              (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
+            (is (= 6 (spatial-index-precision
+                      (spatial-index-for g 'scope-restale 'extent))))
+            (close-graph g)))
+        (unwind-protect
+             (progn
+               (def-vertex scope-restale ()
+                 ((extent :type geometry :index t :spatial-precision 5))
+                 :graph-db-integration-test)
+               (let ((g (graph-db::open-memory-graph *integration-graph-name*
+                                                     path :lazy lazy)))
+                 (unwind-protect
+                      (let ((*graph* g)
+                            (zone-ix (spatial-index-for g 'scope-restale
+                                                        'extent)))
+                        (is (= 5 (spatial-index-precision zone-ix))
+                            "the memory index adopted the declared precision")
+                        (is (has-p zone-id
+                                   (spatial-index-query-bbox
+                                    zone-ix 10d0 42d0 11d0 43d0))
+                            "and holds the zone at the new grid")
+                        (is (= 7 (spatial-index-precision
+                                  (spatial-index-for g 'scope-probe 'geom)))
+                            "the undeclared index keeps its precision"))
+                   (close-graph g :snapshot-p nil)
+                   (collect-garbage))))
+          (def-vertex scope-restale ()
+            ((extent :type geometry :index t :spatial-precision 6))
+            :graph-db-integration-test))))))
+
+(test a-memory-index-adopts-a-changed-precision-at-open
+  (%mem-regrid-assertions nil))
+
+(test a-lazy-memory-index-adopts-a-changed-precision-at-open
+  (%mem-regrid-assertions t))
+
 (test graph-default-precision-does-not-rebuild-a-persisted-index
   "The graph default is the precision for indexes CREATED after the open, not a
 declaration ABOUT the existing ones: reopening without :SPATIAL-PRECISION (so, at

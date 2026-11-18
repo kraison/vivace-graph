@@ -154,9 +154,11 @@ cache is refreshed by its commit."
                                :relation "runs")
         :key #'claim-object-key :test #'string=))
 
-(defun reopen-claim (g claim)
+(defun reopen-claim-in (g claim)
   "CLAIM asserted again: its transaction period re-opened as of now, in
-its own transaction.  Returns nothing."
+its own transaction on G.  Returns nothing.  Not named REOPEN-CLAIM:
+that is the exported function since GH #396, and this package uses
+GRAPH-DB.SPACETIME, so a DEFUN of that name here would redefine it."
   (with-transaction ((graph-db::transaction-manager g))
     (let ((c (copy (graph-db:lookup-vertex (graph-db:id claim)))))
       (setf (claim-transaction-extent-sexp c)
@@ -206,7 +208,7 @@ store at the fixpoint."
           (before (graph-db:id (derived-object g "web-hosts" "h2"))))
       (retract-claim premise)
       (is (null (derived-object g "web-hosts" "h2")))
-      (reopen-claim g premise)
+      (reopen-claim-in g premise)
       (let ((after (derived-object g "web-hosts" "h2")))
         (is (not (null after)))
         (when after
@@ -1533,7 +1535,7 @@ instantiation is unchanged, delivers nothing."
         (let ((before (guarded-rows *recorded-at-body* g)))
           (sleep 1.1)
           (retract-claim (up-claim-by g "h1" "scan-t"))
-          (reopen-claim g (up-claim-by g "h1" "scan-t"))
+          (reopen-claim-in g (up-claim-by g "h1" "scan-t"))
           (is (= 1 (length before)))
           (is (not (equal before (guarded-rows *recorded-at-body* g))))
           (is (= 1 (length (matches "rec"))))
@@ -2929,9 +2931,12 @@ RUN-RULES is quiet."
       (let ((report (graph-db.rules:run-rule g "flag")))
         (is (= 2 (graph-db.rules:rule-report-kept report)))
         (is (zerop (graph-db.rules:rule-report-derived report))))
-      (is (equal ids
-                 (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
-                       #'string< :key #'princ-to-string)))
+      ;; EQUALP: ids are byte vectors, and EQUAL on vectors is identity;
+      ;; the node cache made EQUAL pass on SBCL by handing back the same
+      ;; objects, and ECL re-read the claims after the re-open (GH #497).
+      (is (equalp ids
+                  (sort (mapcar #'graph-db:id (derived g 'rt-claim "flag"))
+                        #'string< :key #'princ-to-string)))
       (is (= 2 (length (derived g 'rt-claim "alarm"))))
       (is (= 4 (length (matches "watch" :added))))
       (is (= 2 (length (producer-records g "rule/flag"))))
@@ -3052,3 +3057,78 @@ compiled the second time, deriving the same claims."
       (is (plusp (getf stats :compiles)))
       (is (plusp (getf stats :hits)))
       (is (= 2 (length (derived g 'rt-claim "web-hosts")))))))
+
+;;; A not over a derived relation after the derivation is lost (GH #479)
+
+(defparameter *nb-flagged-head*
+  "(claim ?c rt-claim \"host\" ?h \"nb-flagged\" nil nil)")
+(defparameter *nb-flagged-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"db\") (claim-current ?p)")
+(defparameter *nb-clean-head*
+  "(claim ?c rt-claim \"host\" ?h \"nb-clean\" nil nil)")
+(defparameter *nb-clean-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (claim-current ?p)
+   (not (claim ?r rt-claim \"host\" ?h \"nb-flagged\" nil nil))")
+(defparameter *nb-clean-now-head*
+  "(claim ?c rt-claim \"host\" ?h \"nb-clean-now\" nil nil)")
+(defparameter *nb-clean-now-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (claim-current ?p)
+   (not (if (claim ?r rt-claim \"host\" ?h \"nb-flagged\" nil nil)
+            (claim-current ?r)))")
+
+(defun nb-hosts (g name)
+  (sort (mapcar #'claim-subject-key (derived g 'rt-claim name)) #'string<))
+
+(defun not-over-a-lost-derivation (g &rest enable-args)
+  "GH #479.  NB-FLAGGED is derived from h1's \"runs db\"; NB-CLEAN says
+plain NOT over it, NB-CLEAN-NOW the current-only form.  Retracting the
+premise retracts the derivation, which stays on record: plain NOT stays
+blocked for h1, the IF form fires.  RUN-RULES agrees with both after
+each commit, so nothing else reports the difference."
+  (write-rule g :name "nb-flagged" :version "1" :family "rt-claim"
+                :head *nb-flagged-head* :body *nb-flagged-body*)
+  (write-rule g :name "nb-clean" :version "1" :family "rt-claim"
+                :head *nb-clean-head* :body *nb-clean-body*)
+  (write-rule g :name "nb-clean-now" :version "1" :family "rt-claim"
+                :head *nb-clean-now-head* :body *nb-clean-now-body*)
+  (apply #'graph-db.rules:enable-forward-rules g enable-args)
+  (flet ((settle ()
+           (when (eq (getf enable-args :drain) :caller)
+             (graph-db.rules:forward-step g))))
+    (seed g)                            ; h1 runs db: flagged
+    (settle)
+    (is (equal '("h1") (nb-hosts g "nb-flagged")))
+    (is (equal '("h2") (nb-hosts g "nb-clean")))
+    (is (equal '("h2") (nb-hosts g "nb-clean-now")))
+    (is-true (run-rules-is-quiet g))
+    (retract-claim (find "db" (claims-touching g 'rt-claim :host "h1"
+                                               :role :subject
+                                               :relation "runs")
+                         :key #'claim-object-key :test #'string=))
+    (settle)
+    (is (null (nb-hosts g "nb-flagged")) "the derivation is lost")
+    (is-false (claim-current-p
+               (derived-subject g "nb-flagged" "h1" :current nil))
+              "lost by retraction: still on record")
+    (is (equal '("h2") (nb-hosts g "nb-clean"))
+        "plain NOT still sees the retracted record")
+    (is (equal '("h1" "h2") (nb-hosts g "nb-clean-now"))
+        "the current-only form fires for h1")
+    (is-true (run-rules-is-quiet g))))
+
+(test plain-not-over-a-lost-derivation-stays-blocked-the-if-form-fires
+  (with-rules-graph (g)
+    (not-over-a-lost-derivation g)))
+
+(test plain-not-over-a-lost-derivation-under-drain-caller
+  (with-rules-graph (g)
+    (not-over-a-lost-derivation g :drain :caller)))
+
+(test standing-query-problems-on-both-negation-forms
+  "GH #479: the call recorded in docs/rules.md, Two negations: plain NOT
+over a derived relation is admitted without a reason, and so is the
+current-only IF form."
+  (with-rules-graph (g)
+    (is (null (graph-db.rules:standing-query-problems *nb-clean-body* g)))
+    (is (null (graph-db.rules:standing-query-problems *nb-clean-now-body*
+                                                      g)))))

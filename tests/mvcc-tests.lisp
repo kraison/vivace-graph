@@ -923,6 +923,76 @@ query run at E; both together is a macroexpansion-time error."
         (macroexpand-1 '(select (:snapshot t :as-of 1) (?p)
                           (is-a ?p g-person)))))))
 
+(test if-reaped-skip-on-every-per-call-read-path
+  "GH #356: :IF-REAPED :SKIP was exercised only through WITH-AS-OF on a
+lookup.  The per-call paths take it too -- LOOKUP-VERTEX, LOOKUP-EDGE,
+MAP-VERTICES and SELECT :AS-OF -- each answering nothing for the reaped
+version instead of signalling; an absent node (revision 0 at the epoch)
+is NIL without counting; and the counter counts READS, not nodes, as
+docs/time-travel.md says: two reads of one reaped id count 2."
+  (with-kept-graph (g 1)
+    (let (id eid later e1)
+      (setq e1 (%epoch-of
+                (lambda ()
+                  (let ((a (make-g-person :name "p" :age 0))
+                        (b (make-g-person :name "q" :age 0)))
+                    (setq id (id a)
+                          eid (id (make-g-knows :from a :to b :since 0)))))))
+      (with-transaction ()
+        (setq later (id (make-g-person :name "later" :age 9))))
+      (dotimes (i 3) (bump-age id (1+ i)) (bump-since eid (1+ i)))
+      (signals version-reaped-error (lookup-vertex id :as-of e1))
+      (is (null (lookup-vertex id :as-of e1 :if-reaped :skip)))
+      (is (null (lookup-edge eid :as-of e1 :if-reaped :skip)))
+      (is (equal '("q") (map-vertices (lambda (v) (slot-value v 'name)) g
+                                      :collect-p t :vertex-type 'g-person
+                                      :as-of e1 :if-reaped :skip))
+          "the reaped vertex is skipped by the typed scan, q stays")
+      (is (null (select (:as-of e1 :if-reaped :skip :flat t) (?n)
+                  (is-a ?p g-person) (node-slot-value ?p name ?n)
+                  (= ?n "p")))
+          "and by SELECT")
+      (with-as-of ((g) e1 :if-reaped :skip)
+        (is (null (lookup-vertex later)) "absent at E1: NIL")
+        (is (= 0 (as-of-skipped-count g)) "an absence is not a skip")
+        (lookup-vertex id)
+        (lookup-vertex id)
+        (is (= 2 (as-of-skipped-count g)) "reads, not nodes")))))
+
+(test latest-epoch-refuses-a-graph-without-version-history
+  "GH #356: LATEST-EPOCH on a graph with no transaction manager signalled
+UNBOUND-SLOT, and on a memory graph answered a number WITH-AS-OF then
+refused; both are AS-OF-REFUSED :NO-VERSION-HISTORY now."
+  (flet ((reason (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (as-of-refused (c) (as-of-refused-reason c)))))
+    (is (eq :no-version-history
+            (reason (lambda ()
+                      (latest-epoch (make-instance 'graph-db::graph))))))
+    (with-temp-directory (dir)
+      (let ((m (graph-db::make-memory-graph *integration-graph-name*
+                                            (namestring dir))))
+        (unwind-protect
+             (is (eq :no-version-history
+                     (reason (lambda () (latest-epoch m)))))
+          (close-graph m :snapshot-p nil)
+          (collect-garbage))))))
+
+(test a-future-start-epoch-is-a-typed-refusal
+  "GH #356: CREATE-TRANSACTION's START-EPOCH guard ran after a sequence
+number was consumed and the transaction consed, and signalled an untyped
+error; it runs first now and signals AS-OF-REFUSED :FUTURE-EPOCH.
+Unreachable from the public path, which refuses earlier."
+  (with-test-graph (g)
+    (let ((tm (graph-db::transaction-manager g)))
+      (is (eq :future-epoch
+              (handler-case
+                  (progn (graph-db::create-transaction
+                          tm :allow-read-only t
+                             :start-epoch (+ 10 (latest-epoch g)))
+                         nil)
+                (as-of-refused (c) (as-of-refused-reason c))))))))
+
 (test edge-and-node-history-walk-the-chain-newest-first
   "Spec §4: EDGE-HISTORY is VERTEX-HISTORY's edge twin; NODE-HISTORY
 dispatches on the node's class; entries are (VERSION . COMMIT-EPOCH)

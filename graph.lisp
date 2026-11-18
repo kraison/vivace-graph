@@ -655,7 +655,12 @@ condition unchanged."
       ;; consult-only commit path now relies on (GH #129).  After the slave
       ;; replay above, so a subset replay is covered.
       (let ((*graph* graph))
-        (install-unique-tuple-constraints graph))
+        (install-unique-tuple-constraints graph)
+        ;; The counting indexes too (GH #363): an empty BUILT map per
+        ;; declaration, as OPEN-GRAPH leaves them, so the first commit
+        ;; counts into it instead of marking the maps stale and the first
+        ;; count query pays no scan.
+        (install-count-indexes graph))
       graph)))
 
 (defun make-graph (name location &key master-p slave-p master-host
@@ -1294,11 +1299,14 @@ accepting, as before)."
           (setf done t))
       (unless done (%abort-graph-open state)))))
 
-(defmethod close-graph ((graph graph) &key (snapshot-p t))
+(defmethod close-graph ((graph graph) &key (snapshot-p t)
+                                        (snapshot-keep *snapshot-keep*))
   "Cleanly close GRAPH: stop replication, flush and unmap all on-disk
 structures (heap, indexes, vertex/edge tables), remove the .dirty marker, and
 deregister it.  With :SNAPSHOT-P true (the default) a snapshot backup is taken
-first.  Must be called with *GRAPH* bound to GRAPH (the snapshot path relies on
+first; SNAPSHOT-KEEP, an integer, is passed to it as :KEEP, so the complete
+snapshots beyond that many newest are deleted once it is written (GH #441).
+Must be called with *GRAPH* bound to GRAPH (the snapshot path relies on
 it).  Failing to close a graph leaves its .dirty marker in place, forcing
 recovery on the next OPEN-GRAPH.
 
@@ -1368,7 +1376,7 @@ a snapshot failure does NOT abort the close (GH #120)."
             ;; :DATA-INTEGRITY-ISSUES is a RETURN value, not a condition, and
             ;; was discarded here -- so a graph with integrity problems closed
             ;; with no snapshot taken and no sign of it.  Surfaced the same way.
-            (let ((result (snapshot graph)))
+            (let ((result (snapshot graph :keep snapshot-keep)))
               (when (eq result :data-integrity-issues)
                 (setf snapshot-problem :data-integrity-issues)))
           (serious-condition (c)

@@ -2371,6 +2371,11 @@ The REST API is protected by a username and password authentication system. It u
 
 *Important:* Authentication credentials are *not* sent via standard HTTP Basic Auth headers. Instead, they must be included as `username` and `password` fields in the JSON body of *every single request*.
 
+**** What runs, and which entries are accepted
+~add-rest-user~ and ~delete-rest-user~ run ~*htpasswd-bin*~ (default ~/usr/bin/htpasswd~; it must be Apache httpd 2.4's, whose ~-i~ flag reads the password from stdin), and every login runs ~openssl passwd~ from ~PATH~. Both run from argument lists, never through a shell, and the password reaches them on stdin, so it never appears on a command line where ~ps~ would show it (#461).
+
+A login checks entries of the form ~$alg$salt$hash~ for the algorithms ~openssl passwd~ takes as a flag: ~apr1~ (htpasswd's default), ~1~, ~5~ and ~6~. Any other entry, including a bcrypt one written by ~htpasswd -B~, refuses every password. The computed and stored hashes are compared exactly, case included, and the comparison takes the same time wherever they differ. A missing password, or one containing a newline, carriage return or NUL, is refused. ~add-rest-user~ signals an error for such a password, for a username that is empty or contains a colon or a line break, and when htpasswd exits non-zero.
+
 **** Creating a User
 To add a new user, call the ~add-rest-user~ function from your Lisp environment. This will create or update the password file (named ~rpasswd~ by default in the current directory).
 
@@ -3147,7 +3152,8 @@ VivaceGraph offers two functions for creating backups, but for most use cases, y
 The ~snapshot~ function is the recommended, safe, and consistent way to back up your graph.
 
 #+BEGIN_SRC lisp
-  ;; Usage: (snapshot graph &key include-deleted-p check-data-integrity-p)
+  ;; Usage: (snapshot graph &key include-deleted-p check-data-integrity-p
+  ;;                        (keep *snapshot-keep*))
   
   ;; Create a snapshot of the currently active graph.
   (snapshot *graph*)
@@ -3160,6 +3166,28 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 2.  *Checks Data Integrity (Opt-in):* With ~:check-data-integrity-p t~, ~snapshot~ first runs a full data integrity check on the graph: it iterates through every vertex and edge, attempting to deserialize its data from the heap, and if any corruption is found the snapshot is aborted with a list of the problematic nodes. This sweep deserializes the whole graph a *second* time, which on a large graph is the larger half of the snapshot's memory cost, so since vivace-graph#119 it is *off by default* — routine snapshots (including the one ~close-graph~ takes) skip it. Run ~check-data-integrity~ directly when you want the audit; ~replay~ still verifies restored data by default.
 
 3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`. Every line is printed under standard I/O syntax, not the caller's: a client that binds print limits around the call (a SWANK client, cl-mcp's remote-eval) cannot truncate the file, and a non-default float format cannot change what a double reads back as (vivace-graph#354). Only the caller's ~*package*~ is kept, so symbols print relative to it as ~recreate-graph~'s ~:package-name~ expects.
+
+**** Retention: ~:keep~ and ~*snapshot-keep*~
+
+Nothing read an older snapshot: crash recovery replays ~tx/*.txn~ and
+never looks in ~txn-log/~, and ~replay~ takes only the newest complete
+file. Yet nothing deleted one either, so a store that closed at every
+deploy kept one full copy of itself per close (vivace-graph#441: 68
+snapshots, 21 GB of a 22 GB directory). ~snapshot~ now takes ~:keep~,
+defaulting to ~*snapshot-keep*~: ~NIL~, the default, keeps every file as
+before; an integer N deletes the *complete* ~snap-~ files beyond the N
+newest by write date, once the new one is renamed into place, and
+returns them as its second value. ~close-graph~ passes its
+~:snapshot-keep~ (same default) to the snapshot it takes, so
+~(setf *snapshot-keep* 2)~ at startup is the whole opt-in. Three rules
+keep it safe: a truncated or legacy file is neither counted nor
+deleted, so it can never push a good snapshot out; a failed write
+prunes nothing; ~in-progress/~ is never touched.
+
+#+BEGIN_SRC lisp
+  (snapshot *graph* :keep 2)        ; => count, the files deleted
+  (let ((*snapshot-keep* 2)) (close-graph *graph*))
+#+END_SRC
 
 **** Heap sizing for snapshots
 
@@ -3606,7 +3634,7 @@ Here is a second spatial type, so the query examples below have two classes to s
     :sensor-app)
 #+END_SRC
 
-*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened — on the *on-disk* backend. A ~memory-graph~ reopens its index at the *persisted* precision and does not adopt a changed declaration until you rebuild explicitly; it over-covers at the old grid, so results stay correct but a stale precision costs selectivity rather than accuracy (see #66).
+*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened, on both backends. On disk that one index is regenerated; a ~memory-graph~ runs its lazy-aware spatial rebuild, which re-creates every spatial index from the geometry-bearing nodes and materializes only those (vivace-graph#66, closed by the #65 rebuild; before it a memory index reopened at its persisted precision and over-covered at the old grid).
 
 
 #+BEGIN_SRC lisp
@@ -6337,7 +6365,13 @@ candidates. A family also declares a fifth index, ~claim-relation~ on
 the second return value is ~T~ exactly when more claims existed past the
 cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
-~claims-by-producer~ paginates the same way (vivace-graph#302).
+~claims-by-producer~ paginates the same way (vivace-graph#302), and so
+does ~claims-by-relation~ (vivace-graph#448), its twin over the
+~claim-relation~ index: every claim of the family carrying one relation,
+both arities, retracted claims included, with the same ~:as-of~ /
+~:as-of-epoch~ resolution. Before it, "every claim with relation R"
+cost a walk of every endpoint; a service polling the newest stamp among
+240 such claims paid for 9,423 at each call.
 
 ~claim-touched-at~ (a claim) is the instant its transaction record last
 changed: the retraction when retracted, else the recording; ~NIL~ for a
@@ -6561,12 +6595,15 @@ backfill sweep links eight thousand edges in about three seconds,
 and — the surprise — a two-hop read through the edges is *slower*
 than the same read through ~claims-touching~ and ~resolve-endpoint~,
 by about 2.5× in Lisp and far more under the guarded Prolog runner.
-The suspected cost is not the walk but the engine's per-edge
-endpoint validation — ~active-edge-p~ looks up both endpoints of
-every edge it emits — tracked as an engine follow-up in GH #373 with
-the bench as its harness. Until it lands, treat the edges as what
-~traverse~ and the Prolog goals need — topology — and keep
-~claims-touching~ as the fast read.
+The suspected cost was the engine's per-edge endpoint validation —
+~active-edge-p~ looked up both endpoints of every edge it emits —
+tracked as GH #373 with the bench as its harness. Profiling found the
+read-statistics counter and the id hash instead (PR #377), after which
+the one-endpoint edge read is about twice the index read. The
+validation itself now checks the endpoint an adjacency read is keyed
+on once per call and only the far endpoint per edge (#373); on this
+bench that is within noise, since the second lookup was a warm cache
+hit. ~docs/perf-baselines.md~ has the rows.
 
 Write-time linking, unlike the sweep, is always on: a store crosses
 the schema version floor at its first linkable write, not only when
@@ -6584,6 +6621,7 @@ indexes, in index order, without walking its claims:
   (claim-namespaces graph 'site-claim)                 ; (:device :sym ...)
   (claim-namespaces graph 'site-claim :role :object :counts t)
   (claim-relations graph 'site-claim :counts t)        ; (("wifi-drop" . 12) ...)
+  (claims-by-relation graph 'site-claim "wifi-drop")   ; the 12 claims themselves
   (claim-keys graph 'site-claim :device :limit 50)     ; ("d1" "d42" ...), more-p
 #+END_SRC
 
@@ -6604,7 +6642,11 @@ those. Names come from index membership, which is live: ~:as-of~ and
 ~with-as-of~ extent the listing falls back to the distinct-prefix walk
 of GH #350 -- the only mechanism that can answer at an epoch -- and
 costs what it cost before the counting indexes existed (Chapter 12,
-"Reading as of an epoch"). The ~claim-relation~ secondary index stays
+"Reading as of an epoch"); the extent's ~:if-reaped~ policy applies
+to that walk too, so under the default ~:error~ its confirmation of a
+name can signal ~version-reaped-error~ mid-listing when a claim it
+resolves is past the retention window, where ~:skip~ lists on
+(vivace-graph#359). The ~claim-relation~ secondary index stays
 as that walk's relation source; a family created before the counting
 indexes existed builds them at its next open. On a device, a
 replication pull -- state-sync or an authored pull alike -- marks the
@@ -7000,6 +7042,18 @@ is ~nil~ for it, and ~claims-touching~ returns it unless called with
 start is not fabricated. Retracting twice is a no-op: a daily sweep must
 not walk the end forward.
 
+~reopen-claim~ is its inverse (vivace-graph#396): the same fact asserted
+again later gets a fresh open period ~[at, open)~, the closed one
+surviving only in version history. It is what ~register-node~ and the
+rules engine do internally when an identity tuple's retracted claim is
+asserted again, exported for a tenant's own idempotent upsert. A
+current claim is left as it is, and like ~retract-claim~ it joins an
+ambient transaction. The extent's transition rule is judged against the
+committed version at commit: ~:at~ may not precede the retraction, and a
+retract and a reopen of a committed *current* claim inside a single
+transaction are refused as a moved start, so reopen a retraction that
+has committed.
+
 Why transaction time and not validity time: registration derives from
 the subject's *current* geometry and cannot tell a correction ("it was
 never there") from a move ("it was there until T"). "We no longer derive
@@ -7146,8 +7200,8 @@ This chapter provides a categorized reference for the most important exported sy
 - ~checkpoint-memory-graph (graph)~ ::
   Forces an in-memory graph to write its checkpoint image and clear the journal *now*, without closing. Call after a ~peer-sync~ on a device so pulled (un-journaled) state survives a restart.
 
-- ~close-graph (graph &key snapshot-p)~ ::
-  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing. For an in-memory graph this writes the checkpoint image and clears the journal.
+- ~close-graph (graph &key snapshot-p snapshot-keep)~ ::
+  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing; ~snapshot-keep~ (default ~*snapshot-keep*~) is that snapshot's ~:keep~, the number of complete snapshots to leave under ~txn-log/~ (vivace-graph#441). For an in-memory graph this writes the checkpoint image and clears the journal.
 
 - ~lookup-graph (name)~ ::
   Retrieves a handle to an already opened graph by its keyword ~name~.
@@ -7504,7 +7558,10 @@ This chapter provides a categorized reference for the most important exported sy
   Stops the REST API server.
 
 - ~add-rest-user (username password)~ ::
-  Creates a new user account for authenticating with the REST API.
+  Creates a new user account for authenticating with the REST API, via ~htpasswd -i~ (httpd 2.4). Signals an error when htpasswd fails or an argument cannot be stored.
+
+- ~delete-rest-user (username)~ ::
+  Removes a user account with ~htpasswd -D~. Signals ~uiop:subprocess-error~ when htpasswd fails.
 
 **** Concurrency & Locking (Advanced)
 - ~make-rw-lock ()~ ::

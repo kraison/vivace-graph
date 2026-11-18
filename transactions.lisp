@@ -10,7 +10,8 @@
                 validate-value-constraints validate-cardinality-constraints
                 validate-domain-range-constraints))
 
-(defvar *transaction* nil)
+;; *TRANSACTION* is defvar'd in globals.lisp: vertex.lisp, edge.lisp and
+;; primitive-node.lisp read it and compile before this file (GH #439).
 
 (defvar *commit-validators* '()
   "Functions of (TX GRAPH), run in %COMMIT's manager-locked pre-durability
@@ -705,9 +706,8 @@ irrelevant to reaping)."
 ;;; that was live as of the reader's snapshot.  The reaper's floor retains every
 ;;; version an active transaction could need, so the chain is guaranteed present.
 
-(defvar *snapshot-reads-p* t
-  "When true, transactional LOOKUP-OBJECT resolves the version visible at the
-transaction's start epoch (snapshot isolation).  Prototype toggle.")
+;; *SNAPSHOT-READS-P* is defvar'd in globals.lisp: LOOKUP-OBJECT above reads
+;; it before this point in the file (GH #439).
 
 (define-condition version-reaped-error (error)
   ((id :initarg :id :reader version-reaped-id)
@@ -730,7 +730,9 @@ retained is epoch ~A (revision ~A)"
   "The version of LIVE-NODE visible to a reader whose snapshot is EPOCH
 (the newest with commit-epoch < EPOCH), or NIL.  Second value, when the
 first is NIL: the oldest retained version head (the live head itself when
-it has no chain) -- its REVISION tells absent (0) from reaped (GH #115)."
+it has no chain) -- its REVISION tells absent (0) from reaped (GH #115).
+That head is BARE: read only its ID, REVISION and COMMIT-EPOCH from it,
+never a slot (GH #356)."
   (if (< (commit-epoch live-node) epoch)
       live-node
       (let ((id (id live-node))
@@ -3494,26 +3496,29 @@ longer open (GH #171, spec R6)."
         (error 'store-not-accepting-error
                :name (graph-name (graph transaction-manager))
                :reason (if (eq state :read-only) :shadow-load state))))
-    (let* ((sequence-number (next-sequence-number transaction-manager))
-           (graph (graph transaction-manager))
+    (let* ((graph (graph transaction-manager))
            (cache (cache graph))
            (current (tm-current-epoch transaction-manager))
-           (start-tx-id (or start-epoch current))
-           (tx (apply #'make-instance class
-                      :sequence-number sequence-number
-                      :start-tx-id start-tx-id
-                      :finish-tx-id nil
-                      :tx-id nil
-                      :transaction-manager transaction-manager
-                      :graph graph
-                      :graph-cache cache
-                      initargs)))
+           (start-tx-id (or start-epoch current)))
+      ;; Before a sequence number is consumed or a transaction consed, and
+      ;; typed; unreachable from the public path, which refuses earlier
+      ;; (CALL-WITH-READ-SNAPSHOT, GH #356).
       (when (> start-tx-id current)
-        (error "start-epoch ~A is past the current epoch ~A"
-               start-tx-id current))
-      (add-transaction tx transaction-manager)
-      (setf (state tx) :active)
-      tx)))
+        (error 'as-of-refused :graph graph :epoch start-tx-id
+                              :reason :future-epoch))
+      (let ((tx (apply #'make-instance class
+                       :sequence-number (next-sequence-number
+                                         transaction-manager)
+                       :start-tx-id start-tx-id
+                       :finish-tx-id nil
+                       :tx-id nil
+                       :transaction-manager transaction-manager
+                       :graph graph
+                       :graph-cache cache
+                       initargs)))
+        (add-transaction tx transaction-manager)
+        (setf (state tx) :active)
+        tx))))
 
 (defun %transaction-covers-graph-p (transaction graph)
   "True when TRANSACTION governs reads of GRAPH.  RECOVERY-TRANSACTION and its
@@ -3545,8 +3550,10 @@ The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
 *TRANSACTION*, so snapshots on several graphs COMPOSE: a cross-graph query holds
 one snapshot per participating graph, each internally consistent, with
 deliberately no single instant across them (GH #53).  An enclosing snapshot of
-the SAME graph is inherited, as is a read-write transaction on it.  A no-op
-(THUNK runs directly) when GRAPH has no transaction manager yet.
+the SAME graph is inherited, as is a read-write transaction on it; an
+as-of extent at the same epoch is inherited POLICY INCLUDED, so the
+inner :IF-REAPED is discarded (spec §3.4, GH #356).  A no-op (THUNK runs
+directly) when GRAPH has no transaction manager yet.
 
 Also takes a read-epoch pin on GRAPH's own manager for the extent (GH #168):
 under a shared image clock, a cross-store composition holds one such pin per
@@ -3652,7 +3659,15 @@ See CALL-WITH-READ-SNAPSHOT :AS-OF."
 (defun latest-epoch (graph)
   "The newest epoch an as-of read of GRAPH may name: one below the
 manager's next epoch (GH #115).  Under a system clock this is the newest
-epoch handed out to ANY store on it."
+epoch handed out to ANY store on it.  Signals AS-OF-REFUSED
+:NO-VERSION-HISTORY for a graph with no transaction manager yet and for
+a memory graph, the graphs WITH-AS-OF refuses for the same reason
+(GH #356)."
+  (let ((mem (find-class 'memory-graph-mixin nil)))
+    (when (or (not (slot-boundp graph 'transaction-manager))
+              (and mem (typep graph mem)))
+      (error 'as-of-refused :graph graph :epoch nil
+                            :reason :no-version-history)))
   (1- (tm-current-epoch (transaction-manager graph))))
 
 (defun %as-of-snapshot (graph)

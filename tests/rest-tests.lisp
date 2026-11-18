@@ -2,8 +2,9 @@
 ;;;; contract and the request handlers (rest-get/post/put/delete-vertex|edge,
 ;;;; rest-list-edges, rest-get-graph) exercised IN-PROCESS.
 ;;;;
-;;;; We do not stand up a real HTTP server or the htpasswd/openssl-backed
-;;;; auth-rest-user (which shells out to external binaries).  Instead each
+;;;; We do not stand up a real HTTP server, and the handler tests do not run
+;;;; the htpasswd/openssl-backed auth-rest-user (the last section of this
+;;;; file tests it and add/delete-rest-user on their own).  Instead each
 ;;;; handler is called directly with a params alist shaped exactly as ningle
 ;;;; delivers it -- route captures (:graph-name, :node-id, :type) as KEYWORD
 ;;;; keys, query/body params ("username", "name", "from", ...) as STRING keys.
@@ -725,3 +726,156 @@ KEYWORD package does not grow -- while the DSL's own keys are keywords."
                                        (search "zzBogusKey" (car pair))))
                    pat)
           "the unknown key survives as a string, uninterned")))))
+
+;;; ---------------------------------------------------------------------------
+;;; REST users (GH #461): the password reaches openssl and htpasswd on
+;;; stdin, from argument lists; no shell reads it.  AUTH-REST-USER runs
+;;; the real openssl (skipped without one); ADD- and DELETE-REST-USER
+;;; run a stand-in htpasswd that records its argv and stdin.
+;;; ---------------------------------------------------------------------------
+
+(defun %rest-openssl-p ()
+  "True when an openssl binary is on PATH."
+  (ignore-errors
+   (eql 0 (nth-value 2 (uiop:run-program '("openssl" "version")
+                                         :ignore-error-status t)))))
+
+(defun %rest-apr1-line (username password salt)
+  "An htpasswd line for USERNAME, PASSWORD hashed by openssl from argv --
+the other transport from the stdin AUTH-REST-USER uses, so the two
+agreeing is a cross-check."
+  (format nil "~A:~A" username
+          (string-right-trim
+           '(#\Newline)
+           (uiop:run-program (list "openssl" "passwd" "-apr1" "-salt" salt
+                                   password)
+                             :output :string))))
+
+(defmacro with-rest-passwd ((dir &rest lines) &body body)
+  "Bind DIR to a scratch directory and graph-db::*rest-passwd-file* to
+DIR/rpasswd holding LINES (none: the file is absent), run BODY, then
+delete DIR."
+  (let ((file (gensym "FILE")) (ls (gensym "LINES")))
+    `(with-temp-directory (,dir)
+       (let ((,file (merge-pathnames "rpasswd" ,dir))
+             (,ls (list ,@lines)))
+         (when ,ls
+           (with-open-file (s ,file :direction :output)
+             (dolist (l ,ls) (write-line l s))))
+         (let ((graph-db::*rest-passwd-file* ,file))
+           ,@body)))))
+
+(defun %fake-htpasswd (dir)
+  "Write DIR/htpasswd, an executable standing in for htpasswd that writes
+its arguments, one per line, to DIR/argv and its stdin to DIR/stdin, and
+exits 0.  Returns its native namestring."
+  (let ((script (merge-pathnames "htpasswd" dir)))
+    (with-open-file (s script :direction :output :if-exists :supersede)
+      (format s "#!/bin/sh~%d=$(dirname \"$0\")~%~
+                 printf '%s\\n' \"$@\" > \"$d/argv\"~%~
+                 cat > \"$d/stdin\"~%"))
+    (uiop:run-program (list "chmod" "+x" (uiop:native-namestring script)))
+    (uiop:native-namestring script)))
+
+(test rest-auth-verifies-an-apr1-entry-exactly
+  "The right password passes and a wrong one fails; the hashes compare
+case-sensitively, where EQUALP let a case-flipped hash through."
+  (if (not (%rest-openssl-p))
+      (skip "no openssl on PATH")
+      (let ((line (%rest-apr1-line "alice" "s3cret" "abcdefgh")))
+        (with-rest-passwd (dir line)
+          (is-true (graph-db::auth-rest-user "alice" "s3cret"))
+          (is-false (graph-db::auth-rest-user "alice" "s3cre"))
+          (is-false (graph-db::auth-rest-user "nobody" "s3cret")))
+        (with-rest-passwd (dir (concatenate
+                                'string "alice:$apr1$abcdefgh$"
+                                (string-upcase
+                                 (subseq line (length "alice:$apr1$abcdefgh$")))))
+          (is-false (graph-db::auth-rest-user "alice" "s3cret")
+                    "a case-flipped hash must not match")))))
+
+(test rest-auth-password-shell-metacharacters-are-data
+  "GH #461: the password was spliced into a /bin/sh command line before
+any comparison.  A password made of shell syntax now authenticates as
+itself, and an injection attempt is only a wrong password."
+  (if (not (%rest-openssl-p))
+      (skip "no openssl on PATH")
+      (let ((odd "a b;c|d&e$(f)`g`'h\"i\\j*"))
+        (with-rest-passwd (dir (%rest-apr1-line "alice" odd "saltsalt"))
+          (let ((marker (merge-pathnames "pwned" dir)))
+            (is-true (graph-db::auth-rest-user "alice" odd))
+            (is-false (graph-db::auth-rest-user
+                       "alice"
+                       (format nil "x; touch ~A"
+                               (uiop:native-namestring marker))))
+            (is-false (probe-file marker)
+                      "the password ran as a shell command"))))))
+
+(test rest-auth-refuses-what-stdin-cannot-carry
+  "A missing password (NIL) is a refusal, not the hash of \"NIL\"; one
+with a line break is refused even when its first line is right, which
+openssl alone would accept; an entry openssl passwd cannot check is a
+refusal, not an error."
+  (if (not (%rest-openssl-p))
+      (skip "no openssl on PATH")
+      (with-rest-passwd (dir (%rest-apr1-line "alice" "right" "abcdefgh")
+                             (%rest-apr1-line "nil-user" "NIL" "abcdefgh")
+                             "bcrypt:$2y$05$abcdefghijklmnopqrstuuJ5Z1Hk3Jr2Tj9kXx0y0y0y0y0y0y0y"
+                             "rounds:$6$rounds=5000$saltsalt$abc")
+        (is-false (graph-db::auth-rest-user "nil-user" nil))
+        (is-false (graph-db::auth-rest-user "alice"
+                                            (format nil "right~%junk")))
+        (is-false (graph-db::auth-rest-user
+                   "alice" (format nil "right~Cjunk" (code-char 0))))
+        (is-false (graph-db::auth-rest-user nil "right"))
+        (is-false (graph-db::auth-rest-user "bcrypt" "anything"))
+        (is-false (graph-db::auth-rest-user "rounds" "anything"))
+        (is-true (graph-db::auth-rest-user "alice" "right")))))
+
+(test add-rest-user-hands-htpasswd-the-password-on-stdin
+  "htpasswd gets -i, -c only while the file is absent, the file and the
+username as separate arguments, and the password on stdin alone: never
+on a command line, where ps shows it."
+  (with-rest-passwd (dir)
+    (let ((graph-db::*htpasswd-bin* (%fake-htpasswd dir))
+          (path (uiop:native-namestring graph-db::*rest-passwd-file*))
+          (password "pw; with spaces"))
+      (graph-db::add-rest-user "alice" password)
+      (is (equal (list "-i" "-c" path "alice")
+                 (uiop:read-file-lines (merge-pathnames "argv" dir))))
+      (is (string= (format nil "~A~%" password)
+                   (uiop:read-file-string (merge-pathnames "stdin" dir))))
+      (with-open-file (s graph-db::*rest-passwd-file* :direction :output))
+      (graph-db::add-rest-user "bob" password)
+      (is (equal (list "-i" path "bob")
+                 (uiop:read-file-lines (merge-pathnames "argv" dir)))
+          "no -c once the file exists"))))
+
+(test add-rest-user-refuses-what-would-corrupt-the-file
+  "A username that is empty or holds a colon or a newline, or a password
+with a newline, is refused before htpasswd runs."
+  (with-rest-passwd (dir)
+    (let ((graph-db::*htpasswd-bin* (%fake-htpasswd dir))
+          (argv (merge-pathnames "argv" dir)))
+      (dolist (args (list (list "" "pw")
+                          (list "a:b" "pw")
+                          (list (format nil "a~%admin") "pw")
+                          (list "alice" (format nil "pw~%more"))
+                          (list "alice" nil)))
+        (signals error (apply #'graph-db::add-rest-user args)))
+      (is-false (probe-file argv) "htpasswd ran"))))
+
+(test delete-rest-user-passes-the-username-as-one-argument
+  "htpasswd -D gets the file and the username as arguments; shell syntax
+in the username is part of it, not a command."
+  (with-rest-passwd (dir)
+    (let* ((graph-db::*htpasswd-bin* (%fake-htpasswd dir))
+           (marker (merge-pathnames "pwned" dir))
+           (username (format nil "bob; touch ~A"
+                             (uiop:native-namestring marker))))
+      (graph-db::delete-rest-user username)
+      (is (equal (list "-D" (uiop:native-namestring
+                             graph-db::*rest-passwd-file*)
+                       username)
+                 (uiop:read-file-lines (merge-pathnames "argv" dir))))
+      (is-false (probe-file marker)))))

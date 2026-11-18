@@ -9,6 +9,143 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
+## [5.1.0] - 2026-11-18
+
+### Added
+
+- **Snapshot retention** (#441): `snapshot` takes `:keep`, defaulting
+  to the new `*snapshot-keep*` (NIL, every file kept as before); an
+  integer N deletes the complete `snap-` files beyond the N newest once
+  the new one is in place, and returns them as a second value.
+  `close-graph` passes `:snapshot-keep` to the snapshot it takes. A
+  truncated or legacy file is neither counted nor deleted, a failed
+  write prunes nothing, and `in-progress/` is never touched. Nothing in
+  the engine read an older snapshot, yet nothing deleted one: a store
+  that closed at every deploy had 68 of them, 21 GB of a 22 GB
+  directory.
+- **`reopen-claim`** (#396): `retract-claim`'s inverse, exported from
+  `graph-db.spacetime`: a fresh open transaction period at `:at`
+  (default now) for a retracted claim, the way `register-node` and the
+  rules engine re-open one; a current claim is left as it is; joins an
+  ambient transaction. `:at` may not precede the retraction, and a
+  retract and a reopen of a committed current claim in one transaction
+  are refused by the extent's transition rule.
+- **`claims-by-relation`** (#448): the exported reader of the
+  `(relation)` index every claim family has carried since #350, the twin
+  of `claims-by-producer`: both arities, retracted claims included, the
+  same `:as-of` / `:as-of-epoch` resolution and `:limit` / `:offset`
+  with the truncated flag. "Every claim with relation R" cost a walk of
+  every endpoint before; it costs the matching claims now.
+
+### Changed
+
+- **The build fails on a full warning** (#439):
+  `tests/check-build-warnings.sh` compiles the systems from a clean
+  FASL cache in a fresh image and exits non-zero on any `WARNING` from
+  this tree that is not a style warning; CI runs it before the suites.
+  The three it found, `*transaction*`, `*snapshot-reads-p*` and
+  `+spatial-insert-max-cells+`, each read by a file compiled before the
+  file that defined it, are defined in `globals.lisp` now. None was a
+  `let` binding, so nothing behaved differently; the next one would be
+  caught before it could.
+- **An adjacency read checks its near endpoint once** (#373).
+  `map-edges` keyed on a vertex, or on an endpoint pair, checked both
+  endpoints of every edge it emitted through `active-edge-p`, though
+  the keyed endpoint is the same for the whole call; it is checked
+  once now and passed as `:known-live`, so each emitted edge costs one
+  endpoint lookup, and a dead keyed vertex walks nothing. What is
+  emitted does not change. On `bench-claim-linking` the difference is
+  within noise (`docs/perf-baselines.md`): the lookup saved was a warm
+  cache hit.
+- **`not` over a lost derivation is documented and pinned** (#479).
+  A retracted claim stays on record, so a plain `not` over a relation
+  that rules derive stays blocked after the derivation is lost, and
+  `run-rules` agrees. `docs/rules.md` "Two negations" now says so and
+  gives the current-only idiom, `(not (if (claim ...) (claim-current
+  ?r)))`; three tests pin both forms under `:commit` and `:drain
+  :caller`, and that `standing-query-problems` admits both without a
+  reason, which is the call recorded there. No engine change.
+- **`graph-db/core` no longer depends on cl-json** (#462), nor,
+  through it, does `graph-db/replication`. `graph-db/query` (the
+  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
+  `graph-db/gui` already did, so a consumer of `graph-db`,
+  `graph-db/query` or `graph-db/gui` loads it as before.
+
+### Removed
+
+- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
+  lists and walks directories with UIOP, which ships with ASDF, so
+  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
+  (`replay`'s `txn-dir`) takes the directory with or without a trailing
+  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
+  programs with UIOP. `visualize :render` hands Graphviz the paths as
+  arguments, so a path containing a space, a quote or a `;` now renders.
+
+### Fixed
+
+- **`map-index-prefixes` checks its arity and `:start` before reading**
+  (#359): a bad `:arity`, or a `:start` longer than it, on a declared
+  index with no entries answered NIL and signalled only once an entry
+  existed; both signal `query-precondition-error` now, from the slot
+  designator alone. The walk's tests run on the B+ tree backend and on
+  a memory graph as well as the heap skip-list; its docstrings say that
+  prefixes are the stored, canonicalized components, that `:start` is
+  canonicalized the same way, and that K prefixes cost K+1 seeks.
+
+- **A memory graph re-grids a spatial index whose declared precision
+  changed** (#66): `open-memory-graph` compares each restored index's
+  persisted precision with its slot's `:spatial-precision` and, when one
+  differs, runs the lazy-aware spatial rebuild of #65, which materializes
+  only the geometry-bearing classes' nodes. The on-disk backend has done
+  this since 3.0.0; a memory index reopened at its persisted precision and
+  over-covered at the old grid, correct but slower. Lazy and eager opens
+  alike.
+
+- **Time travel follow-ups** (#356): `latest-epoch` signals
+  `as-of-refused :no-version-history` for a graph with no transaction
+  manager or a memory graph, where it signalled `unbound-slot` or
+  answered an epoch `with-as-of` then refused; `create-transaction`'s
+  start-epoch guard runs before a sequence number is consumed and
+  signals `as-of-refused :future-epoch`. `:if-reaped :skip` is pinned
+  on every per-call read path (`lookup-vertex`, `lookup-edge`,
+  `map-vertices`, `select :as-of`), an absence does not count as a
+  skip, and the counter counts reads, not nodes, as the doc says.
+  `docs/time-travel.md` names the peer-purge bound.
+
+- **Count-index follow-ups** (#363): `make-graph` installs the
+  declared count maps as `open-graph` does, so a store created
+  in-session no longer marks them stale at its first commit and pays a
+  full scan at its first count query. The four canonicalise loops of
+  the secondary and count indexes are one helper. Tests cover
+  `map-count-index` on the B+ tree backend and a memory graph, a
+  prefix of exactly `:depth` components, a depth-2 listing with no
+  prefix, and `:canonicalize` on a count index against the
+  case-sensitive secondary index on the same owner; `def-count-index`'s
+  docstring says a changed canonicalizer across a close is not detected
+  at open, unlike a changed `:current-p`.
+
+### Security
+
+- **A REST login no longer hands the password to `/bin/sh`** (#461).
+  `auth-rest-user` spliced the request's password into an
+  `openssl passwd` command line and ran it through the shell before any
+  comparison, so anyone who knew one username could run commands as the
+  server's user by putting a `;` in the password, on all 13
+  `with-rest-auth` routes. openssl now runs from an argument list with
+  the password on stdin, and so does `htpasswd -i` for `add-rest-user`;
+  the password is no longer on a command line, where `ps` showed it. The
+  login no longer logs both hashes at warn level on every attempt. It
+  compares them exactly (`equalp` ignored case) and in constant time,
+  and refuses a missing password, which used to be hashed as the string
+  `"NIL"`. An entry it cannot check (bcrypt, `$6$rounds=`) is a refusal,
+  not an error. `add-rest-user` now needs htpasswd from httpd 2.4, and
+  signals an error when htpasswd fails or when the username or password
+  would corrupt the file. Passwords still travel as request parameters.
+  On ECL, where `launch-program` hands back one two-way stream for both
+  directions and no stderr stream, the child's stdin half is closed
+  explicitly, or `openssl passwd -stdin` never answered and every login
+  hung (#497, found by the 5.1.0 gate).
+
 ## [5.0.0] - 2026-11-17
 
 A **MAJOR** release: the spatial contract and two

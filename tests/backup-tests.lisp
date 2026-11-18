@@ -792,6 +792,22 @@ accepted -- loudly."
           (is (equal '(:legacy) reasons))
           (is (equal (namestring file) (namestring chosen))))))))
 
+(test the-newest-snapshot-is-found-from-a-txn-dir-without-a-slash
+  "REPLAY's TXN-DIR is public, and \"/x/txn-log\" names the directory as
+well as \"/x/txn-log/\" does.  cl-fad listed either; some UIOPs list
+/x/ for the first, which holds no snapshot (GH #461)."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Slashless"))
+        (graph-db:snapshot g)))
+    (let ((with-slash (%bk-latest-snap (namestring dir)))
+          (without (graph-db::find-newest-snapshot
+                    (namestring (merge-pathnames "txn-log" dir)))))
+      (is-true with-slash)
+      (is (equal (and with-slash (namestring with-slash))
+                 (and without (namestring without)))))))
+
 (test an-interrupted-snapshot-never-bears-the-snap-name
   "GH #127.  The writer works under in-progress.* -- a name the ^snap-
 scan can never match -- and renames only after the completion trailer is
@@ -817,7 +833,7 @@ partial is deleted on the way out."
                         (remove-if-not
                          (lambda (f)
                            (cl-ppcre:scan "^snap-" (file-namestring f)))
-                         (cl-fad:list-directory
+                         (uiop:directory-files
                           (format nil "~A/txn-log/" (namestring dir))))
                         ;; and no stranded partial in in-progress/
                         (directory
@@ -912,3 +928,77 @@ the double survive unchanged (GH #354)."
                          "double came back as ~S" (slot-value v 'dbl)))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
+
+;;; --- Snapshot retention (GH #441) ------------------------------------------
+
+(defun %bk-snap-files (dir)
+  "The snap- files under DIR/txn-log/, oldest first by FILE-WRITE-DATE."
+  (sort (directory (merge-pathnames "txn-log/snap-*"
+                                    (uiop:ensure-directory-pathname
+                                     (namestring dir))))
+        #'< :key #'file-write-date))
+
+(test snapshot-keep-prunes-the-complete-files-beyond-the-newest-n
+  "GH #441: nothing ever deleted a snapshot, so a store that closed often
+kept one full copy of itself per close.  :KEEP N leaves the N newest
+complete files; the default, NIL, keeps every one as before."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "One"))
+        (graph-db:snapshot g)
+        (sleep 1)                       ; distinct FILE-WRITE-DATEs
+        (graph-db:snapshot g)
+        (sleep 1)
+        (let ((before (%bk-snap-files dir)))
+          (is (= 2 (length before)) "the default keeps every snapshot")
+          (multiple-value-bind (count pruned) (graph-db:snapshot g :keep 2)
+            (is (integerp count))
+            (is (equal (mapcar #'namestring pruned)
+                       (list (namestring (first before))))
+                "the one file beyond the newest two is the oldest")
+            (let ((left (%bk-snap-files dir)))
+              (is (= 2 (length left)))
+              (is-false (probe-file (first before)))
+              (is (string= (file-namestring
+                            (graph-db::find-newest-snapshot
+                             (format nil "~A/txn-log/" dir)))
+                           (file-namestring (second left)))
+                  "the newest complete file is the one REPLAY would read"))))
+        (signals error (graph-db:snapshot g :keep 0))))))
+
+(test snapshot-keep-counts-only-complete-files-and-leaves-the-rest
+  "GH #441: a truncated file is neither counted toward :KEEP nor deleted,
+so it can never push a good snapshot out, and the evidence of a cut
+stays on disk."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Old"))
+        (graph-db:snapshot g)
+        (sleep 1)
+        (graph-db:snapshot g)
+        (sleep 1)
+        (destructuring-bind (old cut) (%bk-snap-files dir)
+          (%bk-truncate-file cut 0.5)
+          (graph-db:snapshot g :keep 1)
+          (let ((left (%bk-snap-files dir)))
+            (is (= 2 (length left)))
+            (is-false (probe-file old) "the older complete file is gone")
+            (is-true (probe-file cut) "the truncated file is left alone")))))))
+
+(test close-graph-prunes-snapshots-by-*snapshot-keep*
+  "GH #441: CLOSE-GRAPH's own snapshot honours the graph-wide default."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-g-person :name "Only"))
+             (graph-db:snapshot g)
+             (sleep 1)
+             (let ((graph-db:*snapshot-keep* 1))
+               (close-graph g))
+             (is (= 1 (length (%bk-snap-files dir)))))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))

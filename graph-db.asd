@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -26,10 +26,12 @@
                #+(or ccl lispworks) :closer-mop
                #+(or ccl lispworks) :trivial-timeout
                :cl-store
-               :cl-fad
+               ;; No :cl-fad: directory listing and walking is UIOP's, which
+               ;; ships with ASDF (GH #461).
                :local-time
                :ieee-floats
-               :cl-json
+               ;; No :cl-json: no core file reads or writes JSON; graph-db/query
+               ;; and graph-db declare it where they use it (GH #462).
                ;; log4cl's compile-time machinery breaks ECL cross-compilation;
                ;; the Android core build sets :graph-db-stub-log and uses the
                ;; no-op log-stub instead.  Desktop/SBCL keeps real log4cl.
@@ -182,7 +184,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -203,8 +205,9 @@
 web-free.  docs/guarded-query.md; GH #322."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
-  :depends-on (:graph-db/core)
+  :version "5.1.0"
+  :depends-on (:graph-db/core
+               :cl-json)
   :pathname "query/"
   :serial t
   :components ((:file "package")
@@ -219,7 +222,7 @@ web-free.  docs/guarded-query.md; GH #322."
 directly, web-free (GH #322)."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/query/"
   :serial t
@@ -237,7 +240,7 @@ directly, web-free (GH #322)."
 docs/rules.md; GH #304."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
@@ -272,9 +275,10 @@ docs/rules.md; GH #304."
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   :depends-on (:graph-db/replication
                :graph-db/query
+               :cl-json
                :hunchentoot
                :ningle
                :clack
@@ -284,8 +288,9 @@ docs/rules.md; GH #304."
                ;; some Quicklisp dists (e.g. clack + a newer lack) and silently
                ;; leave the handler unregistered -> ":HUNCHENTOOT is unknown handler."
                :clack-handler-hunchentoot
-               :usocket
-               :trivial-shell)
+               ;; No :trivial-shell: rest.lisp runs htpasswd and openssl
+               ;; with UIOP, as argument lists, never through /bin/sh (GH #461).
+               :usocket)
   :serial t
   :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
@@ -303,7 +308,7 @@ docs/rules.md; GH #304."
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "5.0.0"
+  :version "5.1.0"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
@@ -509,8 +514,8 @@ and read-only neighborhood exploration."
 (defsystem graph-db/algorithms-io
   :name "VivaceGraph graph-algorithms IO"
   :description "Optional GML/Pajek import + Graphviz export for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number
-               :trivial-shell)
+  ;; Graphviz runs through UIOP:RUN-PROGRAM, not trivial-shell (GH #461).
+  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number)
   :pathname "algorithms/"
   :serial t
   :components ((:file "io")))

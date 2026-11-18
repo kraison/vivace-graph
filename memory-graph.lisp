@@ -834,6 +834,23 @@ only that fraction -- fault-on-access survives for everything else."
                           (id node) geom (%node-spatial-type-tag node))
                          (incf count))))))))))
 
+(defun %install-memory-spatial-indexes (graph)
+  "The memory backend's INSTALL-SPATIAL-INDEXES (GH #66): when a restored
+spatial index's persisted precision differs from the one its slot option
+declares, re-grid through the lazy-aware rebuild of GH #65, which
+materializes only the geometry-bearing classes' nodes.  The rebuild
+re-creates every index at its declared precision, so one stale index
+costs the whole spatial rebuild; until #66 a memory index reopened at
+its persisted precision and over-covered at the old grid."
+  (let ((stale (%stale-spatial-indexes graph)))
+    (when stale
+      (dolist (s stale)
+        (destructuring-bind (owner slot was now) s
+          (log:info "Memory spatial index ~S.~S declares precision ~D but ~
+                     was written at ~D; rebuilding the spatial indexes."
+                    owner slot now was)))
+      (%rebuild-memory-spatial-indexes-from-nodes graph))))
+
 (defun restore-memory-image-native (graph file)
   "Restore a VG-native image, v5 through v9.  When GRAPH is LAZY, node tables
 receive LZNODE blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each
@@ -1101,6 +1118,10 @@ caller's abort guard.  Returns GRAPH."
           ;; fallback).
           (progn (recover-transactions graph)
                  (restore-views graph))))
+    ;; A changed :SPATIAL-PRECISION declaration re-grids its index here, as
+    ;; INSTALL-SPATIAL-INDEXES does on disk; after the journal replay so the
+    ;; rebuild sees every node (GH #66).
+    (%install-memory-spatial-indexes graph)
     ;; Reconcile the declarative view registry (issue #49) after views are
     ;; restored AND the journal tail is replayed, so any regenerate sees all
     ;; nodes.

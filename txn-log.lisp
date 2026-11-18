@@ -5,9 +5,35 @@
 ;; of a snapshot's allocation -- for a check the snapshot itself does
 ;; not need.  CHECK-DATA-INTEGRITY is the explicit audit, and REPLAY
 ;; still verifies restored data by default.
+(defun %prune-snapshots (dir keep)
+  "Delete the COMPLETE snap- files in DIR beyond the KEEP newest, by
+FILE-WRITE-DATE, and return the deleted files.  A truncated or legacy
+file is neither counted toward KEEP nor touched: it can never push a
+good snapshot out, and it stays as evidence (GH #441)."
+  (let ((complete (sort (remove-if-not
+                         (lambda (file)
+                           (and (cl-ppcre:scan "^snap-"
+                                               (file-namestring file))
+                                (eq :complete
+                                    (%snapshot-completeness file))))
+                         (uiop:directory-files
+                          (uiop:ensure-directory-pathname dir)))
+                        '> :key 'file-write-date)))
+    (loop for file in (nthcdr keep complete)
+          do (delete-file file)
+          collect file)))
+
 (defmethod snapshot ((graph graph) &key include-deleted-p
-                                     check-data-integrity-p)
-  (let ((count nil))
+                                     check-data-integrity-p
+                                     (keep *snapshot-keep*))
+  "Write a verifiable logical backup of GRAPH under txn-log/ and return
+the node count, or :DATA-INTEGRITY-ISSUES and the problems when the
+opt-in sweep finds any.  With KEEP (default *SNAPSHOT-KEEP*) an integer,
+the complete snap- files beyond the KEEP newest are deleted once this
+one is in place, never after a failed write; the second value is the
+list deleted (GH #441)."
+  (check-type keep (or null (integer 1)))
+  (let ((count nil) (pruned nil))
     (with-recursive-lock-held ((txn-lock graph))
       (let ((problems (when check-data-integrity-p
                         (check-data-integrity graph
@@ -59,8 +85,18 @@
                        (rename-file tmp-file snap-file)
                        (setq renamed t))
                   (when (and (not renamed) (probe-file tmp-file))
-                    (ignore-errors (delete-file tmp-file)))))
-              count))))))
+                    (ignore-errors (delete-file tmp-file))))
+                ;; Only once this snapshot is in place: a failed write
+                ;; unwinds past here and prunes nothing (GH #441).
+                (when keep
+                  (setq pruned (%prune-snapshots
+                                (format nil "~A/txn-log/" (location graph))
+                                keep))
+                  (when pruned
+                    (log:info "Snapshot retention: deleted ~D older ~
+                               snapshot~:P of ~A, keeping ~D"
+                              (length pruned) graph keep))))
+              (values count pruned)))))))
 
 (define-condition snapshot-refused-warning (warning)
   ((file :initarg :file :reader snapshot-refused-file)
@@ -117,7 +153,12 @@ the cut and report success (GH #127, the #146 chain).  A legacy file
                            (lambda (file)
                              (cl-ppcre:scan "^snap-"
                                             (file-namestring file)))
-                           (cl-fad:list-directory dir))
+                           ;; DIR is REPLAY's public TXN-DIR, so
+                           ;; "/x/txn-log" must list txn-log/, not
+                           ;; /x/: some UIOPs merge a non-directory
+                           ;; pathname as given (GH #461).
+                           (uiop:directory-files
+                            (uiop:ensure-directory-pathname dir)))
                           '> :key 'file-write-date)))
     (dolist (file candidates)
       (ecase (%snapshot-completeness file)

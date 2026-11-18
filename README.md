@@ -27,6 +27,26 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-11-18 — VivaceGraph 5.1.0 (security fix, features and fixes)
+
+A minor release, 13 changes since 5.0.0, carrying one fix every operator
+of the REST API should take: a login spliced the request's password
+into a shell command before comparing it, so anyone who knew one
+username could run commands as the server (#461, reported and fixed by
+bhwdev in PR #492); openssl and htpasswd now run from argument lists
+with the password on stdin, hashes compare in constant time and are no
+longer logged. `add-rest-user` needs htpasswd from httpd 2.4. New:
+snapshot retention, `snapshot :keep` and `*snapshot-keep*` (#441);
+`claims-by-relation` (#448); `reopen-claim` (#396). Fixed: a memory
+graph re-grids a spatial index whose declared precision changed (#66);
+`map-index-prefixes` checks its arguments on an empty index (#359);
+typed time-travel refusals (#356); count maps installed at `make-graph`
+(#363). The core no longer depends on cl-fad, trivial-shell (#461) or
+cl-json (#462). No on-disk or peer-protocol change; a 5.0 store opens as
+it is. On ECL an intermittent fault on the buffer-pool thread (#498),
+present in 5.0.0 as well, can kill an image mid-suite; SBCL and CCL are
+unaffected. See [`CHANGELOG.md`](CHANGELOG.md).
+
 ### Announcement, 2026-11-17 — VivaceGraph 5.0.0 (breaking)
 
 A major release: 43 changes since 4.1.0. The spatial contract changes

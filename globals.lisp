@@ -70,6 +70,34 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +db-version+ 1)
 
 (defvar *graph* nil)
+
+;; Three specials read by files that compile before the files that own
+;; them (GH #439; the #92 trap: a LET of an undeclared special is lexical
+;; and silently inert).  tests/check-build-warnings.sh fails the build on
+;; the undefined-variable warning that announces the next one.
+(defvar *transaction* nil
+  "The transaction open on this thread, or NIL (transactions.lisp).")
+
+(defvar *snapshot-reads-p* t
+  "When true, transactional LOOKUP-OBJECT resolves the version visible at the
+transaction's start epoch (snapshot isolation).  Prototype toggle
+(transactions.lisp).")
+
+;; An insert covers its geometry with at most this many cells.  A SAFETY
+;; NET, not a selectivity knob -- per-index precision is that knob.  Sized
+;; so nothing that works today changes behaviour: a site-scale 0.05 degree
+;; polygon is ~1,444 cells at p=7 and a city-scale 0.1 degree one ~5,476,
+;; both well under.  Per index and PERSISTED (graph.lisp), never a mutable
+;; global: SPATIAL-INDEX-REMOVE recomputes cells from the geometry, so a
+;; cap that drifted between an insert and its matching remove would orphan
+;; entries permanently (spatial-index.lisp).
+(alexandria:define-constant +spatial-insert-max-cells+ 16384 :test '=)
+
+(defvar *snapshot-keep* nil
+  "How many complete snapshots SNAPSHOT leaves under txn-log/ once it has
+written its own: NIL (the default) keeps every one, as before; an integer
+N >= 1 deletes the complete snap- files beyond the N newest.  CLOSE-GRAPH
+passes it to the snapshot it takes.  GH #441.")
 (alexandria:define-constant +main-table-file+ "main.dat" :test 'equal)
 (alexandria:define-constant +meta-file+ "meta.dat" :test 'equal)
 (alexandria:define-constant +data-file+ "data.dat" :test 'equal)

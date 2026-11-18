@@ -84,6 +84,10 @@ old value. `mark-deleted` of one deletes the live node the same way.
   value its resolved version lacks: `index-lookup`, `map-index` and
   `unique-lookup` check the version against the key (#345). Versioned
   membership is phase C-1's epoch-stamped entries (#113).
+- A node hard-removed from the tables by the peer purge path
+  (`peer-purge-node`) reports absent at an epoch before its removal,
+  like the value-index bound above: the purge takes the chain with the
+  node, so there is no version left to resolve (#356).
 - Cost: membership at an epoch walks every entry ever indexed under a
   type, including tombstones, and resolves each id. Phase C-1 (#113)
   replaces that walk with epoch-stamped index entries; the API above

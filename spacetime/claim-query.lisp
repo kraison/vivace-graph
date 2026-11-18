@@ -554,6 +554,30 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (graph-db::*transaction* (%retract))
           (t (graph-db:with-transaction () (%retract))))))
 
+(defun reopen-claim (claim &key (at (%st-now)))
+  "Open a fresh transaction period for CLAIM at AT, [AT, open): the same
+fact asserted again later, RETRACT-CLAIM's inverse (GH #396).  The
+closed period it replaces survives only in MVCC, the #148 design's
+recorded limitation (no retention of superseded periods).  A current
+claim is left as it is.  JOINS an ambient transaction when one is open
+and opens its own otherwise, as RETRACT-CLAIM does.  Trap: the extent's
+transition rule (TRANSACTION-EXTENT-STEP) is judged against the
+COMMITTED version at commit, so AT must be no earlier than the
+retraction, and a retract and a reopen of a committed CURRENT claim
+inside one transaction net to a moved start and are refused; reopen a
+retraction that has committed.  Returns the saved copy, or CLAIM itself when
+nothing was written.  REGISTER-NODE and the rules engine re-open this
+way themselves."
+  (flet ((%reopen ()
+           (let ((c (graph-db:copy claim)))
+             (setf (claim-transaction-extent-sexp c)
+                   (extent->sexp (%open-transaction-extent at)))
+             (graph-db:save c)
+             c)))
+    (cond ((claim-current-p claim) claim)
+          (graph-db::*transaction* (%reopen))
+          (t (graph-db:with-transaction () (%reopen))))))
+
 (defun claims-by-producer (graph claim-class producer
                            &key limit offset as-of as-of-epoch)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
@@ -576,13 +600,32 @@ CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
+  (%claims-by-index graph claim-class '(producer) producer
+                    limit offset as-of as-of-epoch))
+
+(defun claims-by-relation (graph claim-class relation
+                           &key limit offset as-of as-of-epoch)
+  "Every claim of CLAIM-CLASS (the PARENT; both arities) whose relation is
+RELATION, a canonical string, retracted claims included; NIL when none
+carries it.  The twin of CLAIMS-BY-PRODUCER over the (relation) index
+every family declares (GH #350), so the cost is the matching claims, not
+the store: the same :AS-OF / :AS-OF-EPOCH resolution, the same :LIMIT /
+:OFFSET with the truncated flag as the second value, and
+UNKNOWN-CLAIM-FAMILY for an unregistered class (GH #448)."
+  (%claims-by-index graph claim-class '(relation) relation
+                    limit offset as-of as-of-epoch))
+
+(defun %claims-by-index (graph claim-class slots key
+                         limit offset as-of as-of-epoch)
+  "CLAIMS-BY-PRODUCER and CLAIMS-BY-RELATION: the family's claims filed
+under KEY in its secondary index on SLOTS, resolved and paged."
   (check-type as-of-epoch (or null unsigned-byte))
   (when (and as-of as-of-epoch)
     (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
   (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((family (claim-family claim-class))
          (all (graph-db:index-lookup graph (claim-family-parent family)
-                                     '(producer) producer)))
+                                     slots key)))
     (cond (as-of
            (setf all (loop for c in all
                            for v = (%claim-as-of graph c as-of)
@@ -761,6 +804,10 @@ answer; the hand-rolled overlay that once sat here went with GH #411."
       (block walk
         (graph-db:map-index-prefixes
          (lambda (prefix)
+           ;; The raw (FIRST START) against the reported STORED component:
+           ;; on a canonicalizing index the two could differ and the walk
+           ;; would stop on its first prefix.  Claim indexes declare no
+           ;; canonicalizer, so unreachable here (GH #359).
            (when (and start (not (equal (first prefix) (first start))))
              (return-from walk))
            (admit prefix))

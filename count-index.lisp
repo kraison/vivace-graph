@@ -94,7 +94,12 @@ builds now if the graph is open.  Trap: counts are live at commit
 granularity (spec R1).  Re-evaluating an unchanged declaration is a
 no-op; to adopt a changed :CURRENT-P or :CANONICALIZE on an open graph,
 run REBUILD-COUNT-INDEXES -- the built map keeps the ones it was
-created with."
+created with.  Across a close and an open the two differ: a changed
+CURRENT-P is detected at open (its symbol is in the sidecar record) and
+the map rebuilt, but the canonicalizer is not stored, so a map keyed
+under the old one is restored as it is -- run REBUILD-COUNT-INDEXES
+after the open, as DEF-INDEX's changed-canonicalizer contract asks
+(GH #363)."
   `(let ((spec (make-count-index-spec
                 :owner-name ',owner-class
                 :slot-names (%normalize-slots ',slots)
@@ -206,15 +211,10 @@ NIL when every component is null or one is a geometry (nothing to
 count) -- the write-side mirror of %INDEX-TUPLE-KEY."
   (let ((slots (count-index-slot-names cix)))
     (when (%tuple-indexable-p node slots)
-      (let* ((cans (count-index-canonicalizers cix))
-             (any nil)
-             (key (loop for s in slots
-                        for i from 0
-                        for v = (slot-value node s)
-                        collect (cond ((null v) +null-component+)
-                                      (t (setf any t)
-                                         (let ((c (nth i cans)))
-                                           (if c (funcall c v) v)))))))
+      (multiple-value-bind (key any)
+          (%canonical-components
+           (mapcar (lambda (s) (slot-value node s)) slots)
+           (count-index-canonicalizers cix))
         (when any key)))))
 
 (defun %current-p (cix node)
@@ -608,21 +608,15 @@ list at EVERY arity, which is what a :PREFIX is documented to be
 (MAP-COUNT-INDEX passes it; COUNT-INDEX-LOOKUP keeps the value rule).
 Signals on more than the arity."
   (let* ((arity (length (count-index-slot-names cix)))
-         (cans (count-index-canonicalizers cix))
-         (vals (if (and (= arity 1) (not list-p)) (list value) value))
-         (any nil)
-         (key (loop for v in vals
-                    for i from 0
-                    collect (cond ((null v) +null-component+)
-                                  (t (setf any t)
-                                     (let ((c (nth i cans)))
-                                       (if c (funcall c v) v)))))))
-    (when (> (length vals) arity)
-      (error 'query-precondition-error
-             :reason (format nil "Count index on ~S has arity ~D; got ~D"
-                             (count-index-slot-names cix) arity
-                             (length vals))))
-    (when (or any (< (length vals) arity)) key)))
+         (vals (if (and (= arity 1) (not list-p)) (list value) value)))
+    (multiple-value-bind (key any)
+        (%canonical-components vals (count-index-canonicalizers cix))
+      (when (> (length vals) arity)
+        (error 'query-precondition-error
+               :reason (format nil "Count index on ~S has arity ~D; got ~D"
+                               (count-index-slot-names cix) arity
+                               (length vals))))
+      (when (or any (< (length vals) arity)) key))))
 
 (defun overlay-count-delta (ov cix depth prefix)
   "What the open transaction's writes add to CIX at DEPTH under PREFIX
