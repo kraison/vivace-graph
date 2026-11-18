@@ -9,7 +9,7 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
-## [Unreleased]
+## [5.1.0] - 2026-11-18
 
 ### Added
 
@@ -36,6 +36,50 @@ between releases; cutting a release renames it to the new version and dates it.
   same `:as-of` / `:as-of-epoch` resolution and `:limit` / `:offset`
   with the truncated flag. "Every claim with relation R" cost a walk of
   every endpoint before; it costs the matching claims now.
+
+### Changed
+
+- **The build fails on a full warning** (#439):
+  `tests/check-build-warnings.sh` compiles the systems from a clean
+  FASL cache in a fresh image and exits non-zero on any `WARNING` from
+  this tree that is not a style warning; CI runs it before the suites.
+  The three it found, `*transaction*`, `*snapshot-reads-p*` and
+  `+spatial-insert-max-cells+`, each read by a file compiled before the
+  file that defined it, are defined in `globals.lisp` now. None was a
+  `let` binding, so nothing behaved differently; the next one would be
+  caught before it could.
+- **An adjacency read checks its near endpoint once** (#373).
+  `map-edges` keyed on a vertex, or on an endpoint pair, checked both
+  endpoints of every edge it emitted through `active-edge-p`, though
+  the keyed endpoint is the same for the whole call; it is checked
+  once now and passed as `:known-live`, so each emitted edge costs one
+  endpoint lookup, and a dead keyed vertex walks nothing. What is
+  emitted does not change. On `bench-claim-linking` the difference is
+  within noise (`docs/perf-baselines.md`): the lookup saved was a warm
+  cache hit.
+- **`not` over a lost derivation is documented and pinned** (#479).
+  A retracted claim stays on record, so a plain `not` over a relation
+  that rules derive stays blocked after the derivation is lost, and
+  `run-rules` agrees. `docs/rules.md` "Two negations" now says so and
+  gives the current-only idiom, `(not (if (claim ...) (claim-current
+  ?r)))`; three tests pin both forms under `:commit` and `:drain
+  :caller`, and that `standing-query-problems` admits both without a
+  reason, which is the call recorded there. No engine change.
+- **`graph-db/core` no longer depends on cl-json** (#462), nor,
+  through it, does `graph-db/replication`. `graph-db/query` (the
+  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
+  `graph-db/gui` already did, so a consumer of `graph-db`,
+  `graph-db/query` or `graph-db/gui` loads it as before.
+
+### Removed
+
+- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
+  lists and walks directories with UIOP, which ships with ASDF, so
+  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
+  (`replay`'s `txn-dir`) takes the directory with or without a trailing
+  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
+  programs with UIOP. `visualize :render` hands Graphviz the paths as
+  arguments, so a path containing a space, a quote or a `;` now renders.
 
 ### Fixed
 
@@ -97,50 +141,10 @@ between releases; cutting a release renames it to the new version and dates it.
   not an error. `add-rest-user` now needs htpasswd from httpd 2.4, and
   signals an error when htpasswd fails or when the username or password
   would corrupt the file. Passwords still travel as request parameters.
-
-### Removed
-
-- **The `cl-fad` and `trivial-shell` dependencies** (#461). The core
-  lists and walks directories with UIOP, which ships with ASDF, so
-  `graph-db/core` has one dependency fewer. `find-newest-snapshot`
-  (`replay`'s `txn-dir`) takes the directory with or without a trailing
-  slash, as it did under cl-fad. `rest.lisp` and `visualize` run their
-  programs with UIOP. `visualize :render` hands Graphviz the paths as
-  arguments, so a path containing a space, a quote or a `;` now renders.
-
-### Changed
-
-- **The build fails on a full warning** (#439):
-  `tests/check-build-warnings.sh` compiles the systems from a clean
-  FASL cache in a fresh image and exits non-zero on any `WARNING` from
-  this tree that is not a style warning; CI runs it before the suites.
-  The three it found, `*transaction*`, `*snapshot-reads-p*` and
-  `+spatial-insert-max-cells+`, each read by a file compiled before the
-  file that defined it, are defined in `globals.lisp` now. None was a
-  `let` binding, so nothing behaved differently; the next one would be
-  caught before it could.
-- **An adjacency read checks its near endpoint once** (#373).
-  `map-edges` keyed on a vertex, or on an endpoint pair, checked both
-  endpoints of every edge it emitted through `active-edge-p`, though
-  the keyed endpoint is the same for the whole call; it is checked
-  once now and passed as `:known-live`, so each emitted edge costs one
-  endpoint lookup, and a dead keyed vertex walks nothing. What is
-  emitted does not change. On `bench-claim-linking` the difference is
-  within noise (`docs/perf-baselines.md`): the lookup saved was a warm
-  cache hit.
-- **`not` over a lost derivation is documented and pinned** (#479).
-  A retracted claim stays on record, so a plain `not` over a relation
-  that rules derive stays blocked after the derivation is lost, and
-  `run-rules` agrees. `docs/rules.md` "Two negations" now says so and
-  gives the current-only idiom, `(not (if (claim ...) (claim-current
-  ?r)))`; three tests pin both forms under `:commit` and `:drain
-  :caller`, and that `standing-query-problems` admits both without a
-  reason, which is the call recorded there. No engine change.
-- **`graph-db/core` no longer depends on cl-json** (#462), nor,
-  through it, does `graph-db/replication`. `graph-db/query` (the
-  pattern DSL) and `graph-db` (`rest.lisp`) declare it now, and
-  `graph-db/gui` already did, so a consumer of `graph-db`,
-  `graph-db/query` or `graph-db/gui` loads it as before.
+  On ECL, where `launch-program` hands back one two-way stream for both
+  directions and no stderr stream, the child's stdin half is closed
+  explicitly, or `openssl passwd -stdin` never answered and every login
+  hung (#497, found by the 5.1.0 gate).
 
 ## [5.0.0] - 2026-11-17
 
