@@ -97,6 +97,10 @@ between releases; cutting a release renames it to the new version and dates it.
   not an error. `add-rest-user` now needs htpasswd from httpd 2.4, and
   signals an error when htpasswd fails or when the username or password
   would corrupt the file. Passwords still travel as request parameters.
+  On ECL, where `launch-program` hands back one two-way stream for both
+  directions and no stderr stream, the child's stdin half is closed
+  explicitly, or `openssl passwd -stdin` never answered and every login
+  hung (#497, found by the 5.1.0 gate).
 
 ### Removed
 
