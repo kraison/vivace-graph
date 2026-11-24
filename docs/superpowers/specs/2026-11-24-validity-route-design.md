@@ -126,14 +126,18 @@ every family's parent class, next to `claim-touched-at`:
 ```
 
 - **Currency**, from `transaction-extent-sexp`: one value for a current
-  claim (the transaction period is open or absent, as `claim-current-p`
-  reads it) and another for a retracted one.
+  claim (an open transaction period) and another for a retracted one.
+  Core never passes a NIL slot to a canonicalizer: it stores
+  `+null-component+` (`%canonical-components`, index.lisp). An
+  unstamped claim, one with no transaction extent, is current to
+  `claim-current-p`, so the route reads the null-currency bucket as
+  current too (§2).
 - **Validity end**, from `extent-sexp`: one value for an open claim,
   where the end's latest edge is `:unbounded` (an unknown end counts as
   open). Otherwise it is the latest edge as `%timestamp-key`'s
   `(day sec nsec)`, which orders like the instant it encodes. A claim
-  with no extent is never valid at any T and gets its own value, which
-  no read visits.
+  with no extent is never valid at any T. It sits under the null
+  component, which no read visits.
 - **The invariant** a test pins: a claim is outside both read ranges
   (§2) only if its latest validity end is before T, or it is retracted.
   So every claim the route skips is one that `claim-valid-at/2` or
@@ -169,10 +173,18 @@ Otherwise it answers by `claim-after/9`'s route plus the two filters.
   relation bound: the namespace is bound and names a keyword, the
   subject key is unbound, and the relation is bound.
 - `?at` is bound to an instant, read as `claim-valid-at/2` reads it.
-- No store in scope is read under a snapshot (`*read-snapshots*`) or an
-  as-of epoch. The index releases an entry when a write applies (GH
-  #345), so at an older epoch a claim that was closed later is missing
-  from the open bucket.
+- No read-write transaction covers a store in scope (`*transaction*`),
+  and no store is read under a snapshot (`*read-snapshots*`) or an
+  as-of epoch.
+  - A transaction reads at its start epoch (`lookup-object`,
+    transactions.lisp), and `call-with-read-snapshot` inside one enters
+    nothing in `*read-snapshots*`.
+  - The index releases an entry when a write applies (GH #345). So at
+    an older epoch, a claim that a later commit closed has already lost
+    its open entry, while it still resolves as open.
+  - `profile-goals` always runs under `:snapshot`
+    (prolog-explain.lisp), so `profile-text` measures the fallback. The
+    docs say so.
 - Every store in scope that carries the family has the index.
 - The **closed set** is within the cap. This is every current claim of
   the namespace and relation whose validity end is at or after T, over
@@ -181,9 +193,14 @@ Otherwise it answers by `claim-after/9`'s route plus the two filters.
 
 **The validity route, per page:**
 
-1. **The closed set:** for each store, one index range from (namespace,
-   relation, current, T's key) up to the last closed end. It holds the
-   claims that were valid at some instant at or after T: the claims
+Each step reads two currency buckets per store: current, and the null
+component, which holds unstamped claims (§1). That is four index ranges
+per store.
+
+1. **The closed set:** for each store and bucket, one index range from
+   (namespace, relation, currency, T's key) up to the last closed end.
+   It holds the claims that were valid at some instant at or after T:
+   the claims
    closed during a read whose T is its start, and instants recorded
    after T. The route sorts them by (key, store order, id).
 2. **The open bucket:** for each store, the index's (namespace,
@@ -199,9 +216,11 @@ Otherwise it answers by `claim-after/9`'s route plus the two filters.
 4. This run's own derivation (`%derived-all`) follows at the end,
    unfiltered, as it does today.
 
-Reads go through the same overlay rules as `map-index` (GH #408), so a
-query inside a transaction sees its own writes. An entry's node is
-checked with `%index-hit-p` as `map-index` checks it.
+The route never runs inside a transaction, so it needs no overlay merge.
+That also avoids a second ordering problem: `index-lookup` puts a
+transaction's own claims after the committed ones within a key, while
+`map-index` merges them in by key and id. An entry's node is checked
+with `%index-hit-p` as `map-index` checks it.
 
 A claim that is open but starts after T is read and then rejected by
 the filter. That costs one candidate per claim written after T, which
@@ -247,18 +266,30 @@ its input `eq` when nothing fuses.
 that says to write the three goals. The rewrite still applies where
 #451's does.
 
-`explain-goals` reports the fused goal's route: "validity index from
-the key bound" when the validity route would be taken, otherwise
-`claim-after/9`'s row. `docs/rules.md` gets that row in its route
-table.
+`explain-goals` gets a row for a hand-written `claim-current-valid/10`:
+"validity index from the key bound, or claim-after's route; decided at
+run time". It cannot know the cap or the snapshot state without running
+the query. `explain-goals` doesn't apply the rewriters
+(prolog-explain.lisp), so the three-goal text keeps explaining as the
+vocabulary route, as #392's text does (`docs/rules.md` says so for the
+touched-at row). `docs/rules.md` gets the row and that note.
 
 ### 4. Budget and timeout
 
-A skipped claim calls no goal, so it costs no inference. A skipped key
-in the open bucket is one string comparison, as under #451. The closed
-set costs one index step per entry, bounded by the cap. The route ticks
-once per candidate it emits, so a budget or deadline still preempts
-between candidates.
+The functor calls `%tick` once for each candidate claim it resolves, on
+every route, the fallback included, whether or not the claim then
+passes its two filters. So a budget or deadline still preempts between
+claims. It is not once per row emitted: the functor filters inside
+Lisp, so a run of rejected claims would otherwise be work no bound can
+stop, against GH #285's rule ("the work between two `%TICK`s is one
+key's claims").
+
+A claim the index skips is never resolved, so it costs no inference. A
+skipped key in the open bucket is one string comparison on the entry's
+stored key, as under #451. The closed set costs one index step per
+entry, bounded by the cap; an entry is resolved, and ticks, only when
+it is a candidate for the page. On the fallback a closed claim costs
+one inference, against about four today.
 
 ### 5. The race
 
@@ -327,8 +358,10 @@ consumer's pin issue.
   - `:offset` paging inside one key;
   - T given through a variable bound earlier.
 
-  The fallbacks are each shown to answer the same: a free T, `:as-of`,
-  a snapshot, and a closed set over the cap.
+  The fixture also holds unstamped claims (no transaction extent). The
+  fallbacks are each shown to answer the same: a free T, `:as-of`, a
+  snapshot, a read-write transaction (including one where another
+  commit closed a claim after it began), and a closed set over the cap.
 - **The index.** A close moves the entry, a retraction moves it, and a
   re-assertion moves it back. An index rebuilt at open
   (`regenerate-secondary-indexes`) equals the maintained one, entry for
@@ -368,6 +401,20 @@ consumer's pin issue.
   page. It is the call to check first.
 - **The functor's name and arity.** `claim-current-valid/10` names the
   two goals it fuses and carries #451's two key bounds plus T.
+- **Fall back inside any read-write transaction and under any snapshot.**
+  Cost: `profile-text` on the recommended query shows the fallback's
+  cost, and a query inside a transaction keeps today's route. The
+  alternative was taking the route while no commit has applied since
+  the snapshot's epoch, which still races a commit made during the page.
+- **One inference per candidate resolved, on every route** (§4). Cost:
+  the fused fallback's inference count differs from today's, lower per
+  closed claim.
+- **Unstamped claims are read from the null-currency bucket.** That is
+  four ranges per store instead of two. The alternatives were declaring
+  them out of scope, or changing core so canonicalizers see NIL.
+- **`explain-goals` reports the fused route only for hand-written goal
+  text, following #392.** Making it apply the rewriters would change
+  #451's and #392's rows too, so that is its own issue if wanted.
 
 ## Left to the builder
 
