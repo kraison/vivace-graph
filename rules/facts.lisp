@@ -395,6 +395,16 @@ is every family's."
 
 (register-access-path 'claim-touched-after/4 #'%explain-touched-path)
 
+(defun %explain-validity-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM-CURRENT-VALID/10 goal (GH #499,
+design §3): which route it takes is decided at run time, so the row
+names both."
+  (declare (ignore bound args graph))
+  (format nil "validity index from the key bound, or claim-after's ~
+route; decided at run time"))
+
+(register-access-path 'claim-current-valid/10 #'%explain-validity-path)
+
 (defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
                     skey-after okey-after cont &key filter)
   "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
@@ -500,7 +510,9 @@ store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
 NIL; a bound ?C and the empty fast paths read no store at all (spec
 §10, GH #332).  Solution order: docs/rules.md \"Solution order\".
 A > on the key right after this goal compiles to CLAIM-AFTER/9, which
-starts the namespace route at the bound (#451)."
+starts the namespace route at the bound (#451).  This goal followed at
+once by (CLAIM-CURRENT ?C) and (CLAIM-VALID-AT ?C T) compiles to
+CLAIM-CURRENT-VALID/10, the two filters kept (#499)."
   (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil cont))
 
 (def-global-prolog-functor claim-after/9
@@ -665,6 +677,93 @@ than the family's tail.  Returns GOALS itself when nothing fuses
     (if changed (nreverse out) goals)))
 
 (pushnew '%fuse-touched-cursor *clause-body-rewriters*)
+
+;;; The validity rewrite (#499, design §3): a CLAIM/7 or CLAIM-AFTER/9
+;;; goal followed at once by (claim-current ?c) and (claim-valid-at ?c
+;;; T), in either order, compiles to CLAIM-CURRENT-VALID/10 with both
+;;; filters kept.  It runs LAST: the key-bound rewrite must have made
+;;; the CLAIM-AFTER/9 this one sees.
+
+(defun %validity-kept-comparisons (claim-goal following)
+  "FOLLOWING's leading > goals on CLAIM-GOAL's key variables: the ones
+%FUSE-KEY-BOUNDS left there (GH #499, design §3)."
+  (let ((skey (fifth claim-goal)) (okey (eighth claim-goal)))
+    (loop for tail on following
+          for goal = (first tail)
+          while (or (and (variable-p skey) (%key-bound-goal-p goal skey))
+                    (and (variable-p okey) (%key-bound-goal-p goal okey)))
+          collect goal)))
+
+(defun %validity-filter-at (g1 g2 c)
+  "(CLAIM-CURRENT C) and (CLAIM-VALID-AT C T) in either order: T when
+it is a string literal or a variable, NIL otherwise (GH #499, design
+§3)."
+  (flet ((current (g)
+           (and (%engine-functor-goal-p g "CLAIM-CURRENT" 1)
+                (eq (second g) c)))
+         (valid-at (g)
+           (and (%engine-functor-goal-p g "CLAIM-VALID-AT" 2)
+                (eq (second g) c)
+                (let ((at (third g)))
+                  (and (or (stringp at) (variable-p at)) at)))))
+    (cond ((and (current g1) (valid-at g2)) (third g2))
+          ((and (valid-at g1) (current g2)) (third g1)))))
+
+(defun %validity-fusion (claim-goal earlier following)
+  "(VALUES FUSED CONSUMED) when CLAIM-GOAL and its two filters in
+FOLLOWING fuse into CLAIM-CURRENT-VALID/10: FUSED is the replacement
+goals, the fused goal then the kept comparisons then both filters, and
+CONSUMED the number of FOLLOWING goals it takes; NIL otherwise.
+EARLIER is the body before CLAIM-GOAL, so ?C is fresh (GH #499, design
+§3).  A variable T the claim goal binds is not fused: the fused goal
+reads T when it is called, so T would be free there."
+  ;; The functor test first: a goal may be an atom, such as !.
+  (let ((c (and (or (%engine-functor-goal-p claim-goal "CLAIM" 7)
+                    (%engine-functor-goal-p claim-goal "CLAIM-AFTER" 9))
+                (second claim-goal))))
+    (when (and (%named-variable-p c)
+               (notany (lambda (g) (%var-occurs-p c g)) earlier))
+      (let* ((kept (%validity-kept-comparisons claim-goal following))
+             (filters (nthcdr (length kept) following))
+             (at (%validity-filter-at (first filters) (second filters) c)))
+        (when (and at
+                   (or (stringp at)
+                       (notany (lambda (arg) (%var-occurs-p at arg))
+                               (rest claim-goal))))
+          (values (append
+                   (list
+                    (list* (intern "CLAIM-CURRENT-VALID"
+                                   (symbol-package 'claim/7))
+                           (append (rest claim-goal)
+                                   (if (%engine-functor-goal-p
+                                        claim-goal "CLAIM-AFTER" 9)
+                                       (list at)
+                                       (list nil nil at)))))
+                   kept
+                   (list (first filters) (second filters)))
+                  (+ (length kept) 2)))))))
+
+(defun %fuse-validity (goals)
+  "GOALS with each CLAIM/7 or CLAIM-AFTER/9 goal whose two filters
+follow it at once rewritten to CLAIM-CURRENT-VALID/10, both filters
+kept.  Returns GOALS itself when nothing fuses (GH #499, design §3)."
+  (let ((out '()) (changed nil) (rest goals))
+    (loop while rest
+          do (let ((goal (pop rest)))
+               (multiple-value-bind (fused consumed)
+                   (%validity-fusion goal out rest)
+                 (cond (fused
+                        (setf changed t)
+                        (dotimes (i consumed) (pop rest))
+                        (dolist (g fused) (push g out)))
+                       (t (push goal out))))))
+    (if changed (nreverse out) goals)))
+
+;; Runs last: PUSHNEW would put it first, before %FUSE-KEY-BOUNDS has
+;; made the CLAIM-AFTER/9 this rewrite must see (GH #499, design §3).
+(setf *clause-body-rewriters*
+      (append (remove '%fuse-validity *clause-body-rewriters*)
+              '(%fuse-validity)))
 
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
@@ -1090,7 +1189,9 @@ one arity per premise count."
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601
 string or a timestamp); a claim with no extent makes no validity
 statement and never matches.  Shares CLAIMS-TOUCHING's predicate and
-probe shape, so the two cannot diverge (spec §11)."
+probe shape, so the two cannot diverge (spec §11).  With a preceding
+CLAIM/7 and CLAIM-CURRENT/1 the compiler fuses the three into
+CLAIM-CURRENT-VALID/10 (#499)."
   (let ((c (%claim-arg ?c))
         (at (%instant-arg ?at)))
     (when (and c at
@@ -1285,7 +1386,10 @@ design §2).  Answers by the validity route when its conditions hold
 applied before unification.  Every candidate resolved ticks once, on
 every route, so a budget or deadline preempts between claims (design
 §4).  The compiler writes this goal for the fused three-goal text; it
-may be written by hand, except in a rule body (GH #499)."
+may be written by hand, except in a rule body (GH #499).  Trap: ?AT is
+read when this goal is called, so a ?AT the claim goal binds is free
+here and fails every claim; the rewrite leaves that shape alone
+(design §3)."
   (let* ((family (%family-or-ill-typed ?family))
          (at (%instant-arg ?at))
          (c (%prolog-index-bound ?c))

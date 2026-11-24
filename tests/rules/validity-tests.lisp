@@ -450,3 +450,224 @@ keys before the bound."
       (is (equal '("d020" "d021" "d022" "d023" "d024")
                  (mapcar #'first rows)))
       (is (<= 5 calls 7)))))
+
+;;; --- Task 4: the rewrite, rule bodies and explain -----------------------
+
+(defun %validity-rewritten (goals)
+  "GOALS through the validity rewrite."
+  (graph-db::%fuse-validity goals))
+
+(test the-validity-rewrite-fuses-both-orders
+  "The three-goal text, its filters in either order, fuses to
+CLAIM-CURRENT-VALID/10 with both filters kept (GH #499, design §3)."
+  (let* ((body '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+                 (claim-current ?c)
+                 (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z")))
+         (out (%validity-rewritten body)))
+    (is (= 3 (length out)))
+    (is (string= "CLAIM-CURRENT-VALID" (symbol-name (first (first out)))))
+    (is (equal '(?c rt-claim "host" ?k "runs" ?ons ?o nil nil
+                 "2026-06-01T00:00:00.000000000Z")
+               (rest (first out))))
+    (is (equal (rest body) (rest out))))
+  (let* ((body '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+                 (claim-valid-at ?c ?t)
+                 (claim-current ?c)))
+         (out (%validity-rewritten body)))
+    (is (= 3 (length out)))
+    (is (equal '(?c rt-claim "host" ?k "runs" ?ons ?o nil nil ?t)
+               (rest (first out))))
+    (is (equal (rest body) (rest out)))))
+
+(test the-validity-rewrite-fuses-behind-a-key-bound
+  "The key-bound rewrite's output -- CLAIM-AFTER/9 and its kept
+comparison -- fuses too, the comparison kept (GH #499, design §3)."
+  (let* ((body '((claim-after ?c rt-claim "host" ?k "runs" ?ons ?o
+                              "k1" nil)
+                  (> ?k "k1")
+                  (claim-current ?c)
+                  (claim-valid-at ?c ?t)))
+         (out (%validity-rewritten body)))
+    (is (= 4 (length out)))
+    (is (string= "CLAIM-CURRENT-VALID" (symbol-name (first (first out)))))
+    (is (equal '(?c rt-claim "host" ?k "runs" ?ons ?o "k1" nil ?t)
+               (rest (first out))))
+    (is (equal '(> ?k "k1") (second out)))
+    (is (equal '((claim-current ?c) (claim-valid-at ?c ?t))
+               (cddr out)))))
+
+(test the-validity-rewrite-leaves-every-other-shape-alone
+  "Everything outside design §3's conditions is returned EQ (GH #499):
+one filter, a goal between, another ?C, a ?C bound earlier, a T the
+claim goal binds, a numeric T, no claim goal, and nothing."
+  (flet ((same (body) (is (eq body (%validity-rewritten body)))))
+    (same '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+            (claim-current ?c)))
+    (same '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+            (true)
+            (claim-current ?c)
+            (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z")))
+    (same '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+            (claim-current ?d)
+            (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z")))
+    (same '((claim-touched-after ?c ?t "rtt-claim")
+            (claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+            (claim-current ?c)
+            (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z")))
+    (same '((claim ?c rt-claim "host" ?k "runs" ?ons ?ok)
+            (claim-current ?c)
+            (claim-valid-at ?c ?ok)))
+    (same '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+            (claim-current ?c)
+            (claim-valid-at ?c 5)))
+    (same '((claim-current ?c) (claim-valid-at ?c ?t)))
+    (same '())))
+
+(test the-rewriters-run-in-order
+  "The validity rewrite runs after the key-bound and cursor rewrites, so
+it sees the CLAIM-AFTER/9 the first makes (GH #499, design §3)."
+  (let* ((order graph-db:*clause-body-rewriters*)
+         (validity (position 'graph-db::%fuse-validity order))
+         (keys (position 'graph-db::%fuse-key-bounds order))
+         (cursor (position 'graph-db::%fuse-touched-cursor order)))
+    (is (not (null validity)))
+    (is (not (null keys)))
+    (is (not (null cursor)))
+    (is (> validity keys))
+    (is (> validity cursor))
+    (is (eq 'graph-db::%fuse-validity (car (last order))))))
+
+(test the-recommended-valid-at-text-reads-no-closed-history
+  "The three goals plus a > on the key, as the docs recommend, fuse to
+the validity route: the page answers under Task 3's 200-inference
+budget and resolves only its own rows (GH #499, design §3)."
+  (with-rules-graph (g)
+    (%seed-validity-history g)
+    (let ((*validity-at* (validity-instant *validity-t0*))
+          (rows nil) (calls 0))
+      (counting-resolutions (resolved)
+        (setf rows
+              (select (:max-inferences 200 :limit 10) (?k)
+                (lisp ?at *validity-at*)
+                (claim ?c rtt-claim "vt" ?k "rel" ?ons ?ok)
+                (> ?k "c999")
+                (claim-current ?c)
+                (claim-valid-at ?c ?at)))
+        (setf calls resolved))
+      (is (= 10 (length rows)))
+      (is (equal "d000" (first (first rows))))
+      (is (<= 10 calls 12)))))
+
+(test the-guard-path-is-fused-for-valid-at
+  "The recommended valid-at text through RUN-GUARDED-PROLOG answers its
+page under the same budget, so the guard's compile fused it (GH #499,
+design §3)."
+  (with-rules-graph (g)
+    (%seed-validity-history g)
+    (let ((graph-db::*query-default-max-inferences* 200))
+      (multiple-value-bind (columns rows)
+          (graph-db.query:run-guarded-prolog
+           (format nil "(claim ?c rtt-claim \"vt\" ?k \"rel\" ?ons ?ok) ~
+(> ?k \"c999\") (claim-current ?c) (claim-valid-at ?c ~S)"
+                   (validity-instant *validity-t0*))
+           g :limit 10)
+        (let ((k (position "k" columns :test #'string=)))
+          (is (= 10 (length rows)))
+          (is (equal "d000" (nth k (first rows)))))))))
+
+(defun %vf-head (relation)
+  "A VREACHES-shaped rtt-claim head over RELATION."
+  (format nil "(claim ?c rtt-claim \"vt\" ?a ~S \"vt\" ?b)" relation))
+
+(defun %vf-body (at relation &key true-between step)
+  "A closure body over \"next\" and RELATION.  The three goals read
+\"next\", or with STEP the recursive RELATION premise after a \"next\"
+goal; TRUE-BETWEEN puts (TRUE) before their filters."
+  (let ((filters (format nil "~A (claim-current ?q) (claim-valid-at ?q ~S)"
+                         (if true-between " (true)" "") at)))
+    (if step
+        (format nil "(claim ?p rtt-claim \"vt\" ?a \"next\" \"vt\" ?m) ~
+(claim ?q rtt-claim \"vt\" ?m ~S \"vt\" ?b)~A" relation filters)
+        (format nil "(claim ?q rtt-claim \"vt\" ?a \"next\" \"vt\" ?b)~A"
+                filters))))
+
+(defun %vf-link (g from to)
+  "A \"next\" rtt-claim FROM -> TO open from 2026-01-01, producer
+\"seed-a\"."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rtt-claim-binary
+     :graph g :subject-namespace :vt :subject-key from
+     :relation "next" :object-namespace :vt :object-key to
+     :producer "seed-a" :standing :observed
+     :extent (%validity-open-extent (ts 2026 1 1)))))
+
+(defun %vf-pairs (g relation)
+  "The (subject . object) pairs of the current claims of RELATION,
+sorted."
+  (sort (mapcar (lambda (c)
+                  (cons (claim-subject-key c) (claim-object-key c)))
+                (remove-if-not #'claim-current-p
+                               (claims-by-relation g 'rtt-claim relation)))
+        (lambda (a b)
+          (if (string= (car a) (car b))
+              (string< (cdr a) (cdr b))
+              (string< (car a) (car b))))))
+
+(test a-fused-rule-body-derives-as-the-three-goals
+  "Rules whose premises carry the two filters derive what the same
+bodies with a (TRUE) before them derive, and the rewrite fused one
+(GH #499, design §3).  Trap: a semi-naive variant moves the recursive
+premise first, so only the full evaluation runs it fused."
+  (with-rules-graph (g)
+    (%vf-link g "a" "b")
+    (%vf-link g "b" "c")
+    (%vf-link g "c" "d")
+    (let* ((at (validity-instant *validity-t0*))
+           (fused 0)
+           ;; Counts the bodies the rewrite changes, so the agreement
+           ;; below is between a fused and an unfused body.
+           (graph-db:*clause-body-rewriters*
+             (substitute (lambda (goals)
+                           (let ((out (graph-db::%fuse-validity goals)))
+                             (unless (eq out goals) (incf fused))
+                             out))
+                         'graph-db::%fuse-validity
+                         graph-db:*clause-body-rewriters*)))
+      (write-rule g :name "vf-base" :version "1" :family "rtt-claim"
+                  :head (%vf-head "freaches")
+                  :body (%vf-body at "freaches"))
+      (write-rule g :name "vf-step" :version "1" :family "rtt-claim"
+                  :head (%vf-head "freaches")
+                  :body (%vf-body at "freaches" :step t))
+      (write-rule g :name "vu-base" :version "1" :family "rtt-claim"
+                  :head (%vf-head "ureaches")
+                  :body (%vf-body at "ureaches" :true-between t))
+      (write-rule g :name "vu-step" :version "1" :family "rtt-claim"
+                  :head (%vf-head "ureaches")
+                  :body (%vf-body at "ureaches" :step t :true-between t))
+      (graph-db.rules:run-rules g)
+      (is (plusp fused) "a rule body was fused")
+      (is (equal (%vf-pairs g "freaches") (%vf-pairs g "ureaches")))
+      (is (member (cons "a" "d") (%vf-pairs g "freaches")
+                  :test #'equal)
+          "the fused premise read two hops this run derived"))))
+
+(test the-validity-rewrite-passes-a-cut
+  "A body holding an atom goal such as ! rewrites without signalling:
+the three goals after a cut fuse, a cut between them blocks the fusion
+and returns the body EQ, and a cut alone is left alone (GH #499)."
+  (let* ((body '(! (claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+                 (claim-current ?c)
+                 (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z")
+                 !))
+         (out (%validity-rewritten body)))
+    (is (eq '! (first out)))
+    (is (string= "CLAIM-CURRENT-VALID" (symbol-name (first (second out)))))
+    (is (eq '! (car (last out)))))
+  (let ((body '((claim ?c rt-claim "host" ?k "runs" ?ons ?o)
+                !
+                (claim-current ?c)
+                (claim-valid-at ?c "2026-06-01T00:00:00.000000000Z"))))
+    (is (eq body (%validity-rewritten body))))
+  (let ((body '(!)))
+    (is (eq body (%validity-rewritten body)))))

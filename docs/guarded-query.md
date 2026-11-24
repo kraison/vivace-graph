@@ -138,6 +138,28 @@ What this is and is not:
   (GH #451; the condition and what is not fused are in `docs/rules.md`
   "Solution order"). A `>` separated from the goal still works, at the
   old price of the discarded keys' claims.
+- **A valid-at page costs what it returns.** The three-goal text
+  `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-current ?c) (claim-valid-at
+  ?c T)`, with the filters right after the claim goal, fuses to
+  `claim-current-valid/10` (#499): the page reads the relation's open
+  claims in key order and merges in the few that closed at or after
+  `T`, so history that ended before `T` costs nothing. A free `T`, a
+  goal between the claim goal and its filters, `:as-of`, a snapshot, a
+  read-write transaction, and a closed set over the cap keep today's
+  cost -- the vocabulary route with both filters -- and `profile-text`
+  always measures that fallback, since `profile-goals` reads under a
+  snapshot. The conditions are in `docs/rules.md`, "The validity
+  route".
+- **A claim can close mid-page, and the page leaves it out.** The page
+  takes no snapshot: a claim can close after the closed set was
+  collected and before the open-bucket walk reaches it, so its open
+  entry is gone and its new entry is not in the collected set. The
+  unfused route would return it. The validity route never returns a
+  wrong row, and a later read at a later `T` is right. **Accepted**
+  (#499, design §5): pages are already not atomic across their run -- a
+  claim written mid-read at a key before the bound is missed by every
+  later page -- and holding the claim class's read lock for a page
+  would make every writer wait on readers.
 - **Not a snapshot cursor.** Each call runs under its own read
   snapshot; nothing is held between pages, so nothing expires and
   nothing needs a token. A resumable cursor -- a suspended run holding

@@ -60,6 +60,8 @@ pathname and its `graph-db.rules` package are unchanged.
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-after ?c family ?sns ?skey ?rel ?ons ?okey skey-after okey-after)
+(claim-current-valid ?c family ?sns ?skey ?rel ?ons ?okey
+                     skey-after okey-after instant)
 (claim-absent ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
@@ -76,6 +78,7 @@ pathname and its `graph-db.rules` package are unchanged.
 |---|---|
 | `claim/7` | a claim of `family`, and its endpoints |
 | `claim-after/9` | `claim/7`'s rows with strict lower bounds on both keys, the namespace route started at the bound; "Solution order" (GH #451) |
+| `claim-current-valid/10` | `claim-after/9`'s rows that are current and possibly valid at `instant`, in its order: the validity-index route when its conditions hold, else `claim-after/9`'s route with both filters; the compiler writes it for the fused three-goal text (#499) |
 | `claim-absent/7` | `claim/7`'s rows restricted to current claims of standing `:searched-empty` or `:determined-empty`: the determined absences (D2) |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
@@ -334,6 +337,50 @@ make it a generator the reads and strata analyses never counted.
 from the cursor", "touched-at index of every family from the cursor"
 or "that claim".
 
+**The validity route (#499).** A page of claims holding at `T` is the
+three-goal text `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-current ?c)
+(claim-valid-at ?c "<T>")`. Left as written it is the vocabulary route
+with two filters: every key's claims, closed history included, are
+read and then rejected one at a time. So every claim family carries a
+second ordered index (`claim-validity`, declared by
+`def-claim-classes`) keyed by whether the claim is current and where
+its validity ends, and the compiler fuses the goal and its two filters
+into `claim-current-valid/10`. The fused goal takes the validity route
+when all of these hold at run time, and otherwise answers by
+`claim-after/9`'s route plus both filters:
+
+- the route `claim/7` would take is the subject vocabulary route with
+  the relation bound: the namespace is bound and names a keyword, the
+  subject key is unbound;
+- `?at` is bound to an instant, read as `claim-valid-at/2` reads it;
+- no read-write transaction covers a store in scope, and no store is
+  read under a snapshot or an as-of epoch;
+- every store in scope that carries the family has the index;
+- the closed set -- every current claim of the namespace and relation
+  whose validity end is at or after `T`, over the stores in scope -- is
+  within 10,000 entries (`*validity-closed-cap*`).
+
+The route reads the claims still open, in key order, and merges in the
+few that closed at or after `T`. A claim closed before `T`, and a key
+all of whose claims were, is never resolved. A retracted claim is
+skipped too, since `claim-current` is in the shape. A claim open but
+starting after `T` is read and then rejected; that is one candidate per
+claim written after `T`. Both filters stay in the body, so the route
+can only skip a claim they would reject. `explain-goals` does not apply
+the rewriters, so the three-goal text still explains as the vocabulary
+route; a hand-written `claim-current-valid/10` reports "validity index
+from the key bound, or claim-after's route; decided at run time".
+`profile-goals` runs under a snapshot, so `profile-text` measures the
+fallback. A rule body may not name `claim-current-valid`: `compile-rule`
+refuses it, and the rewrite fuses the three goals there as it does
+#451's comparison.
+
+In one accepted race a claim can close while a page is being read: its
+open entry is gone and its new entry was not in the closed set the page
+collected, so the page leaves it out. The route never returns a wrong
+row, and a later read at a later `T` is right; "Paging" in
+`docs/guarded-query.md` says why that is accepted (design §5).
+
 `claim/7` is deliberately **not** `declare-functor-cost-unbounded`'d.
 That classifies a whole functor, and `%excluded-predicate-p` would
 then withhold `claim` from free text entirely -- breaking the guarded
@@ -393,6 +440,13 @@ reads and strata analyses recognise `claim/7` by name -- and writes
 `claim/7` and the comparison instead, which the rule's run fuses.
 Neither offset nor key bound is a snapshot cursor;
 `docs/guarded-query.md` "Paging" has the trade-off.
+
+The validity route answers in `claim-after/9`'s order: the stores in
+scope, own store first, keys ascending, and within a key the own
+store's claims in id order then each foreign store's
+(`claim-current-valid/10`, #499). It reads a subset of the same rows in
+the same order, so paging is unchanged: the fused text pages exactly as
+the three goals do.
 
 ## Unknown names
 

@@ -63,3 +63,25 @@ time only when the route consulted it (design D3, docs/rules.md)."
     (is (search "by value at run time"
                 (ter-path '(claim ?c rt-claim ?ns "h1" ?r ?ons ?o)
                           '((= ?ns "host")))))))
+
+(test explain-names-the-validity-row
+  "A hand-written CLAIM-CURRENT-VALID/10 explains as the run-time choice
+and the three-goal text keeps its vocabulary route: explain-goals does
+not apply the rewriters (GH #499, design §3)."
+  (with-rules-graph (g)
+    (seed g)
+    (is (search "validity index from the key bound"
+                (ter-path '(claim-current-valid
+                            ?c rt-claim "vt" ?k "rel" ?ons ?o
+                            nil nil "2026-06-01T00:00:00.000000000Z"))))
+    (is (search "decided at run time"
+                (ter-path '(claim-current-valid
+                            ?c rt-claim "vt" ?k "rel" ?ons ?o
+                            nil nil "2026-06-01T00:00:00.000000000Z"))))
+    (let ((rows (graph-db:explain-goals
+                 '() '((claim ?c rt-claim "vt" ?k "rel" ?ons ?o)
+                       (claim-current ?c)
+                       (claim-valid-at
+                        ?c "2026-06-01T00:00:00.000000000Z")))))
+      (is (search "vocabulary route, subject"
+                  (getf (first rows) :path))))))

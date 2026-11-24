@@ -21,6 +21,37 @@ between releases; cutting a release renames it to the new version and dates it.
   every closed end. A page of claims valid at an instant can then read
   the open claims in key order and skip the history that ended before
   it. The route that reads the index lands in a later change.
+- **`claim-current-valid/10` and the validity rewrite** (#499): the
+  fused form of a claim store's commonest page -- `(claim ...)
+  (claim-current ?c) (claim-valid-at ?c T)` -- `claim-after/9`'s rows
+  filtered to the current claims whose validity possibly contains `T`,
+  in `claim-after/9`'s order. The compiler fuses the three goals when
+  the filters sit right after the claim goal, `?c` is a fresh named
+  variable and `T` is a literal or a variable the claim goal does not
+  bind; both filters stay in the body, so a route that skips a claim
+  skips one they reject. The validity route reads the new index's open
+  claims in key order and merges in the ones that closed at or after
+  `T`. A free `T`, a goal in between, `:as-of`, a snapshot, a read-write
+  transaction, a store without the index, or a closed set over
+  `*validity-closed-cap*` (10,000) fall back to `claim-after/9`'s route
+  with both filters. `compile-rule` refuses the functor in a rule body
+  and the rewrite fuses the three goals there; `explain-goals` names
+  the run-time choice for a hand-written goal.
+
+### Changed
+
+- **A page of claims valid at an instant costs what it returns** (#499).
+  The three-goal text `(claim ...) (claim-current ?c) (claim-valid-at ?c
+  T)` no longer walks the relation's closed history: fused to
+  `claim-current-valid/10`, it reads the claims still open in key order
+  and merges in those closed at or after `T`, so its cost tracks the
+  rows it returns. The same rows answer in the same order, and
+  `:offset` paging is unchanged; `:as-of`, a free `T` and a `T` far
+  enough back that the closed set is over the cap keep today's cost. A
+  claim that
+  closes during the page may be left out of it (accepted,
+  `docs/guarded-query.md` "Paging"). `profile-text` always measures the
+  fallback, since `profile-goals` reads under a snapshot.
 
 ## [5.1.0] - 2026-11-18
 

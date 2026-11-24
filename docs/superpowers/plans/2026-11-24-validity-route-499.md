@@ -379,11 +379,15 @@ Spec §3, §5, §7.
     `select`. It answers under the same budget, so the rewrite fused it.
   - `the-guard-path-is-fused-for-valid-at`: the same text through
     `run-guarded-prolog` answers under the same budget.
-  - `a-fused-rule-body-sees-this-runs-derivations`: a rule whose body is
-    the three goals, over a family the same run derives into, gives the
-    same derived claims as the rule with a `(true)` between the claim
-    goal and its filters. This is the spec's "a derivation in the run"
-    case: `%derived-all` follows the route.
+  - `a-fused-rule-body-derives-as-the-three-goals` (written as
+    `a-fused-rule-body-sees-this-runs-derivations`; renamed in review):
+    a rule whose body is the three goals, over a family the same run
+    derives into, gives the same derived claims as the rule with a
+    `(true)` between the claim goal and its filters, and the rewrite
+    fused a body. Review found a run reads under snapshots (fallback),
+    and a semi-naive variant moves the recursive premise first, so no
+    rule run's result can rest on the fused goal reading this run's
+    derivations; a mutation that hid them changed nothing.
   - In compile-tests: `a-rule-may-not-write-claim-current-valid`. The
     refusal text says to write the three goals.
   - In explain-tests: `explain-names-the-validity-row`. A hand-written

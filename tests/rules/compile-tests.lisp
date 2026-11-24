@@ -145,6 +145,12 @@
                " (not (claim-after ?q rt-claim \"app\" \"web\" \"z\""
                " \"host\" ?h nil nil))"))
 
+(defparameter *body-claim-current-valid*
+  (concatenate 'string
+               "(claim-current-valid ?p rt-claim \"host\" ?h \"runs\""
+               " \"app\" \"web\" nil nil"
+               " \"2026-06-01T00:00:00.000000000Z\")"))
+
 (test claim-after-is-not-a-rule-premise
   "GH #451: the reads and strata analyses recognise claim/7 by name; a
 rule writes claim/7 and the comparison, and the rewrite fuses them."
@@ -154,6 +160,14 @@ rule writes claim/7 and the comparison, and the rewrite fuses them."
            :head *web-hosts-head* :body *body-claim-after*)
   (refuses "not a rule premise" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body *body-claim-after-under-not*))
+
+(test a-rule-may-not-write-claim-current-valid
+  "GH #499: claim-current-valid/10 is the compiler's own fused form; a
+rule writes the three goals, which the compiler fuses."
+  (refuses "not a rule premise" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *body-claim-current-valid*)
+  (refuses "claim-valid-at" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head* :body *body-claim-current-valid*))
 
 (test a-rule-that-reads-its-own-relation-compiles-as-its-own-stratum
   "GH #333: recursion is a stratum, not a refusal; an unbound relation
