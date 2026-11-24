@@ -413,6 +413,79 @@ Spec §3, §5, §7.
 - [ ] **Step 6: Commit**: `rules: the validity rewrite, its rule and
   explain handling, and the docs (#499)`.
 
+### Task 4b: the route under a snapshot no commit has passed
+
+Added on 2026-11-24, after Task 5's first bench run. Guarded queries
+read under `:snapshot t`, so the route never ran for them (ratio 286).
+Kevin chose the epoch check, spec §2 "Under a snapshot". The task also
+carries the five low findings from Task 4's review.
+
+**Files:** `rules/facts.lisp`, `tests/rules/validity-tests.lisp`,
+`tests/rules/compile-tests.lisp`, `docs/rules.md`,
+`docs/guarded-query.md`, `CHANGELOG.md`.
+
+**Interfaces:**
+- Produces: `%snapshot-passed-p (graph) → generalized boolean`. It is
+  true when GRAPH has an entry in `*read-snapshots*` whose
+  `start-tx-id` is not `(tm-current-epoch (transaction-manager
+  graph))`. `%validity-route` falls back when it is true for any store
+  in scope. That replaces the any-snapshot test.
+
+- [ ] **Step 1: Tests.**
+  - `the-route-stays-off-under-each-fallback`: its snapshot case
+    becomes "a snapshot a commit has passed". Open `with-read-snapshot`
+    on g and commit one claim inside it, from another thread as
+    `%ix-write-in-another-thread` does (`tests/index-tests.lisp`). Then
+    `(%validity-fused)` resolves 0. The as-of case is unchanged. The
+    docstring is updated.
+  - `the-route-runs-under-a-snapshot-no-commit-has-passed`: over
+    `seed-validity`, a `(select (:snapshot t) …)` of `%validity-fused`'s
+    goals, and the same at `(:as-of (latest-epoch g))`, each resolve a
+    positive count, and each answers the rows `%validity-fused` answers
+    with no snapshot.
+  - `a-snapshot-a-commit-passed-still-sees-the-claim`: under one
+    `with-read-snapshot`:
+    - rows R0 of the fused page;
+    - then `close-validity` on an open claim in R0, with an end before
+      `*validity-t0*`, committed from another thread;
+    - then the fused page again answers R0 `equal`.
+  - `the-guard-path-is-fused-for-valid-at`: wrap it in
+    `counting-resolutions` and assert `(<= 10 calls 12)`.
+  - `compile-tests.lisp`: `a-rule-may-not-write-claim-current-valid-nested`.
+    A premise `(not (claim-current-valid …))` is refused with the same
+    message.
+- [ ] **Step 2: Implement** `%snapshot-passed-p` and use it in
+  `%validity-route`. Update the route's docstring.
+- [ ] **Step 3: Mutation checks.**
+  - With the old any-snapshot test back, the runs-under test and the
+    guard test fail.
+  - With no snapshot test at all, the fallback test and the
+    still-sees test fail.
+  - With `%mentions-claim-current-valid-p` made top-level only, the
+    nested compile test fails.
+- [ ] **Step 4: Docs.**
+  - `docs/rules.md` "The validity route" and `docs/guarded-query.md`
+    "Paging": the snapshot condition as in spec §2. `profile-text` now
+    measures the route, unless a commit lands between its snapshot and
+    the route. The race reads the index's newest state, with or without
+    a snapshot (spec §5).
+  - CHANGELOG: the Added and Changed entries say the same.
+  - The low findings:
+    1. The `claim/7` and `claim-valid-at/2` docstrings point at the
+       conditions in `docs/rules.md` instead of implying the three goals
+       always fuse.
+    2. The CHANGELOG says "a string literal" where it says "a literal".
+    3. Drop the CHANGELOG sentence "The route that reads the index
+       lands in a later change."
+    4. `docs/rules.md` "paging is unchanged" gains "except the accepted
+       race".
+    5. The nested compile test is in Step 1.
+- [ ] **Step 5: Verify**: `tests/run-system-tests.sh
+  graph-db/rules-test graph-db/query-test graph-db/gui-test &&
+  tests/check-build-warnings.sh`.
+- [ ] **Step 6: Commit**: `rules: the validity route under a snapshot
+  no commit has passed (#499)`.
+
 ### Task 5 (session, on odm): the after case and the store measurement
 
 Spec §6. Run in the session: it needs the store copy and cl-llm on odm.

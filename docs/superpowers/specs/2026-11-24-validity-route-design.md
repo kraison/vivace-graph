@@ -174,18 +174,45 @@ Otherwise it answers by `claim-after/9`'s route plus the two filters.
   relation bound: the namespace is bound and names a keyword, the
   subject key is unbound, and the relation is bound.
 - `?at` is bound to an instant, read as `claim-valid-at/2` reads it.
-- No read-write transaction covers a store in scope (`*transaction*`),
-  and no store is read under a snapshot (`*read-snapshots*`) or an
-  as-of epoch.
+- No read-write transaction covers a store in scope (`*transaction*`).
+- No store in scope is read under a snapshot or an as-of epoch
+  (`*read-snapshots*`) that a commit has passed. A snapshot of a store
+  has been passed when its transaction's `start-tx-id` differs from the
+  store manager's `tm-current-epoch`. This was revised on 2026-11-24;
+  see "Under a snapshot" below.
   - A transaction reads at its start epoch (`lookup-object`,
     transactions.lisp), and `call-with-read-snapshot` inside one enters
     nothing in `*read-snapshots*`.
   - The index releases an entry when a write applies (GH #345). So at
     an older epoch, a claim that a later commit closed has already lost
     its open entry, while it still resolves as open.
-  - `profile-goals` always runs under `:snapshot`
-    (prolog-explain.lisp), so `profile-text` measures the fallback. The
-    docs say so.
+
+**Under a snapshot** (Kevin, 2026-11-24). Every guarded query
+compiles to `(select (:effects nil :snapshot t …))`
+(`query/compiled-cache.lisp`), and so does `profile-goals`
+(prolog-explain.lisp). A route that fell back under every snapshot
+would never run for a guarded page. In the measurement, the fused page
+kept a ratio of 286 against the ≤ 1.5 acceptance.
+
+So the route also runs under a snapshot that no commit has passed:
+
+- `create-transaction` reads `tm-current-epoch` under the manager
+  lock. A commit takes its epoch (`tm-next-epoch`) and applies to the
+  index under that same lock.
+- So while the snapshot's `start-tx-id` equals the store's
+  `tm-current-epoch`, no commit has applied since the snapshot began,
+  and the index holds exactly the snapshot's state.
+- An as-of read starts at its epoch + 1, so it passes only at the
+  latest epoch (`latest-epoch`).
+- Under a shared clock, another store's commits advance the epoch too.
+  The check is then conservative: it can only fall back.
+
+The check is made once per store, at the route's start, before
+anything is collected. A commit after the check is §5's race.
+Node reads still resolve through the snapshot. `index-lookup`
+re-checks each node against its key (`%index-hit-p`), so a node a
+later commit changed drops out rather than being returned at the wrong
+version.
 - Every store in scope that carries the family has the index.
 - The **closed set** is within the cap. This is every current claim of
   the namespace and relation whose validity end is at or after T, over
@@ -297,12 +324,17 @@ one inference, against about four today.
 
 ### 5. The race
 
-The board's reads take no snapshot. A claim can close while a page is
-being read, after the closed set was collected and before the walk of
-the open bucket reaches it. Its open entry is then gone, and its new
-entry is not in the collected set, so the page leaves it out. Today's
-route returns it, because its subject-relation entry never moves and its
-new end is still at or after T.
+The route reads the index's newest state, with or without a snapshot.
+(This section first said "the board's reads take no snapshot", which is
+wrong: guarded reads take one, §2 "Under a snapshot".) A claim can
+close while a page is being read, after the closed set was collected
+and before the walk of the open bucket reaches it. Its open entry is
+then gone, and its new entry is not in the collected set, so the page
+leaves it out. Under a snapshot, the claim stays out even if the walk
+meets its new entry: the snapshot resolves the open version, which
+`%index-hit-p` rejects. Today's route returns it, because its
+subject-relation entry never moves and its new end is still at or
+after T.
 
 So a claim whose validity closes during the page that would hold it may
 be missing from that page. The route never returns a wrong row, and a
@@ -336,8 +368,9 @@ consumer's pin issue.
 - `docs/rules.md`: the route table row, "Solution order" (unchanged,
   said so), the fused shape and its conditions, and the race.
 - `docs/guarded-query.md` "Paging": a page of claims valid at T costs
-  what it returns when the three goals sit together, and a free T,
-  `:as-of` and a far-back T keep today's cost.
+  what it returns when the three goals sit together. A free T, an
+  `:as-of` below the latest epoch, a snapshot a commit has passed and a
+  far-back T keep today's cost.
 - `docs/vivace-graph-v3-doc.org`: the claim chapter's list of indexes.
 - `CHANGELOG.md` `[Unreleased]`: under Added, the index, the functor
   and the rewrite; under Changed, the page cost and the write cost (§6).
@@ -373,6 +406,17 @@ consumer's pin issue.
   fallbacks are each shown to answer the same: a free T, `:as-of`, a
   snapshot, a read-write transaction (including one where another
   commit closed a claim after it began), and a closed set over the cap.
+- **Under a snapshot** (§2, revised 2026-11-24).
+  - The route runs under a snapshot that no commit has passed: a
+    `:snapshot t` select, a guarded query, and an `:as-of` read at
+    `latest-epoch`.
+  - It falls back under a snapshot that a commit has passed, and under
+    an `:as-of` below the latest epoch.
+  - A claim closed by a commit after the snapshot began is still
+    returned under that snapshot. Under mutation, dropping the epoch
+    check loses that claim.
+  - The guarded valid-at page runs the route. Its resolutions are
+    counted, so the test fails when the route falls back.
 - **The index.** A close moves the entry, a retraction moves it, and a
   re-assertion moves it back. An index rebuilt at open
   (`regenerate-secondary-indexes`) equals the maintained one, entry for
@@ -409,11 +453,21 @@ consumer's pin issue.
   string collation is shown to agree with `>/2`.
 - **The functor's name and arity.** `claim-current-valid/10` names the
   two goals it fuses and carries #451's two key bounds plus T.
-- **Fall back inside any read-write transaction and under any snapshot.**
-  Cost: `profile-text` on the recommended query shows the fallback's
-  cost, and a query inside a transaction keeps today's route. The
-  alternative was taking the route while no commit has applied since
-  the snapshot's epoch, which still races a commit made during the page.
+- **Fall back inside any read-write transaction, and under a snapshot a
+  commit has passed.** This first said "under any snapshot". That missed
+  that every guarded query reads under one, so the route never ran for
+  them (measured, ratio 286). Kevin chose the epoch check on 2026-11-24
+  (§2 "Under a snapshot"). The other options were:
+  - Exact under any snapshot, merging the claims written since the
+    snapshot from the touched-at index. That is more code, and each page
+    pays for the writes made during it.
+  - The route only for reads without a snapshot. That changes the
+    consumers' read contract.
+
+  Cost: a query inside a read-write transaction, an older outer
+  snapshot such as a rule run after a commit, and a commit landing
+  between a guarded query's snapshot and its route all keep today's
+  route.
 - **One inference per candidate resolved, on every route** (§4). Cost:
   the fused fallback's inference count differs from today's, lower per
   closed claim.
