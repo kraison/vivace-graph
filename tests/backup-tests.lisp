@@ -954,9 +954,13 @@ complete files; the default, NIL, keeps every one as before."
           (is (= 2 (length before)) "the default keeps every snapshot")
           (multiple-value-bind (count pruned) (graph-db:snapshot g :keep 2)
             (is (integerp count))
-            (is (equal (mapcar #'namestring pruned)
-                       (list (namestring (first before))))
-                "the one file beyond the newest two is the oldest")
+            ;; File names, not namestrings: the engine lists with
+            ;; UIOP:DIRECTORY-FILES and %BK-SNAP-FILES with DIRECTORY,
+            ;; which resolves a symlinked scratch root (macOS /var, #501).
+            (is (equal (mapcar #'file-namestring pruned)
+                       (list (file-namestring (first before))))
+                "the one file beyond the newest two is the oldest: ~S"
+                pruned)
             (let ((left (%bk-snap-files dir)))
               (is (= 2 (length left)))
               (is-false (probe-file (first before)))
