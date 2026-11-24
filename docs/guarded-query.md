@@ -138,6 +138,32 @@ What this is and is not:
   (GH #451; the condition and what is not fused are in `docs/rules.md`
   "Solution order"). A `>` separated from the goal still works, at the
   old price of the discarded keys' claims.
+- **A valid-at page doesn't pay for closed history.** The three-goal
+  text `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-current ?c)
+  (claim-valid-at ?c T)`, with the filters right after the claim goal,
+  fuses to `claim-current-valid/10` (#499). The page reads the
+  relation's open claims in key order and merges in the few that closed
+  at or after `T`, so history that ended before `T` costs nothing. Its
+  inferences track its rows. Each page still reads every open index
+  entry of the relation, without resolving it, much as the unfused
+  route reads every key of the namespace. A free `T`, a
+  goal between the claim goal and its filters, an `:as-of` below the
+  latest epoch, a snapshot a commit has passed, a read-write
+  transaction, and a closed set over the cap keep today's cost -- the
+  vocabulary route with both filters -- and `profile-text` measures the
+  route, unless a commit lands between its snapshot and the route. The
+  conditions are in `docs/rules.md`, "The validity route".
+- **A claim can close mid-page, and the page leaves it out.** The route
+  reads the index's newest state, with or without a snapshot: a claim
+  can close after the closed set was collected and before the
+  open-bucket walk reaches it, so its open entry is gone and its new
+  entry is not in the collected set. The unfused route would return it.
+  The validity route never returns a wrong row, and a later read at a
+  later `T` is right. **Accepted** (#499, design §5): pages are already
+  not atomic across their run -- a claim written mid-read at a key
+  before the bound is missed by every later page -- and holding the
+  claim class's read lock for a page would make every writer wait on
+  readers.
 - **Not a snapshot cursor.** Each call runs under its own read
   snapshot; nothing is held between pages, so nothing expires and
   nothing needs a token. A resumable cursor -- a suspended run holding

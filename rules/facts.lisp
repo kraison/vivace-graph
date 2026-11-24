@@ -27,12 +27,22 @@
 (defparameter +claim-producer-index-slots+
   '(graph-db.spacetime::producer))
 
+(defparameter +claim-validity-index-slots+
+  '(graph-db.spacetime::subject-namespace graph-db.spacetime::relation
+    graph-db.spacetime::transaction-extent-sexp
+    graph-db.spacetime::extent-sexp graph-db.spacetime::subject-key))
+
 (defvar *claim-scope* nil
   "The stores CLAIM/7 and CLAIM-PRODUCER/2 read, own store first, or NIL
 for *GRAPH* alone (spec §10, GH #332).  RUN-RULE binds it for a body's
 evaluation; a Lisp caller may bind it around a SELECT.  Trap: inside a
 read-write transaction every read of another store is the engine's
 CROSS-GRAPH-TRANSACTION-ERROR (GH #53) -- bind it outside one.")
+
+(defvar *validity-closed-cap* 10000
+  "The most distinct CLAIM-VALIDITY tuples CLAIM-CURRENT-VALID/10's
+validity route collects as its closed set, over every store in scope;
+past it the route falls back to CLAIM-AFTER/9's (GH #499, design §2).")
 
 (defvar *rule-delta* nil
   "NIL, or an EQUAL hash table relation -> list of claim nodes: the
@@ -385,11 +395,24 @@ is every family's."
 
 (register-access-path 'claim-touched-after/4 #'%explain-touched-path)
 
+(defun %explain-validity-path (bound args graph)
+  "EXPLAIN-GOALS' path for a CLAIM-CURRENT-VALID/10 goal (GH #499,
+design §3): which route it takes is decided at run time, so the row
+names both."
+  (declare (ignore bound args graph))
+  (format nil "validity index from the key bound, or claim-after's ~
+route; decided at run time"))
+
+(register-access-path 'claim-current-valid/10 #'%explain-validity-path)
+
 (defun %claim-goal (?c ?family ?sns ?skey ?rel ?ons ?okey
-                    skey-after okey-after cont)
+                    skey-after okey-after cont &key filter)
   "CLAIM/7's routes, with SKEY-AFTER and OKEY-AFTER (values, NIL for no
 bound) applied as %KEY-AFTER-P filters on every route and as skips on
-the namespace routes (#451)."
+the namespace routes (#451).  When FILTER is non-NIL it runs on every
+candidate first, and a NIL return drops the candidate before
+%UNIFY-CLAIM: CLAIM-CURRENT-VALID/10's currency and validity filters
+(GH #499, design §2)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
@@ -405,19 +428,24 @@ the namespace routes (#451)."
     ;; keyed like the index it substitutes for (GH #333, C1);
     ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
     (flet ((emit (claim)
-             ;; The bounds filter on every route; the namespace routes
-             ;; also skip by them (#451).  A non-PARENT node (a bound
-             ;; ?c, another family's derivation) has no key to read
-             ;; and is left to %UNIFY-CLAIM's own TYPEP.
-             (when (or (not (typep claim parent))
-                       (and (%key-after-p
-                             (graph-db.spacetime:claim-subject-key claim)
-                             skey-after)
-                            (%key-after-p
-                             (and (typep claim binary)
-                                  (graph-db.spacetime:claim-object-key
-                                   claim))
-                             okey-after)))
+             ;; FILTER runs for every candidate, a key-bound rejection
+             ;; included, so CLAIM-CURRENT-VALID/10 ticks once per
+             ;; candidate resolved (GH #499, design §4).  The bounds
+             ;; filter on every route; the namespace routes also skip by
+             ;; them (#451).  A non-PARENT node (a bound ?c, another
+             ;; family's derivation) has no key to read and is left to
+             ;; %UNIFY-CLAIM's own TYPEP.
+             (when (and (or (null filter) (funcall filter claim))
+                        (or (not (typep claim parent))
+                            (and (%key-after-p
+                                  (graph-db.spacetime:claim-subject-key
+                                   claim)
+                                  skey-after)
+                                 (%key-after-p
+                                  (and (typep claim binary)
+                                       (graph-db.spacetime:claim-object-key
+                                        claim))
+                                  okey-after))))
                (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
                              cont))))
       (ecase (%claim-route (node-p c) sns-arg sns ons-arg ons skey okey rel
@@ -482,7 +510,10 @@ store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
 NIL; a bound ?C and the empty fast paths read no store at all (spec
 §10, GH #332).  Solution order: docs/rules.md \"Solution order\".
 A > on the key right after this goal compiles to CLAIM-AFTER/9, which
-starts the namespace route at the bound (#451)."
+starts the namespace route at the bound (#451).  This goal followed at
+once by (CLAIM-CURRENT ?C) and (CLAIM-VALID-AT ?C T) may compile to
+CLAIM-CURRENT-VALID/10, the two filters kept, under the conditions in
+docs/rules.md \"The validity route\" (#499)."
   (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil cont))
 
 (def-global-prolog-functor claim-after/9
@@ -647,6 +678,93 @@ than the family's tail.  Returns GOALS itself when nothing fuses
     (if changed (nreverse out) goals)))
 
 (pushnew '%fuse-touched-cursor *clause-body-rewriters*)
+
+;;; The validity rewrite (#499, design §3): a CLAIM/7 or CLAIM-AFTER/9
+;;; goal followed at once by (claim-current ?c) and (claim-valid-at ?c
+;;; T), in either order, compiles to CLAIM-CURRENT-VALID/10 with both
+;;; filters kept.  It runs LAST: the key-bound rewrite must have made
+;;; the CLAIM-AFTER/9 this one sees.
+
+(defun %validity-kept-comparisons (claim-goal following)
+  "FOLLOWING's leading > goals on CLAIM-GOAL's key variables: the ones
+%FUSE-KEY-BOUNDS left there (GH #499, design §3)."
+  (let ((skey (fifth claim-goal)) (okey (eighth claim-goal)))
+    (loop for tail on following
+          for goal = (first tail)
+          while (or (and (variable-p skey) (%key-bound-goal-p goal skey))
+                    (and (variable-p okey) (%key-bound-goal-p goal okey)))
+          collect goal)))
+
+(defun %validity-filter-at (g1 g2 c)
+  "(CLAIM-CURRENT C) and (CLAIM-VALID-AT C T) in either order: T when
+it is a string literal or a variable, NIL otherwise (GH #499, design
+§3)."
+  (flet ((current (g)
+           (and (%engine-functor-goal-p g "CLAIM-CURRENT" 1)
+                (eq (second g) c)))
+         (valid-at (g)
+           (and (%engine-functor-goal-p g "CLAIM-VALID-AT" 2)
+                (eq (second g) c)
+                (let ((at (third g)))
+                  (and (or (stringp at) (variable-p at)) at)))))
+    (cond ((and (current g1) (valid-at g2)) (third g2))
+          ((and (valid-at g1) (current g2)) (third g1)))))
+
+(defun %validity-fusion (claim-goal earlier following)
+  "(VALUES FUSED CONSUMED) when CLAIM-GOAL and its two filters in
+FOLLOWING fuse into CLAIM-CURRENT-VALID/10: FUSED is the replacement
+goals, the fused goal then the kept comparisons then both filters, and
+CONSUMED the number of FOLLOWING goals it takes; NIL otherwise.
+EARLIER is the body before CLAIM-GOAL, so ?C is fresh (GH #499, design
+§3).  A variable T the claim goal binds is not fused: the fused goal
+reads T when it is called, so T would be free there."
+  ;; The functor test first: a goal may be an atom, such as !.
+  (let ((c (and (or (%engine-functor-goal-p claim-goal "CLAIM" 7)
+                    (%engine-functor-goal-p claim-goal "CLAIM-AFTER" 9))
+                (second claim-goal))))
+    (when (and (%named-variable-p c)
+               (notany (lambda (g) (%var-occurs-p c g)) earlier))
+      (let* ((kept (%validity-kept-comparisons claim-goal following))
+             (filters (nthcdr (length kept) following))
+             (at (%validity-filter-at (first filters) (second filters) c)))
+        (when (and at
+                   (or (stringp at)
+                       (notany (lambda (arg) (%var-occurs-p at arg))
+                               (rest claim-goal))))
+          (values (append
+                   (list
+                    (list* (intern "CLAIM-CURRENT-VALID"
+                                   (symbol-package 'claim/7))
+                           (append (rest claim-goal)
+                                   (if (%engine-functor-goal-p
+                                        claim-goal "CLAIM-AFTER" 9)
+                                       (list at)
+                                       (list nil nil at)))))
+                   kept
+                   (list (first filters) (second filters)))
+                  (+ (length kept) 2)))))))
+
+(defun %fuse-validity (goals)
+  "GOALS with each CLAIM/7 or CLAIM-AFTER/9 goal whose two filters
+follow it at once rewritten to CLAIM-CURRENT-VALID/10, both filters
+kept.  Returns GOALS itself when nothing fuses (GH #499, design §3)."
+  (let ((out '()) (changed nil) (rest goals))
+    (loop while rest
+          do (let ((goal (pop rest)))
+               (multiple-value-bind (fused consumed)
+                   (%validity-fusion goal out rest)
+                 (cond (fused
+                        (setf changed t)
+                        (dotimes (i consumed) (pop rest))
+                        (dolist (g fused) (push g out)))
+                       (t (push goal out))))))
+    (if changed (nreverse out) goals)))
+
+;; Runs last: PUSHNEW would put it first, before %FUSE-KEY-BOUNDS has
+;; made the CLAIM-AFTER/9 this rewrite must see (GH #499, design §3).
+(setf *clause-body-rewriters*
+      (append (remove '%fuse-validity *clause-body-rewriters*)
+              '(%fuse-validity)))
 
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
@@ -1072,7 +1190,10 @@ one arity per premise count."
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601
 string or a timestamp); a claim with no extent makes no validity
 statement and never matches.  Shares CLAIMS-TOUCHING's predicate and
-probe shape, so the two cannot diverge (spec §11)."
+probe shape, so the two cannot diverge (spec §11).  With a preceding
+CLAIM/7 and CLAIM-CURRENT/1 the three may compile to
+CLAIM-CURRENT-VALID/10 under the conditions in docs/rules.md \"The
+validity route\" (#499)."
   (let ((c (%claim-arg ?c))
         (at (%instant-arg ?at)))
     (when (and c at
@@ -1080,6 +1201,245 @@ probe shape, so the two cannot diverge (spec §11)."
                 c (graph-db.spacetime:make-instant
                    (graph-db.spacetime:exact-bound at))))
       (funcall cont))))
+
+;;; The fused validity goal (GH #499, design §2, §4).  CLAIM/7's and
+;;; CLAIM-AFTER/9's rows, current at ?C's transaction period and
+;;; possibly valid at ?AT.  The validity route answers from the
+;;; CLAIM-VALIDITY index when its conditions hold; otherwise the
+;;; fallback below is CLAIM-AFTER/9's route with the two filters.
+
+(defun %validity-candidate-filter (at)
+  "The predicate CLAIM-CURRENT-VALID/10 applies to every candidate it
+resolves: one %TICK, then CLAIM-CURRENT/1 and CLAIM-VALID-AT/2's test
+at AT (GH #499, design §2, §4).  A free AT fails every claim, as
+CLAIM-VALID-AT/2 does; AT is already a timestamp."
+  (let ((probe (and at (graph-db.spacetime:make-instant
+                        (graph-db.spacetime:exact-bound at)))))
+    (lambda (claim)
+      (%tick)
+      (let ((c (%claim-arg claim)))
+        (and probe c
+             (graph-db.spacetime:claim-current-p c)
+             (graph-db.spacetime::%claim-validity-touches-p c probe))))))
+
+(defun %claim-emittable-p (claim)
+  "CLAIM survives *CLAIM-EXCLUDE-PRODUCERS*: the per-candidate form of
+the list filter CLAIM/7's routes apply (GH #499, design §2 step 3)."
+  (consp (%exclude-producers (list claim))))
+
+;; NOTINLINE: a test counts resolutions by swapping it (ECL would
+;; otherwise compile same-file calls directly, CLAUDE.md engine traps).
+(declaim (notinline %resolve-validity-candidates))
+(defun %resolve-validity-candidates (graph class-name tuple)
+  "The nodes of CLASS-NAME in GRAPH whose full CLAIM-VALIDITY tuple is
+TUPLE: the route's one node-resolution step, so a test can count it
+(GH #499, design §2)."
+  (index-lookup graph class-name +claim-validity-index-slots+ tuple))
+
+(defun %validity-index-walk (graph class-name start end on-tuple)
+  "Call ON-TUPLE on each distinct CLAIM-VALIDITY tuple of GRAPH from
+START through END's last extension, in index order, until it returns
+true.  One range cursor, not a seek per tuple as MAP-INDEX-PREFIXES
+takes (GH #499).  No overlay: the route never runs in a transaction."
+  (let* ((*graph* graph)
+         (six (%index-for-read graph class-name
+                               +claim-validity-index-slots+))
+         (lo (and six (%index-key six start)))
+         (hi (and six (%index-key six end)))
+         (last nil))
+    (when (and lo hi)
+      (block walk
+        (ix-map six
+                (lambda (key id)
+                  (declare (ignore id))
+                  (unless (equal key last)
+                    (setf last key)
+                    (when (funcall on-tuple (%ix-prefix-out key 5))
+                      (return-from walk nil))))
+                :start lo :end hi))))
+  nil)
+
+(defun %validity-walk-closed (graph class-name head at-key on-tuple)
+  "GRAPH's CLAIM-VALIDITY tuples under HEAD (namespace, relation,
+currency) whose validity end is at or after AT-KEY, in index order
+(GH #499, design §2 step 1)."
+  (%validity-index-walk graph class-name (append head (list at-key))
+                        head on-tuple))
+
+(defun %validity-walk-open (graph class-name head on-tuple)
+  "GRAPH's CLAIM-VALIDITY tuples under HEAD whose validity is open, in
+key order (GH #499, design §2 step 2)."
+  (let ((open (append head (list graph-db.spacetime::+validity-open+))))
+    (%validity-index-walk graph class-name open open on-tuple)))
+
+(defun %validity-add (entries store tuple)
+  "Record TUPLE, read from the store at index STORE, under its subject
+key, for CLAIM-CURRENT-VALID/10's key-ordered merge (GH #499)."
+  (push (cons store tuple)
+        (gethash (fifth tuple) entries)))
+
+(defun %validity-id-lessp (a b)
+  "Ascending node id: the order the subject-relation index gives a key's
+claims today (GH #499, design §2 step 3)."
+  (key-vector< (id a) (id b)))
+
+(defun %snapshot-passed-p (graph)
+  "True when GRAPH has an entry in *READ-SNAPSHOTS* whose START-TX-ID is
+not (TM-CURRENT-EPOCH (TRANSACTION-MANAGER GRAPH)) (GH #499, design §2
+\"Under a snapshot\").  Always true under a snapshot of a SLAVE-GRAPH:
+a replicated apply moves the index without taking a local epoch."
+  (let ((tx (and *read-snapshots* (gethash graph *read-snapshots*))))
+    (and tx (or (typep graph 'slave-graph)
+                (not (= (start-tx-id tx)
+                        (tm-current-epoch (transaction-manager graph))))))))
+
+(defun %validity-route (family sns rel at skey-after emit)
+  "The fused validity route for CLAIM-CURRENT-VALID/10 (GH #499,
+design §2): T when it answered, NIL when the caller must fall back to
+CLAIM-AFTER/9's route.  Called before any candidate is emitted, so a
+NIL never follows emitted rows.  It answers NIL unless the namespace SNS
+names a keyword, REL is bound, AT is an instant, no read-write
+transaction covers a store in scope, no store's snapshot or as-of epoch
+has been passed by a commit (design §2 \"Under a snapshot\"), and the
+closed set is within *VALIDITY-CLOSED-CAP*.  Every candidate it resolves
+passes %VALIDITY-CANDIDATE-FILTER and the producer exclusion before
+EMIT; %DERIVED-ALL follows as in %NAMESPACE-ROUTE, filtered but not
+producer-excluded."
+  (let ((graphs (%scope-graphs)))
+    (when (and sns rel at
+               (not (loop for g in graphs
+                          thereis (and *transaction*
+                                       (%transaction-covers-graph-p
+                                        *transaction* g))))
+               (notany #'%snapshot-passed-p graphs))
+      (let* ((parent (graph-db.spacetime:claim-family-parent family))
+             (at-key (graph-db.spacetime::%timestamp-key at))
+             (accept (%validity-candidate-filter at))
+             (entries (make-hash-table :test 'equal))
+             (seen (make-hash-table :test 'equal))
+             (count 0)
+             (over nil))
+        ;; The closed set: one range per store and currency from T's
+        ;; end key up, its distinct tuples bounded by the cap.
+        (block collect
+          (loop for g in graphs
+                for store from 0
+                do (dolist (cur (list
+                                 graph-db.spacetime::+currency-current+
+                                 nil))
+                     (flet ((walk ()
+                              (%validity-walk-closed
+                               g parent (list sns rel cur) at-key
+                               (lambda (tuple)
+                                 (unless (gethash tuple seen)
+                                   (setf (gethash tuple seen) t)
+                                   (when (> (incf count)
+                                            *validity-closed-cap*)
+                                     (setf over t)
+                                     (return-from collect nil)))
+                                 (when (%key-after-p (fifth tuple)
+                                                     skey-after)
+                                   (%validity-add entries store tuple))
+                                 nil))))
+                       (if (zerop store)
+                           (walk)
+                           (handler-case (walk)
+                             (query-precondition-error () nil)))))))
+        (when (not over)
+          ;; The open bucket: one range per store and currency, a key
+          ;; before the bound skipped before its node is resolved.
+          (loop for g in graphs
+                for store from 0
+                do (dolist (cur (list
+                                 graph-db.spacetime::+currency-current+
+                                 nil))
+                     (flet ((walk ()
+                              (%validity-walk-open
+                               g parent (list sns rel cur)
+                               (lambda (tuple)
+                                 (when (%key-after-p (fifth tuple)
+                                                     skey-after)
+                                   (%validity-add entries store tuple))
+                                 nil))))
+                       (if (zerop store)
+                           (walk)
+                           (handler-case (walk)
+                             (query-precondition-error () nil))))))
+          ;; Merge by key, own store first; within a store, id order.
+          (dolist (key (sort (alexandria:hash-table-keys entries)
+                             #'less-than))
+            (let ((group (gethash key entries)))
+              (loop for store from 0 below (length graphs)
+                    do (let ((nodes
+                               (loop for (s . tuple) in group
+                                     when (= s store)
+                                       append (%resolve-validity-candidates
+                                               (nth store graphs)
+                                               parent tuple))))
+                         (dolist (node (sort nodes #'%validity-id-lessp))
+                           (when (and (%claim-emittable-p node)
+                                      (funcall accept node))
+                             (funcall emit node)))))))
+          ;; This run's own derivation follows, as today: no producer
+          ;; exclusion, but the functor's filters apply (design §2 step 4).
+          (dolist (claim (%derived-all))
+            (when (funcall accept claim)
+              (funcall emit claim)))
+          t)))))
+
+(def-global-prolog-functor claim-current-valid/10
+    (?c ?family ?sns ?skey ?rel ?ons ?okey ?skey-after ?okey-after ?at
+     cont)
+  "Exactly CLAIM-AFTER/9's rows, given its first nine arguments, that
+CLAIM-CURRENT/1 accepts and whose validity possibly contains ?AT
+(CLAIM-VALID-AT/2's test), in CLAIM-AFTER/9's solution order (GH #499,
+design §2).  Answers by the validity route when its conditions hold
+(%VALIDITY-ROUTE), else by CLAIM-AFTER/9's route with both filters
+applied before unification.  Every candidate resolved ticks once, on
+every route, so a budget or deadline preempts between claims (design
+§4).  The compiler writes this goal for the fused three-goal text; it
+may be written by hand, except in a rule body (GH #499).  Trap: ?AT is
+read when this goal is called, so a ?AT the claim goal binds is free
+here and fails every claim; the rewrite leaves that shape alone
+(design §3)."
+  (let* ((family (%family-or-ill-typed ?family))
+         (at (%instant-arg ?at))
+         (c (%prolog-index-bound ?c))
+         (sns-arg (%prolog-index-bound ?sns))
+         (ons-arg (%prolog-index-bound ?ons))
+         (sns (%namespace-keyword sns-arg))
+         (ons (%namespace-keyword ons-arg))
+         (skey (%prolog-index-bound ?skey))
+         (okey (%prolog-index-bound ?okey))
+         (rel (%prolog-index-bound ?rel))
+         (skey-after (%prolog-index-bound ?skey-after))
+         (okey-after (%prolog-index-bound ?okey-after))
+         (parent (graph-db.spacetime:claim-family-parent family))
+         (binary (graph-db.spacetime:claim-family-binary family)))
+    (flet ((emit (claim)
+             ;; The route's emission path (design §2 step 3): the key
+             ;; bounds, then unification.  %VALIDITY-ROUTE excludes the
+             ;; producers of what it resolves; %DERIVED-ALL goes through
+             ;; here unfiltered by producers, as %CLAIM-GOAL's does
+             ;; (GH #333).
+             (when (or (not (typep claim parent))
+                       (and (%key-after-p
+                             (graph-db.spacetime:claim-subject-key claim)
+                             skey-after)
+                            (%key-after-p
+                             (and (typep claim binary)
+                                  (graph-db.spacetime:claim-object-key
+                                   claim))
+                             okey-after)))
+               (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
+                             cont))))
+      (or (and (eq (%claim-route (node-p c) sns-arg sns ons-arg ons
+                                 skey okey rel)
+                    :subject-vocabulary)
+               (%validity-route family sns rel at skey-after #'emit))
+          (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey
+                       skey-after okey-after cont
+                       :filter (%validity-candidate-filter at))))))
 
 (def-global-prolog-functor claim-standing/2 (?c ?s cont)
   "?C's standing as the lowercase wire string (\"inferred\"), the same

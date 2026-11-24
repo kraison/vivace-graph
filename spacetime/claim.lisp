@@ -177,6 +177,53 @@ behind the CLAIM-TOUCHED-AT index (GH #392, design D1)."
     (let ((ts (%extent-touched-at (sexp->extent sexp))))
       (if ts (%timestamp-key ts) :unbounded))))
 
+;;; The CLAIM-VALIDITY index's canonical values (GH #499, design §1).  A
+;;; NIL slot never reaches a canonicalizer: core stores +NULL-COMPONENT+
+;;; instead (%CANONICAL-COMPONENTS, index.lisp).
+
+(defparameter +currency-current+ :claim-current
+  "The CLAIM-VALIDITY currency component of a claim whose transaction
+period is open -- current, as CLAIM-CURRENT-P reads it (GH #499).")
+
+(defparameter +currency-retracted+ :claim-retracted
+  "The CLAIM-VALIDITY currency component of a claim whose transaction
+period is closed -- retracted, as CLAIM-CURRENT-P reads it (GH #499).")
+
+(alexandria:define-constant +validity-open+ (list most-negative-fixnum)
+  :test 'equal
+  :documentation
+  "The CLAIM-VALIDITY end component of a claim whose validity is open.
+A list, so %INDEX-COMP-LESSP orders it before every (day sec nsec) end
+key (GH #499, design §1).")
+
+(defun extent-sexp-currency-key (sexp)
+  "The CLAIM-VALIDITY currency component of SEXP's transaction extent:
++CURRENCY-CURRENT+ while the period is open, +CURRENCY-RETRACTED+ once it
+is closed, as CLAIM-CURRENT-P reads a period.  A canonical value comes
+back unchanged: INDEX-LOOKUP and MAP-INDEX-PREFIXES canonicalize the
+values a read passes (GH #499, design §1)."
+  (cond ((or (eq sexp +currency-current+)
+             (eq sexp +currency-retracted+))
+         sexp)
+        ((null sexp) nil)
+        ((%extent-open-p (sexp->extent sexp)) +currency-current+)
+        (t +currency-retracted+)))
+
+(defun extent-sexp-validity-end-key (sexp)
+  "The CLAIM-VALIDITY end component of SEXP: +VALIDITY-OPEN+ when the
+end's latest edge is :UNBOUNDED (an unknown end counts as open), else the
+latest edge as %TIMESTAMP-KEY's (day sec nsec); NIL for NIL.  A canonical
+value -- +VALIDITY-OPEN+ or a (day sec nsec) list -- comes back
+unchanged: INDEX-LOOKUP and MAP-INDEX-PREFIXES canonicalize the values a
+read passes (GH #499, design §1)."
+  (cond ((null sexp) nil)
+        ((and (consp sexp) (not (eq (car sexp) :temporal-extent)))
+         sexp)
+        (t (let ((end (bound-latest (extent-end (sexp->extent sexp)))))
+             (if (eq end :unbounded)
+                 +validity-open+
+                 (%timestamp-key end))))))
+
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
                        :accessor claim-subject-namespace
@@ -513,6 +560,16 @@ write; ENDPOINT-MISMATCH on a wrong node does."
        (graph-db:def-index ,parent (transaction-extent-sexp) ,graph-name
                            :name claim-touched-at
                            :canonicalize extent-sexp-touched-key)
+       ;; The validity route's index (GH #499, design §1): currency and
+       ;; validity end, so a page reads the open claims in key order and
+       ;; skips history that ended before its instant.  A NIL slot never
+       ;; reaches a canonicalizer; it is stored under +NULL-COMPONENT+.
+       (graph-db:def-index ,parent (subject-namespace relation
+                                    transaction-extent-sexp extent-sexp
+                                    subject-key)
+           ,graph-name :name claim-validity
+           :canonicalize (nil nil extent-sexp-currency-key
+                           extent-sexp-validity-end-key nil))
        ;; Counting indexes (GH #361 §3.1): the vocabulary is a lookup.
        ;; The object index on BINARY, like CLAIM-OBJECT above.
        ;; CLAIM-CURRENT-P is stored as a symbol and funcalled at

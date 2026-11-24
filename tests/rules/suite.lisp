@@ -187,6 +187,134 @@ index reads a claim route pays, one per key on a namespace route
             (symbol-macrolet ((,counter (car ,cell))) ,@body)
          (setf (fdefinition 'graph-db::%scope-lookup) ,orig)))))
 
+;;; GH #499's equivalence fixture: one relation of RTT-CLAIMs whose
+;;; validity, currency and producers vary, and the instants its tests
+;;; probe.
+
+(defparameter *validity-t0* (ts 2026 6 1)
+  "T0, the instant the validity fixture's closes straddle (GH #499).")
+
+(defparameter *validity-close-end*
+  (local-time:encode-timestamp 500000000 0 0 12 1 9 2026
+                               :timezone local-time:+utc-zone+)
+  "A close after T0 whose nanoseconds no other fixture instant shares.")
+
+(defparameter *validity-instants*
+  (list (ts 2020 1 1)                    ; before everything
+        *validity-t0*
+        *validity-close-end*             ; exactly a close end
+        (local-time:timestamp+ *validity-close-end* -1 :nsec)
+        (local-time:timestamp+ *validity-close-end* 1 :nsec)
+        (ts 2030 1 1)                    ; after everything
+        (ts 2026 7 1))                   ; an instant claim's instant
+  "The instants CLAIM-CURRENT-VALID/10 must answer as the three goals
+do (GH #499, design §2).")
+
+(defun %validity-open-extent (from)
+  "A validity extent open from FROM."
+  (make-interval (exact-bound from) (unknown-bound)
+                 :semantics :validity :standing :asserted))
+
+(defun %validity-instant-extent (at)
+  "A validity instant extent at AT: the claim holds at that instant only."
+  (make-instant (exact-bound at) :semantics :validity :standing :asserted))
+
+(defun seed-validity (g)
+  "RTT-CLAIM's validity fixture under :VT, relation \"rel\": open
+claims, claims closed before and after *VALIDITY-T0*, instant claims
+at, before and after it, a retracted open and a retracted closed claim,
+one key with three producers, a claim a test closes later, and an
+unstamped claim (GH #499).  Returns nothing."
+  (let ((graph-db:*graph* g))
+    (flet ((claim (key okey extent &key (producer "seed-a"))
+             (make-rtt-claim-binary
+              :graph g :subject-namespace :vt :subject-key key
+              :relation "rel" :object-namespace :vt-obj
+              :object-key okey :producer producer :standing :observed
+              :extent extent)))
+      (with-transaction ((graph-db::transaction-manager g))
+        (claim "a1" "o1" (%validity-open-extent (ts 2026 1 1)))
+        (claim "a2" "o2" (interval (ts 2026 1 1) (ts 2026 3 1)))
+        (claim "a3" "o3" (interval (ts 2026 1 1) *validity-close-end*))
+        (claim "a4" "o4" (%validity-instant-extent (ts 2026 5 1)))
+        (claim "a5" "o5" (%validity-instant-extent *validity-t0*))
+        (claim "a6" "o6" (%validity-instant-extent (ts 2026 7 1)))
+        (claim "a7" "o7" (%validity-open-extent (ts 2026 1 1)))
+        (claim "a8" "o8" (interval (ts 2026 1 1) (ts 2026 3 1)))
+        (claim "multi" "m1" (%validity-open-extent (ts 2026 1 1))
+               :producer "p1")
+        (claim "multi" "m2" (%validity-open-extent (ts 2026 1 1))
+               :producer "p2")
+        (claim "multi" "m3" (%validity-open-extent (ts 2026 1 1))
+               :producer "p3")
+        (claim "thread" "t1" (%validity-open-extent (ts 2025 1 1))
+               :producer "threader"))
+      (with-transaction ((graph-db::transaction-manager g))
+        (dolist (key '("a7" "a8"))
+          (retract-claim
+           (first (claims-touching g 'rtt-claim :vt key :role :subject
+                                   :relation "rel")))))
+      (let ((unstamped
+              (with-transaction ((graph-db::transaction-manager g))
+                (claim "u1" "u9" (%validity-open-extent (ts 2026 1 1))
+                       :producer "unstamped"))))
+        ;; Withdraw the transition rule so a raw NIL stamp can be
+        ;; written, as the spacetime suite's unstamped fixture does
+        ;; (GH #148).
+        (graph-db:undef-value-constraint rtt-claim :graph-db-rules-test
+          :name graph-db.spacetime::transaction-extent-transition)
+        (unwind-protect
+             (with-transaction ((graph-db::transaction-manager g))
+               (let ((c (copy unstamped)))
+                 (setf (claim-transaction-extent-sexp c) nil)
+                 (save c)))
+          (graph-db:def-value-constraint
+              rtt-claim graph-db.spacetime::transaction-extent-sexp
+              :graph-db-rules-test
+            :transition graph-db.spacetime:transaction-extent-step
+            :name graph-db.spacetime::transaction-extent-transition))))))
+
+(defun seed-validity-b (g)
+  "Store B's share of the validity fixture: open and closed claims on
+keys store A also files, so the scope merge is exercised (GH #499).
+Returns nothing."
+  (let ((graph-db:*graph* g))
+    (with-transaction ((graph-db::transaction-manager g))
+      (flet ((claim (key okey extent)
+               (make-rtt-claim-binary
+                :graph g :subject-namespace :vt :subject-key key
+                :relation "rel" :object-namespace :vt-obj
+                :object-key okey :producer "seed-b" :standing :observed
+                :extent extent)))
+        (claim "a1" "b1" (%validity-open-extent (ts 2026 1 1)))
+        (claim "a3" "b3" (interval (ts 2026 1 1) (ts 2026 10 1)))
+        (claim "multi" "bm" (%validity-open-extent (ts 2026 1 1)))))))
+
+(defun close-validity (claim end)
+  "Close CLAIM's validity at END: copy, set the extent, save -- the way
+an absence closes a claim (GH #499).  Joins the ambient transaction, so
+the caller opens one."
+  (let* ((c (copy claim))
+         (start (bound-earliest (extent-start (claim-extent claim)))))
+    (setf (claim-extent c) (interval start end))
+    (save c)))
+
+(defmacro counting-resolutions ((counter) &body body)
+  "BODY with COUNTER bound to a place counting
+%RESOLVE-VALIDITY-CANDIDATES calls: the index tuples CLAIM-CURRENT-VALID/10's
+validity route resolves, so a test can see that closed history is never
+read (GH #499).  The swap is undone on exit."
+  (let ((orig (gensym "ORIG")) (cell (gensym "CELL")))
+    `(let* ((,cell (list 0))
+            (,orig (fdefinition
+                    'graph-db::%resolve-validity-candidates)))
+       (setf (fdefinition 'graph-db::%resolve-validity-candidates)
+             (lambda (&rest args) (incf (car ,cell)) (apply ,orig args)))
+       (unwind-protect
+            (symbol-macrolet ((,counter (car ,cell))) ,@body)
+         (setf (fdefinition 'graph-db::%resolve-validity-candidates)
+               ,orig)))))
+
 ;; S3: a second store the scope tests read from (spec §10, GH #332).  The
 ;; same families, declared under B's name too -- the registry is per
 ;; family symbol, the indexes per store (S2 recon A4) -- and every

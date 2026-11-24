@@ -11,6 +11,59 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **The `claim-validity` index** (#499): every claim family now declares
+  a composite index on `(subject-namespace relation
+  transaction-extent-sexp extent-sexp subject-key)`, canonically keyed
+  by whether the transaction period is open (current or retracted) and
+  where the validity extent ends, with an open validity sorting before
+  every closed end. A page of claims valid at an instant can then read
+  the open claims in key order and skip the history that ended before
+  it.
+- **`claim-current-valid/10` and the validity rewrite** (#499): the
+  fused form of a claim store's commonest page -- `(claim ...)
+  (claim-current ?c) (claim-valid-at ?c T)` -- `claim-after/9`'s rows
+  filtered to the current claims whose validity possibly contains `T`,
+  in `claim-after/9`'s order. The compiler fuses the three goals when
+  the filters sit right after the claim goal, `?c` is a fresh named
+  variable and `T` is a string literal or a variable the claim goal
+  does not bind; both filters stay in the body, so a route that skips a
+  claim skips one they reject. The validity route reads the new index's
+  open claims in key order and merges in the ones that closed at or
+  after `T`. A free `T`, a goal in between, an `:as-of` below the
+  latest epoch, a snapshot a commit has passed, a read-write
+  transaction, a store without the index, or a closed set over
+  `*validity-closed-cap*` (10,000) fall back to `claim-after/9`'s route
+  with both filters. `compile-rule` refuses the functor in a rule body
+  and the rewrite fuses the three goals there; `explain-goals` names
+  the run-time choice for a hand-written goal.
+
+### Changed
+
+- **A page of claims valid at an instant no longer pays for closed
+  history** (#499). The three-goal text `(claim ...) (claim-current ?c)
+  (claim-valid-at ?c T)` no longer walks the relation's closed history:
+  fused to `claim-current-valid/10`, it reads the claims still open in
+  key order and merges in those closed at or after `T`. Its inferences
+  track the rows it returns. Each page still reads every open index
+  entry of the relation, without resolving it, much as today's route
+  reads every key of the namespace. The same rows answer
+  in the same order, and
+  `:offset` paging is unchanged; an `:as-of` below the latest epoch, a
+  snapshot a commit has passed, a free `T` and a `T` far enough back
+  that the closed set is over the cap keep today's cost. A claim that
+  closes during the page may be left out of it (accepted,
+  `docs/guarded-query.md` "Paging"). `profile-text` measures the route,
+  unless a commit lands between its snapshot and the route.
+- **The first open after upgrading builds `claim-validity`** (#499). A
+  store that holds claims builds the new index once, at its first open
+  on this engine, by a scan. A 2.1 GB store took about 173 s more than
+  a plain open and grew by about 129 MB; later opens cost what they did
+  before. Claim writes and validity closes measured within the bench
+  host's noise of their cost without the index (587 and 520 a second,
+  against 545 and 471).
+
 ## [5.1.0] - 2026-11-18
 
 ### Added

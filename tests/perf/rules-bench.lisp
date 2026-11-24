@@ -202,3 +202,233 @@ the second run compiles it and the rest run compiled.  Runs per second."
         (timed-ops ("rules-rerun" k)
           (dotimes (i k)
             (graph-db.rules:run-rule g rule)))))))
+
+;;;; The validity route's before case (#499): a page of claims valid at
+;;;; an instant against the closed history filed ahead of them, and the
+;;;; write cost of a claim and of a validity close.  Own graph name and
+;;;; own schema, as above.  Reported, not gated: the numbers go to #499.
+
+(defparameter *perf-validity-graph-name* :graph-db-perf-validity)
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash *perf-validity-graph-name* *schema-node-metadata*) nil))
+
+(graph-db.spacetime:def-claim-classes pv-claim :graph-db-perf-validity
+  :temporal t)
+
+(defmacro with-perf-validity-graph ((g) &body body)
+  "A fresh on-disk graph holding temporal PV-CLAIM claims."
+  (let ((d (gensym "DIR")))
+    `(with-temp-directory (,d)
+       (let ((,g (make-graph *perf-validity-graph-name* (namestring ,d)
+                             :buffer-pool-size 4000)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
+(defun pv-ts (year month day hour min sec nsec)
+  "A UTC timestamp at nanosecond precision."
+  (local-time:encode-timestamp nsec sec min hour day month year
+                               :timezone local-time:+utc-zone+))
+
+;; CLOSED's claims run from START to one nanosecond before CLOSE; the
+;; page's T is after every close.
+(defparameter +pv-start+ (pv-ts 2020 1 1 0 0 0 0))
+(defparameter +pv-close+ (pv-ts 2021 6 1 0 0 0 0))
+(defparameter +pv-close-end+ (pv-ts 2021 5 31 23 59 59 999999999))
+(defparameter +pv-at+ (pv-ts 2022 1 1 0 0 0 0))
+
+(defun pv-instant-string (ts)
+  "TS as RFC 3339 UTC with nanoseconds, the spelling CLAIM-VALID-AT
+reads."
+  (local-time:format-timestring
+   nil ts
+   :format '((:year 4) #\- (:month 2) #\- (:day 2) #\T
+             (:hour 2) #\: (:min 2) #\: (:sec 2) #\. (:nsec 9) #\Z)
+   :timezone local-time:+utc-zone+))
+
+(defun pv-closed-key (i) (format nil "a~5,'0D" i))
+(defun pv-open-key (i) (format nil "b~5,'0D" i))
+
+(defun pv-open-extent ()
+  "An extent starting at +PV-START+ with no known end."
+  (graph-db.spacetime:make-interval
+   (graph-db.spacetime:exact-bound +pv-start+)
+   (graph-db.spacetime:unknown-bound)))
+
+(defun pv-insert-claims (g n key-function)
+  "N binary PV-CLAIM claims with an open validity extent, keys from
+KEY-FUNCTION, in batches of 500.  => their ids in key order."
+  (let ((ids (make-array n)) (i 0))
+    (loop while (< i n) do
+      (graph-db:with-transaction ()
+        (dotimes (k (min 500 (- n i)))
+          (let ((c (make-pv-claim-binary
+                    :graph g
+                    :subject-namespace :pv-things
+                    :subject-key (funcall key-function i)
+                    :relation "rel"
+                    :object-namespace :pv-things
+                    :object-key "o"
+                    :producer "perf" :standing :observed
+                    :extent (pv-open-extent))))
+            (setf (aref ids i) (graph-db:id c)))
+          (incf i))))
+    ids))
+
+(defun pv-close-claim (g id)
+  "Close one claim the way an absence closes it: COPY, set its extent to
+[its start, one nanosecond before +PV-CLOSE+], SAVE."
+  (let* ((c (lookup-vertex id :graph g))
+         (start (graph-db.spacetime:extent-start
+                 (graph-db.spacetime:claim-extent c)))
+         (k (copy c)))
+    (setf (graph-db.spacetime:claim-extent k)
+          (graph-db.spacetime:make-interval
+           start
+           (graph-db.spacetime:exact-bound +pv-close-end+)))
+    (save k)))
+
+(defun pv-close-claims (g ids)
+  "Close every claim in IDS in batches of 500.  => the number closed."
+  (let ((i 0) (n (length ids)))
+    (loop while (< i n) do
+      (graph-db:with-transaction ()
+        (dotimes (k (min 500 (- n i)))
+          (pv-close-claim g (aref ids i))
+          (incf i))))
+    n))
+
+(defun pv-add-absences (g n)
+  "N unary claims, one per closed key, whose extent is the close
+instant -- the absence that closes each key."
+  (let ((i 0))
+    (loop while (< i n) do
+      (graph-db:with-transaction ()
+        (dotimes (k (min 500 (- n i)))
+          (make-pv-claim-unary
+           :graph g
+           :subject-namespace :pv-things
+           :subject-key (pv-closed-key i)
+           :relation "rel"
+           :producer "perf" :standing :observed
+           :extent (graph-db.spacetime:make-instant
+                    (graph-db.spacetime:exact-bound +pv-close+)))
+          (incf i))))))
+
+(defun pv-seed (g closed open)
+  "CLOSED claims whose validity is closed ahead of OPEN still-open ones:
+keys A00000.. then B00000.., one relation and producer.  Each closed
+claim is closed by a unary claim on its key at the close instant, as an
+absence closes it."
+  (let ((ids (pv-insert-claims g closed #'pv-closed-key)))
+    (pv-close-claims g ids)
+    (pv-add-absences g closed))
+  (pv-insert-claims g open #'pv-open-key))
+
+(defun pv-page-text ()
+  "The issue's page: the claim goal, then its currency and validity
+filters, at +PV-AT+."
+  (format nil "(claim ?c pv-claim \"pv-things\" ?k \"rel\" ?ons ?o) ~
+(claim-current ?c) (claim-valid-at ?c ~S)"
+          (pv-instant-string +pv-at+)))
+
+(defun pv-page-answers-p (g text budget)
+  "True when TEXT's 50-row page answers within BUDGET inferences."
+  (handler-case
+      (progn (graph-db.query:run-guarded-prolog
+              text g :limit 50 :max-inferences budget)
+             t)
+    (graph-db:prolog-resource-error () nil)))
+
+(defun pv-least-budget (g text &key (low 10) (high 50000000))
+  "The least inference budget within 1% or 20 of which TEXT's page
+answers, bisected between LOW and HIGH."
+  (unless (pv-page-answers-p g text high)
+    (error "valid-at page does not answer within ~D inferences" high))
+  (loop while (> (- high low) (max 20 (floor high 100)))
+        do (let ((mid (floor (+ low high) 2)))
+             (if (pv-page-answers-p g text mid)
+                 (setf high mid)
+                 (setf low mid))))
+  high)
+
+(defun bench-valid-at-page ()
+  "GH #499: a 50-row page of claims current and valid at +PV-AT+, over
+CLOSED closed keys ahead of 600 open ones -- CLOSED 0, then (SCALE
+3000) and (SCALE 30000).  VALID-AT-PAGE-BUDGET-<N> is the least
+inference budget that answers, VALID-AT-PAGE-SECONDS-<N> the wall
+seconds at 50,000,000, and VALID-AT-PAGE-BUDGET-RATIO the largest N's
+budget over N = 0's.  Before the validity route (#499) the page reads
+every closed claim ahead of it, so the budget grows with N."
+  (let* ((ns (list 0 (scale 3000) (scale 30000)))
+         (open 600)
+         (graph-db::*query-default-timeout* 600)
+         (budgets '()))
+    (dolist (n ns)
+      (with-perf-validity-graph (g)
+        (pv-seed g n open)
+        (let* ((text (pv-page-text))
+               (budget (pv-least-budget g text)))
+          (push (cons n budget) budgets)
+          (record (format nil "valid-at-page-budget-~D" n)
+                  :inferences budget)
+          (timed-seconds ((format nil "valid-at-page-seconds-~D" n))
+            (graph-db.query:run-guarded-prolog
+             text g :limit 50 :max-inferences 50000000)))))
+    (record "valid-at-page-budget-ratio"
+            :ratio (float-3 (/ (cdr (assoc (car (last ns)) budgets))
+                               (cdr (assoc 0 budgets)))))))
+
+(defun pv-page-ms (g text &key (runs 10))
+  "Mean wall milliseconds of TEXT's 50-row guarded page over RUNS runs,
+after one untimed run."
+  (flet ((page ()
+           (graph-db.query:run-guarded-prolog
+            text g :limit 50 :max-inferences 50000000)))
+    (page)
+    (let ((t0 (get-internal-real-time)))
+      (dotimes (i runs) (page))
+      (float-3 (/ (* 1000 (- (get-internal-real-time) t0))
+                  internal-time-units-per-second runs)))))
+
+(defun pv-unfused-text ()
+  "PV-PAGE-TEXT with (TRUE) before its filters, so they do not fuse:
+the vocabulary route today's text takes."
+  (let* ((text (pv-page-text))
+         (p (search " (claim-current" text)))
+    (concatenate 'string (subseq text 0 p) " (true)" (subseq text p))))
+
+(defun bench-valid-at-open ()
+  "GH #499: the same 50-row page over OPEN open keys and no history --
+600, (SCALE 6000) and (SCALE 30000).  VALID-AT-OPEN-MS-<N> is the fused
+page, VALID-AT-OPEN-UNFUSED-MS-<N> the unfused one, and
+VALID-AT-OPEN-RATIO the largest N's fused over unfused.  The route
+reads the whole open bucket (design, \"Calls I made\"; GH #500)."
+  (let ((ns (list 600 (scale 6000) (scale 30000)))
+        (graph-db::*query-default-timeout* 600)
+        (last nil))
+    (dolist (n ns)
+      (with-perf-validity-graph (g)
+        (pv-seed g 0 n)
+        (let ((fused (pv-page-ms g (pv-page-text)))
+              (unfused (pv-page-ms g (pv-unfused-text))))
+          (setf last (cons fused unfused))
+          (record (format nil "valid-at-open-ms-~D" n) :ms fused)
+          (record (format nil "valid-at-open-unfused-ms-~D" n)
+                  :ms unfused))))
+    (record "valid-at-open-ratio"
+            :ratio (float-3 (/ (car last) (max (cdr last) 0.001))))))
+
+(defun bench-claim-writes ()
+  "GH #499: (SCALE 20000) binary claims written in batches of 500, then
+the same claims closed as PV-SEED closes them -- the write and close
+costs spec §6 compares with and without the validity index.
+CLAIM-WRITES-PER-SECOND and CLAIM-CLOSES-PER-SECOND report both."
+  (let ((n (scale 20000)))
+    (with-perf-validity-graph (g)
+      (let ((ids nil))
+        (timed-ops ("claim-writes-per-second" n)
+          (setf ids (pv-insert-claims g n #'pv-closed-key)))
+        (timed-ops ("claim-closes-per-second" n)
+          (pv-close-claims g ids))))))

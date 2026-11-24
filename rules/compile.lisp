@@ -465,6 +465,14 @@ CLAIM-TOUCHED-AT and the comparison (#392)."
        (or (%engine-goal-p goals "CLAIM-TOUCHED-AFTER" 4)
            (some #'%mentions-touched-after-p goals))))
 
+(defun %mentions-claim-current-valid-p (goals)
+  "A CLAIM-CURRENT-VALID/10 goal anywhere in GOALS, at any nesting: the
+reads and strata analyses recognise CLAIM/7 and its filters by name, so
+a rule writes those three (#499)."
+  (and (consp goals)
+       (or (%engine-goal-p goals "CLAIM-CURRENT-VALID" 10)
+           (some #'%mentions-claim-current-valid-p goals))))
+
 (defun %touched-at-without-premise-p (goals)
   "Some TOP-LEVEL CLAIM-TOUCHED-AT/2 goal of GOALS names a variable no
 top-level CLAIM/7 or CLAIM-ABSENT/7 goal BEFORE it binds: a dead filter
@@ -929,6 +937,10 @@ claim/7 and the comparison, the compiler fuses them (#451)"))
       (when (%mentions-touched-after-p goals)
         (%refuse spec "claim-touched-after/4 is not a rule premise: write ~
 claim-touched-at and the comparison, the compiler fuses them (#392)"))
+      (when (%mentions-claim-current-valid-p goals)
+        (%refuse spec "claim-current-valid/10 is not a rule premise: ~
+write claim/7, claim-current and claim-valid-at, the compiler fuses ~
+them (#499)"))
       (when (%touched-at-without-premise-p goals)
         (%refuse spec "claim-touched-at reads a premise's claim: bind ?c ~
 with claim/7 first (#392)"))

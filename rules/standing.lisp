@@ -59,6 +59,7 @@
     ;; the engine's own, withheld from text
     ("rule-delta/2" . :withheld) ("claim-after/9" . :withheld)
     ("claim-touched-after/4" . :withheld)
+    ("claim-current-valid/10" . :withheld)   ; GH #499
     ("instantiation-key/3" . :withheld) ("instantiation-key/4" . :withheld)
     ("instantiation-key/5" . :withheld) ("instantiation-key/6" . :withheld)
     ("instantiation-key/7" . :withheld) ("instantiation-key/8" . :withheld)
