@@ -26,6 +26,12 @@ case "$1" in
   | bench-change-feed-cursor | bench-graph-predicates \
   | bench-traced-k-hop | bench-tabled-chain)
     CALL="(graph-db/perf-test::run-prolog-bench :scale :small :only 'graph-db/perf-test::$1)" ;;
+  bench-valid-at-page)
+    CALL="(graph-db/perf-test::run-perf-only \
+'graph-db/perf-test::bench-valid-at-page :scale :small)" ;;
+  bench-claim-writes)
+    CALL="(graph-db/perf-test::run-perf-only \
+'graph-db/perf-test::bench-claim-writes :scale :small)" ;;
   *)
     echo "unknown FUNCTION: $1" >&2
     exit 2 ;;

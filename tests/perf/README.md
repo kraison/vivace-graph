@@ -30,7 +30,9 @@ release wiring are in `docs/perf-baselines.md` (GH #253).
 - `spacetime-bench.lisp` — edges-under-claims write/sweep/read measurement
   (GH #372).
 - `rules-bench.lisp` — paging a claim namespace by key through the guarded
-  runner, first page against last (GH #451).
+  runner, first page against last (GH #451); and the validity route's before
+  case: a page valid at an instant against the closed history ahead of it,
+  and what a claim write and a validity close cost (GH #499).
 - `prolog-bench.lisp` — the Prolog Engine 5.0 before-and-after cases (GH
   #45), one per performance unit of the 5.0 scope.
 - `run-bench.sh` — one bench function alone at small scale in a fresh
