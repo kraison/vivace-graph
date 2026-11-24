@@ -254,6 +254,9 @@ All of these must hold:
 - `?c` is a named variable that occurs in no earlier goal of the body,
   so the claim goal generates it.
 - `T` is a string literal or a variable.
+- A variable `T` occurs in no argument of the claim goal. The fused
+  goal reads `T` when it is called, so a `T` the claim goal binds would
+  be free then and fail every claim.
 - The goals are top-level goals of the body, the only list a rewriter is
   offered.
 
@@ -420,6 +423,11 @@ consumer's pin issue.
 - **`explain-goals` reports the fused route only for hand-written goal
   text, following #392.** Making it apply the rewriters would change
   #451's and #392's rows too, so that is its own issue if wanted.
+- **T is read once, when the fused goal is called** (found in Task 3's
+  review). So the rewrite skips a `T` that the claim goal binds (§3).
+  A malformed T string is refused even when no candidate exists, where
+  the three goals answer an empty page. Cost: only text that names a
+  bad instant changes, and GH #388 already wants that refused.
 
 ## Left to the builder
 

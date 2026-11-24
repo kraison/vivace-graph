@@ -368,6 +368,8 @@ Spec §3, §5, §7.
     - only one filter; a `(true)` between; the filters on another
       variable;
     - `?c` bound earlier, e.g. `(claim-touched-after …)` first;
+    - a T variable the claim goal binds, e.g. `(claim-valid-at ?c ?ok)`
+      with `?ok` the claim goal's object key;
     - a numeric T; no claim goal; `'()`.
   - `the-rewriters-run-in-order`: the positions of `%fuse-validity`,
     `%fuse-key-bounds` and `%fuse-touched-cursor` in
