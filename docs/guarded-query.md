@@ -145,7 +145,7 @@ What this is and is not:
   relation's open claims in key order and merges in the few that closed
   at or after `T`, so history that ended before `T` costs nothing. Its
   inferences track its rows. Each page still reads every open index
-  entry after its bound, without resolving it, much as the unfused
+  entry of the relation, without resolving it, much as the unfused
   route reads every key of the namespace. A free `T`, a
   goal between the claim goal and its filters, an `:as-of` below the
   latest epoch, a snapshot a commit has passed, a read-write

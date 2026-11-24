@@ -211,6 +211,9 @@ So the route also runs under a snapshot that no commit has passed:
   latest epoch (`latest-epoch`).
 - Under a shared clock, another store's commits advance the epoch too.
   The check is then conservative: it can only fall back.
+- A replication slave applies the master's transactions without taking
+  a local epoch (`transaction-streaming.lisp`). So under a snapshot of a
+  `slave-graph` the route always falls back.
 
 The check is made once per store, at the route's start, before
 anything is collected. A commit after the check is §5's race.
@@ -407,7 +410,7 @@ consumer's pin issue.
 
   The fixture also holds unstamped claims (no transaction extent). The
   fallbacks are each shown to answer the same: a free T, `:as-of`, a
-  snapshot, a read-write transaction (including one where another
+  snapshot a commit has passed, a read-write transaction (including one where another
   commit closed a claim after it began), and a closed set over the cap.
 - **Under a snapshot** (§2, revised 2026-11-24).
   - The route runs under a snapshot that no commit has passed: a
@@ -459,8 +462,8 @@ consumer's pin issue.
   `map-index-prefixes`. That is one skip-list seek per open entry, so a
   50-row page cost 1,478 ms at 30,000 open claims with no history,
   against 47 ms for the unfused text. Reading it with one cursor (`ix-map`)
-  costs 73–83 ms there. The route still collects every open key after
-  the bound and sorts it before emitting. That is O(open), as today's
+  costs 73–83 ms there. The route still walks the whole open bucket,
+  and collects and sorts every key after the bound before emitting. That is O(open), as today's
   route reads every key of the namespace from the vocabulary. Cost: on
   a relation with many open claims and no history, a page is about 1.7×
   today's. A lazy merge that stops at the page's limit is #500.

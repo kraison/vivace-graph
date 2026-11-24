@@ -46,9 +46,9 @@ between releases; cutting a release renames it to the new version and dates it.
   (claim-valid-at ?c T)` no longer walks the relation's closed history:
   fused to `claim-current-valid/10`, it reads the claims still open in
   key order and merges in those closed at or after `T`. Its inferences
-  track the rows it returns. Each page still reads the relation's open
-  index entries after its bound, without resolving them, much as
-  today's route reads every key of the namespace. The same rows answer
+  track the rows it returns. Each page still reads every open index
+  entry of the relation, without resolving it, much as today's route
+  reads every key of the namespace. The same rows answer
   in the same order, and
   `:offset` paging is unchanged; an `:as-of` below the latest epoch, a
   snapshot a commit has passed, a free `T` and a `T` far enough back

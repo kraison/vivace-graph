@@ -355,7 +355,7 @@ when all of these hold at run time, and otherwise answers by
 - `?at` is bound to an instant, read as `claim-valid-at/2` reads it;
 - no read-write transaction covers a store in scope, and no store in
   scope is read under a snapshot or an as-of epoch that a commit has
-  passed;
+  passed, nor under any snapshot of a replication slave;
 - every store in scope that carries the family has the index;
 - the closed set -- every current claim of the namespace and relation
   whose validity end is at or after `T`, over the stores in scope -- is

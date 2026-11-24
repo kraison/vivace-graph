@@ -190,10 +190,11 @@ is not, though CLAIM-AFTER/9 alone would return the retracted open one
 
 (test each-fallback-answers-the-same
   "Every condition that keeps the validity route off answers as the
-three-goal text (GH #499, design §2): a free T, an :AS-OF read, a
-snapshot, and a read-write transaction -- including one whose view a
-later commit's close cannot reach.  The closed-set cap is the route's
-own test (Task 3b)."
+three-goal text (GH #499, design §2): a free T, an :AS-OF read and a
+read-write transaction -- including one whose view a later commit's
+close cannot reach.  So does a fresh snapshot, under which the route
+runs (\"Under a snapshot\").  The closed-set cap is the route's own
+test (Task 3b)."
   (with-rules-graph (g)
     (seed-validity g)
     (let ((*validity-at* (validity-instant *validity-t0*)))
@@ -232,7 +233,7 @@ own test (Task 3b)."
                (claim-current ?c)
                (claim-valid-at ?c ?at)
                (claim-producer ?c ?p)))))
-      ;; A snapshot.
+      ;; A fresh snapshot: the route runs and answers the same.
       (is (equal
            (select (:snapshot t) (?k ?ok ?p)
              (lisp ?at *validity-at*)
@@ -499,6 +500,22 @@ answered at its open version (GH #499, design §2 \"Under a snapshot\")."
                                           :relation "rel"))
                   (ts 2026 3 1)))))
           (is (equal r0 (%validity-fused))))))))
+
+(test a-slave-graphs-snapshot-is-always-passed
+  "A replicated apply moves a slave's index without taking a local
+epoch, so a snapshot of a SLAVE-GRAPH counts as passed even with its
+epoch unmoved (GH #499, design §2 \"Under a snapshot\").  The class is
+changed for the check alone and restored."
+  (with-rules-graph (g)
+    (let ((class (class-of g)))
+      (graph-db:with-read-snapshot (g)
+        (is (not (graph-db::%snapshot-passed-p g))
+            "control: no commit has passed the snapshot")
+        (unwind-protect
+             (progn
+               (change-class g 'graph-db::slave-graph)
+               (is (graph-db::%snapshot-passed-p g)))
+          (change-class g class))))))
 
 (test the-validity-route-skips-keys-before-the-bound
   "With ?SKEY-AFTER bound, the route skips the open keys at or before it

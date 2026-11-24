@@ -1286,10 +1286,12 @@ claims today (GH #499, design §2 step 3)."
 (defun %snapshot-passed-p (graph)
   "True when GRAPH has an entry in *READ-SNAPSHOTS* whose START-TX-ID is
 not (TM-CURRENT-EPOCH (TRANSACTION-MANAGER GRAPH)) (GH #499, design §2
-\"Under a snapshot\")."
+\"Under a snapshot\").  Always true under a snapshot of a SLAVE-GRAPH:
+a replicated apply moves the index without taking a local epoch."
   (let ((tx (and *read-snapshots* (gethash graph *read-snapshots*))))
-    (and tx (not (= (start-tx-id tx)
-                    (tm-current-epoch (transaction-manager graph)))))))
+    (and tx (or (typep graph 'slave-graph)
+                (not (= (start-tx-id tx)
+                        (tm-current-epoch (transaction-manager graph))))))))
 
 (defun %validity-route (family sns rel at skey-after emit)
   "The fused validity route for CLAIM-CURRENT-VALID/10 (GH #499,

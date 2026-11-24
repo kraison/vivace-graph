@@ -404,7 +404,7 @@ the vocabulary route today's text takes."
 600, (SCALE 6000) and (SCALE 30000).  VALID-AT-OPEN-MS-<N> is the fused
 page, VALID-AT-OPEN-UNFUSED-MS-<N> the unfused one, and
 VALID-AT-OPEN-RATIO the largest N's fused over unfused.  The route
-reads the whole open bucket after its bound (design, \"Calls I made\")."
+reads the whole open bucket (design, \"Calls I made\"; GH #500)."
   (let ((ns (list 600 (scale 6000) (scale 30000)))
         (graph-db::*query-default-timeout* 600)
         (last nil))
