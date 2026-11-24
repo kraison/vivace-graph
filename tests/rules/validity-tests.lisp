@@ -1,8 +1,8 @@
 ;;;; tests/rules/validity-tests.lisp -- claim-current-valid/10 and the
 ;;;; validity route (GH #499, design §2, §4).
 ;;;;
-;;;; The route lands in Task 3b; these tests pin the functor's contract
-;;;; on the fallback now, and become the route's equivalence gate then.
+;;;; The three-goal equivalence tests are the route's gate: they hold on
+;;;; the fallback and must hold unchanged on the validity route.
 
 (in-package #:graph-db/rules-test)
 
@@ -278,3 +278,175 @@ own test (Task 3b)."
                          :test #'string=)))
         (%same-validity-rows (lambda () (%validity-fused))
                              (lambda () (%validity-unfused)))))))
+
+;;; --- Task 3b: the validity route -----------------------------------------
+
+(defun %seed-validity-history (g)
+  "300 keys whose claims closed before *VALIDITY-T0*, then 30 open keys:
+the history a valid-at page must not read (GH #499, design §2).  Returns
+nothing."
+  (let ((graph-db:*graph* g))
+    (with-transaction ((graph-db::transaction-manager g))
+      (dotimes (i 300)
+        (make-rtt-claim-binary
+         :graph g :subject-namespace :vt
+         :subject-key (format nil "c~3,'0D" i)
+         :relation "rel" :object-namespace :vt-obj
+         :object-key "closed" :producer "history" :standing :observed
+         :extent (interval (ts 2026 1 1) (ts 2026 2 1))))
+      (dotimes (i 30)
+        (make-rtt-claim-binary
+         :graph g :subject-namespace :vt
+         :subject-key (format nil "d~3,'0D" i)
+         :relation "rel" :object-namespace :vt-obj
+         :object-key "open" :producer "current" :standing :observed
+         :extent (%validity-open-extent (ts 2026 1 1)))))))
+
+(test the-validity-route-reads-no-closed-history
+  "A 10-row fused page over 300 closed keys ahead of 30 open ones answers
+under a 200-inference budget and resolves only the rows it needs; the
+three-goal text signals at that budget (GH #499, design §2)."
+  (with-rules-graph (g)
+    (%seed-validity-history g)
+    (let ((*validity-at* (validity-instant *validity-t0*)))
+      (let ((rows nil) (calls 0))
+        (counting-resolutions (resolved)
+          (setf rows
+                (select (:max-inferences 200 :limit 10) (?k)
+                  (lisp ?at *validity-at*)
+                  (claim-current-valid ?c rtt-claim "vt" ?k "rel" ?ons ?ok
+                                       nil nil ?at)))
+          (setf calls resolved))
+        (is (= 10 (length rows)))
+        (is (equal "d000" (first (first rows))))
+        (is (<= 10 calls 12)))
+      (signals graph-db::prolog-resource-error
+        (select (:max-inferences 200 :limit 10) (?k)
+          (lisp ?at *validity-at*)
+          (claim-after ?c rtt-claim "vt" ?k "rel" ?ons ?ok nil nil)
+          (true)
+          (claim-current ?c)
+          (claim-valid-at ?c ?at))))))
+
+(test one-key-in-two-stores-pages-as-today
+  "With both stores in scope, paging two rows at a time gives the same
+sequence fused and unfused, a key's own-store claims first then each
+foreign store's in id order (GH #499, design §2 step 3)."
+  (with-two-stores (a b)
+    (seed-validity a)
+    (seed-validity-b b)
+    (let ((graph-db::*claim-scope* (list a b))
+          (*validity-at* (validity-instant *validity-t0*)))
+      (flet ((fused (offset)
+               (select (:limit 2 :skip offset) (?k ?ok ?p)
+                 (lisp ?at *validity-at*)
+                 (claim-current-valid ?c rtt-claim "vt" ?k "rel" ?ons ?ok
+                                      nil nil ?at)
+                 (claim-producer ?c ?p)))
+             (unfused (offset)
+               (select (:limit 2 :skip offset) (?k ?ok ?p)
+                 (lisp ?at *validity-at*)
+                 (claim-after ?c rtt-claim "vt" ?k "rel" ?ons ?ok nil nil)
+                 (true)
+                 (claim-current ?c)
+                 (claim-valid-at ?c ?at)
+                 (claim-producer ?c ?p))))
+        (let ((seen 0))
+          (loop for offset from 0 below 12 by 2
+                do (let ((f (fused offset)) (u (unfused offset)))
+                     (is (equal f u))
+                     (incf seen (length f))))
+          (is (= seen (length (%validity-fused)))
+              "the pages cover the whole sequence"))
+        (is (member "multi" (mapcar #'first (%validity-fused))
+                    :test #'string=)
+            "the key filed in both stores is on the page")))))
+
+(test a-closed-set-over-the-cap-falls-back
+  "With more closed tuples than *VALIDITY-CLOSED-CAP*, the route answers
+as the three-goal text (GH #499, design §2)."
+  (with-rules-graph (g)
+    (seed-validity g)
+    (let ((*validity-at* (validity-instant *validity-t0*))
+          (graph-db::*validity-closed-cap* 2))
+      (is (plusp (length (%validity-fused))))
+      (%same-validity-rows (lambda () (%validity-fused))
+                           (lambda () (%validity-unfused))))))
+
+(test the-route-stays-off-under-each-fallback
+  "The validity route resolves nothing under each fallback condition
+(GH #499, design §2): a free T, a snapshot, a read-write transaction, a
+closed set over the cap, and an :AS-OF read.  Without them it resolves
+some, so the zeros are not vacuous."
+  (with-rules-graph (g)
+    (seed-validity g)
+    (let ((*validity-at* (validity-instant *validity-t0*)))
+      (labels ((resolutions (thunk)
+                 (let ((calls 0))
+                   (counting-resolutions (resolved)
+                     (funcall thunk)
+                     (setf calls resolved))
+                   calls)))
+        (is (plusp (resolutions (lambda () (%validity-fused)))))
+        ;; A free T.
+        (is (= 0 (resolutions
+                  (lambda ()
+                    (select () (?k ?ok ?p)
+                      (claim-current-valid ?c rtt-claim "vt" ?k "rel"
+                                           ?ons ?ok nil nil ?free)
+                      (claim-producer ?c ?p))))))
+        ;; A snapshot.
+        (is (= 0 (resolutions
+                  (lambda ()
+                    (select (:snapshot t) (?k ?ok ?p)
+                      (lisp ?at *validity-at*)
+                      (claim-current-valid ?c rtt-claim "vt" ?k "rel"
+                                           ?ons ?ok nil nil ?at)
+                      (claim-producer ?c ?p))))))
+        ;; A read-write transaction.
+        (is (= 0 (resolutions
+                  (lambda ()
+                    (with-transaction
+                        ((graph-db::transaction-manager g))
+                      (%validity-fused))))))
+        ;; A closed set over the cap.
+        (is (= 0 (resolutions
+                  (lambda ()
+                    (let ((graph-db::*validity-closed-cap* 2))
+                      (%validity-fused))))))
+        ;; An :AS-OF read, one epoch below the next commit's.
+        (let ((epoch (graph-db:latest-epoch g)))
+          (with-transaction ((graph-db::transaction-manager g))
+            (make-rtt-claim-binary
+             :graph g :subject-namespace :vt :subject-key "zz-extra"
+             :relation "rel" :object-namespace :vt-obj
+             :object-key "x1" :producer "seed-a" :standing :observed
+             :extent (interval (ts 2026 1 1) (ts 2026 12 31))))
+          (is (= 0 (resolutions
+                    (lambda ()
+                      (select (:as-of epoch) (?k ?ok ?p)
+                        (lisp ?at *validity-at*)
+                        (claim-current-valid ?c rtt-claim "vt" ?k "rel"
+                                             ?ons ?ok nil nil ?at)
+                        (claim-producer ?c ?p)))))))))))
+
+(test the-validity-route-skips-keys-before-the-bound
+  "With ?SKEY-AFTER bound, the route skips the open keys at or before it
+before resolving them, as #451's skip does (GH #499, design §2 step 2):
+a 5-row page after \"d019\" resolves about its own rows, not the 20
+keys before the bound."
+  (with-rules-graph (g)
+    (%seed-validity-history g)
+    (let ((*validity-at* (validity-instant *validity-t0*))
+          (rows nil)
+          (calls 0))
+      (counting-resolutions (resolved)
+        (setf rows
+              (select (:limit 5) (?k)
+                (lisp ?at *validity-at*)
+                (claim-current-valid ?c rtt-claim "vt" ?k "rel" ?ons ?ok
+                                     "d019" nil ?at)))
+        (setf calls resolved))
+      (is (equal '("d020" "d021" "d022" "d023" "d024")
+                 (mapcar #'first rows)))
+      (is (<= 5 calls 7)))))

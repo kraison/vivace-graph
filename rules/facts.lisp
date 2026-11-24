@@ -27,6 +27,11 @@
 (defparameter +claim-producer-index-slots+
   '(graph-db.spacetime::producer))
 
+(defparameter +claim-validity-index-slots+
+  '(graph-db.spacetime::subject-namespace graph-db.spacetime::relation
+    graph-db.spacetime::transaction-extent-sexp
+    graph-db.spacetime::extent-sexp graph-db.spacetime::subject-key))
+
 (defvar *claim-scope* nil
   "The stores CLAIM/7 and CLAIM-PRODUCER/2 read, own store first, or NIL
 for *GRAPH* alone (spec §10, GH #332).  RUN-RULE binds it for a body's
@@ -1119,18 +1124,155 @@ CLAIM-VALID-AT/2 does; AT is already a timestamp."
 the list filter CLAIM/7's routes apply (GH #499, design §2 step 3)."
   (consp (%exclude-producers (list claim))))
 
+;; NOTINLINE: a test counts resolutions by swapping it (ECL would
+;; otherwise compile same-file calls directly, CLAUDE.md engine traps).
+(declaim (notinline %resolve-validity-candidates))
+(defun %resolve-validity-candidates (graph class-name tuple)
+  "The nodes of CLASS-NAME in GRAPH whose full CLAIM-VALIDITY tuple is
+TUPLE: the route's one node-resolution step, so a test can count it
+(GH #499, design §2)."
+  (index-lookup graph class-name +claim-validity-index-slots+ tuple))
+
+(defun %validity-index-walk (graph class-name head start keep-p on-tuple)
+  "Walk GRAPH's CLAIM-VALIDITY prefixes under HEAD from START, calling
+ON-TUPLE on each tuple KEEP-P accepts.  A prefix walk has no :END, so the
+walk leaves when KEEP-P rejects a prefix, or when ON-TUPLE returns true;
+MAP-INDEX-PREFIXES holds no lock across the callback (GH #499, §2)."
+  (block walk
+    (map-index-prefixes
+     (lambda (tuple)
+       (unless (funcall keep-p tuple)
+         (return-from walk nil))
+       (when (funcall on-tuple tuple)
+         (return-from walk nil)))
+     graph class-name +claim-validity-index-slots+ :arity 5 :start start))
+  nil)
+
+(defun %validity-walk-closed (graph class-name head at-key on-tuple)
+  "GRAPH's CLAIM-VALIDITY tuples under HEAD (namespace, relation,
+currency) whose validity end is at or after AT-KEY, in index order
+(GH #499, design §2 step 1)."
+  (%validity-index-walk
+   graph class-name head (append head (list at-key))
+   (lambda (tuple) (equal (subseq tuple 0 3) head))
+   on-tuple))
+
+(defun %validity-walk-open (graph class-name head on-tuple)
+  "GRAPH's CLAIM-VALIDITY tuples under HEAD whose validity is open, in
+key order (GH #499, design §2 step 2)."
+  (%validity-index-walk
+   graph class-name head
+   (append head (list graph-db.spacetime::+validity-open+))
+   (lambda (tuple)
+     (and (equal (subseq tuple 0 3) head)
+          (equal (fourth tuple) graph-db.spacetime::+validity-open+)))
+   on-tuple))
+
+(defun %validity-add (entries store tuple)
+  "Record TUPLE, read from the store at index STORE, under its subject
+key, for CLAIM-CURRENT-VALID/10's key-ordered merge (GH #499)."
+  (push (cons store tuple)
+        (gethash (fifth tuple) entries)))
+
+(defun %validity-id-lessp (a b)
+  "Ascending node id: the order the subject-relation index gives a key's
+claims today (GH #499, design §2 step 3)."
+  (key-vector< (id a) (id b)))
+
 (defun %validity-route (family sns rel at skey-after emit)
   "The fused validity route for CLAIM-CURRENT-VALID/10 (GH #499,
 design §2): T when it answered, NIL when the caller must fall back to
 CLAIM-AFTER/9's route.  Called before any candidate is emitted, so a
-NIL never follows emitted rows.  It answers NIL when FAMILY's namespace
-SNS or relation REL is not the route's shape, AT is not an instant, a
-transaction covers a store in scope, a store is read under a snapshot,
-or the closed set is over *VALIDITY-CLOSED-CAP*.  The route itself --
-the claim-validity index's open bucket and closed set, merged in key
-order and emitted through EMIT -- lands in Task 3b."
-  (declare (ignore family sns rel at skey-after emit))
-  nil)
+NIL never follows emitted rows.  It answers NIL unless the namespace SNS
+names a keyword, REL is bound, AT is an instant, no read-write
+transaction covers a store in scope, no store is read under a snapshot
+or an as-of epoch, and the closed set is within *VALIDITY-CLOSED-CAP*.
+Every candidate it resolves passes %VALIDITY-CANDIDATE-FILTER and the
+producer exclusion before EMIT; %DERIVED-ALL follows as in
+%NAMESPACE-ROUTE, filtered but not producer-excluded."
+  (let ((graphs (%scope-graphs)))
+    (when (and sns rel at
+               (not (loop for g in graphs
+                          thereis (and *transaction*
+                                       (%transaction-covers-graph-p
+                                        *transaction* g))))
+               (not (loop for g in graphs
+                          thereis (and *read-snapshots*
+                                       (gethash g *read-snapshots*)))))
+      (let* ((parent (graph-db.spacetime:claim-family-parent family))
+             (at-key (graph-db.spacetime::%timestamp-key at))
+             (accept (%validity-candidate-filter at))
+             (entries (make-hash-table :test 'equal))
+             (seen (make-hash-table :test 'equal))
+             (count 0)
+             (over nil))
+        ;; The closed set: one range per store and currency from T's
+        ;; end key up, its distinct tuples bounded by the cap.
+        (block collect
+          (loop for g in graphs
+                for store from 0
+                do (dolist (cur (list
+                                 graph-db.spacetime::+currency-current+
+                                 nil))
+                     (flet ((walk ()
+                              (%validity-walk-closed
+                               g parent (list sns rel cur) at-key
+                               (lambda (tuple)
+                                 (unless (gethash tuple seen)
+                                   (setf (gethash tuple seen) t)
+                                   (when (> (incf count)
+                                            *validity-closed-cap*)
+                                     (setf over t)
+                                     (return-from collect nil)))
+                                 (when (%key-after-p (fifth tuple)
+                                                     skey-after)
+                                   (%validity-add entries store tuple))
+                                 nil))))
+                       (if (zerop store)
+                           (walk)
+                           (handler-case (walk)
+                             (query-precondition-error () nil)))))))
+        (when (not over)
+          ;; The open bucket: one range per store and currency, a key
+          ;; before the bound skipped before its node is resolved.
+          (loop for g in graphs
+                for store from 0
+                do (dolist (cur (list
+                                 graph-db.spacetime::+currency-current+
+                                 nil))
+                     (flet ((walk ()
+                              (%validity-walk-open
+                               g parent (list sns rel cur)
+                               (lambda (tuple)
+                                 (when (%key-after-p (fifth tuple)
+                                                     skey-after)
+                                   (%validity-add entries store tuple))
+                                 nil))))
+                       (if (zerop store)
+                           (walk)
+                           (handler-case (walk)
+                             (query-precondition-error () nil))))))
+          ;; Merge by key, own store first; within a store, id order.
+          (dolist (key (sort (alexandria:hash-table-keys entries)
+                             #'less-than))
+            (let ((group (gethash key entries)))
+              (loop for store from 0 below (length graphs)
+                    do (let ((nodes
+                               (loop for (s . tuple) in group
+                                     when (= s store)
+                                       append (%resolve-validity-candidates
+                                               (nth store graphs)
+                                               parent tuple))))
+                         (dolist (node (sort nodes #'%validity-id-lessp))
+                           (when (and (%claim-emittable-p node)
+                                      (funcall accept node))
+                             (funcall emit node)))))))
+          ;; This run's own derivation follows, as today: no producer
+          ;; exclusion, but the functor's filters apply (design §2 step 4).
+          (dolist (claim (%derived-all))
+            (when (funcall accept claim)
+              (funcall emit claim)))
+          t)))))
 
 (def-global-prolog-functor claim-current-valid/10
     (?c ?family ?sns ?skey ?rel ?ons ?okey ?skey-after ?okey-after ?at
@@ -1146,7 +1288,13 @@ every route, so a budget or deadline preempts between claims (design
 may be written by hand, except in a rule body (GH #499)."
   (let* ((family (%family-or-ill-typed ?family))
          (at (%instant-arg ?at))
-         (sns (%namespace-keyword (%prolog-index-bound ?sns)))
+         (c (%prolog-index-bound ?c))
+         (sns-arg (%prolog-index-bound ?sns))
+         (ons-arg (%prolog-index-bound ?ons))
+         (sns (%namespace-keyword sns-arg))
+         (ons (%namespace-keyword ons-arg))
+         (skey (%prolog-index-bound ?skey))
+         (okey (%prolog-index-bound ?okey))
          (rel (%prolog-index-bound ?rel))
          (skey-after (%prolog-index-bound ?skey-after))
          (okey-after (%prolog-index-bound ?okey-after))
@@ -1154,21 +1302,25 @@ may be written by hand, except in a rule body (GH #499)."
          (binary (graph-db.spacetime:claim-family-binary family)))
     (flet ((emit (claim)
              ;; The route's emission path (design §2 step 3): the key
-             ;; bounds, the producer filter, then unification.
-             (when (and (%claim-emittable-p claim)
-                        (or (not (typep claim parent))
-                            (and (%key-after-p
-                                  (graph-db.spacetime:claim-subject-key
-                                   claim)
-                                  skey-after)
-                                 (%key-after-p
-                                  (and (typep claim binary)
-                                       (graph-db.spacetime:claim-object-key
-                                        claim))
-                                  okey-after))))
+             ;; bounds, then unification.  %VALIDITY-ROUTE excludes the
+             ;; producers of what it resolves; %DERIVED-ALL goes through
+             ;; here unfiltered by producers, as %CLAIM-GOAL's does
+             ;; (GH #333).
+             (when (or (not (typep claim parent))
+                       (and (%key-after-p
+                             (graph-db.spacetime:claim-subject-key claim)
+                             skey-after)
+                            (%key-after-p
+                             (and (typep claim binary)
+                                  (graph-db.spacetime:claim-object-key
+                                   claim))
+                             okey-after)))
                (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
                              cont))))
-      (or (%validity-route family sns rel at skey-after #'emit)
+      (or (and (eq (%claim-route (node-p c) sns-arg sns ons-arg ons
+                                 skey okey rel)
+                    :subject-vocabulary)
+               (%validity-route family sns rel at skey-after #'emit))
           (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey
                        skey-after okey-after cont
                        :filter (%validity-candidate-filter at))))))

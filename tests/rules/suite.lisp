@@ -299,6 +299,22 @@ the caller opens one."
     (setf (claim-extent c) (interval start end))
     (save c)))
 
+(defmacro counting-resolutions ((counter) &body body)
+  "BODY with COUNTER bound to a place counting
+%RESOLVE-VALIDITY-CANDIDATES calls: the index tuples CLAIM-CURRENT-VALID/10's
+validity route resolves, so a test can see that closed history is never
+read (GH #499).  The swap is undone on exit."
+  (let ((orig (gensym "ORIG")) (cell (gensym "CELL")))
+    `(let* ((,cell (list 0))
+            (,orig (fdefinition
+                    'graph-db::%resolve-validity-candidates)))
+       (setf (fdefinition 'graph-db::%resolve-validity-candidates)
+             (lambda (&rest args) (incf (car ,cell)) (apply ,orig args)))
+       (unwind-protect
+            (symbol-macrolet ((,counter (car ,cell))) ,@body)
+         (setf (fdefinition 'graph-db::%resolve-validity-candidates)
+               ,orig)))))
+
 ;; S3: a second store the scope tests read from (spec §10, GH #332).  The
 ;; same families, declared under B's name too -- the registry is per
 ;; family symbol, the indexes per store (S2 recon A4) -- and every
