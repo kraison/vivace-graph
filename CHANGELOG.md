@@ -56,6 +56,13 @@ between releases; cutting a release renames it to the new version and dates it.
   closes during the page may be left out of it (accepted,
   `docs/guarded-query.md` "Paging"). `profile-text` measures the route,
   unless a commit lands between its snapshot and the route.
+- **The first open after upgrading builds `claim-validity`** (#499). A
+  store that holds claims builds the new index once, at its first open
+  on this engine, by a scan. A 2.1 GB store took about 173 s more than
+  a plain open and grew by about 129 MB; later opens cost what they did
+  before. Claim writes and validity closes measured within the bench
+  host's noise of their cost without the index (587 and 520 a second,
+  against 545 and 471).
 
 ## [5.1.0] - 2026-11-18
 

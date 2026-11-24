@@ -531,3 +531,43 @@ which was measured through a consumer's guarded queries.
 
 Writes: 20,000 claims at 545 a second; 20,000 validity closes at 471 a
 second.
+
+## After case
+
+Recorded 2026-11-24 on odm (SBCL 2.6.6, perf generation 5), at normal
+scale, on e1b06b2 (code identical to f99ee39, the run's tag). The page
+runs through `run-guarded-prolog`, so it reads under `:snapshot t`.
+
+| closed claims ahead | least budget, 50-row page | seconds |
+|---|---|---|
+| 0 | 211 | 0.004 |
+| 3,000 | 211 | 0.005 |
+| 30,000 | 211 | 0.005 |
+
+`valid-at-page-budget-ratio` is 1.0; acceptance is ≤ 1.5.
+
+A first run, at 4ce1403 before Task 4b, gave 211 / 6,208 / 60,282
+(ratio 285.7): the guarded page's snapshot sent every page to the
+fallback (spec §2 "Under a snapshot").
+
+`bench-valid-at-open`, the same page over open claims and no history
+(added after the first build was found to seek once per open entry,
+spec "Calls I made"; #500 for the rest):
+
+| open claims | fused ms | unfused ms |
+|---|---|---|
+| 600 | 6.9 | 13.6 |
+| 6,000 | 27.8 | 14.1 |
+| 30,000 | 83.3 | 53.2 |
+
+Before the one-cursor walk, the fused page took 1,478 ms at 30,000.
+
+Writes: 20,000 claims at 587 a second; 20,000 validity closes at 520 a
+second. Both are above the before case, which ran beside another build:
+the index's write cost is inside this host's noise.
+
+Store (blackboard#38, comment 7128939138): on the 2.1 GB copy, the
+first open on the branch builds `claim-validity` in about 173 s and
+adds about 129 MB; the second open is 199 s, as today's pin. Scaled to
+the live 4.5 GB store: about 18 minutes for the first open after the
+pin move, against about 7 today, and about 280 MB.
