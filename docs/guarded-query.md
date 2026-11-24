@@ -138,12 +138,15 @@ What this is and is not:
   (GH #451; the condition and what is not fused are in `docs/rules.md`
   "Solution order"). A `>` separated from the goal still works, at the
   old price of the discarded keys' claims.
-- **A valid-at page costs what it returns.** The three-goal text
-  `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-current ?c) (claim-valid-at
-  ?c T)`, with the filters right after the claim goal, fuses to
-  `claim-current-valid/10` (#499): the page reads the relation's open
-  claims in key order and merges in the few that closed at or after
-  `T`, so history that ended before `T` costs nothing. A free `T`, a
+- **A valid-at page doesn't pay for closed history.** The three-goal
+  text `(claim ?c f "ns" ?k ?r ?ons ?o) (claim-current ?c)
+  (claim-valid-at ?c T)`, with the filters right after the claim goal,
+  fuses to `claim-current-valid/10` (#499). The page reads the
+  relation's open claims in key order and merges in the few that closed
+  at or after `T`, so history that ended before `T` costs nothing. Its
+  inferences track its rows. Each page still reads every open index
+  entry after its bound, without resolving it, much as the unfused
+  route reads every key of the namespace. A free `T`, a
   goal between the claim goal and its filters, an `:as-of` below the
   latest epoch, a snapshot a commit has passed, a read-write
   transaction, and a closed set over the cap keep today's cost -- the

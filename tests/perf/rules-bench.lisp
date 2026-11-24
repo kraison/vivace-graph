@@ -380,6 +380,46 @@ every closed claim ahead of it, so the budget grows with N."
             :ratio (float-3 (/ (cdr (assoc (car (last ns)) budgets))
                                (cdr (assoc 0 budgets)))))))
 
+(defun pv-page-ms (g text &key (runs 10))
+  "Mean wall milliseconds of TEXT's 50-row guarded page over RUNS runs,
+after one untimed run."
+  (flet ((page ()
+           (graph-db.query:run-guarded-prolog
+            text g :limit 50 :max-inferences 50000000)))
+    (page)
+    (let ((t0 (get-internal-real-time)))
+      (dotimes (i runs) (page))
+      (float-3 (/ (* 1000 (- (get-internal-real-time) t0))
+                  internal-time-units-per-second runs)))))
+
+(defun pv-unfused-text ()
+  "PV-PAGE-TEXT with (TRUE) before its filters, so they do not fuse:
+the vocabulary route today's text takes."
+  (let* ((text (pv-page-text))
+         (p (search " (claim-current" text)))
+    (concatenate 'string (subseq text 0 p) " (true)" (subseq text p))))
+
+(defun bench-valid-at-open ()
+  "GH #499: the same 50-row page over OPEN open keys and no history --
+600, (SCALE 6000) and (SCALE 30000).  VALID-AT-OPEN-MS-<N> is the fused
+page, VALID-AT-OPEN-UNFUSED-MS-<N> the unfused one, and
+VALID-AT-OPEN-RATIO the largest N's fused over unfused.  The route
+reads the whole open bucket after its bound (design, \"Calls I made\")."
+  (let ((ns (list 600 (scale 6000) (scale 30000)))
+        (graph-db::*query-default-timeout* 600)
+        (last nil))
+    (dolist (n ns)
+      (with-perf-validity-graph (g)
+        (pv-seed g 0 n)
+        (let ((fused (pv-page-ms g (pv-page-text)))
+              (unfused (pv-page-ms g (pv-unfused-text))))
+          (setf last (cons fused unfused))
+          (record (format nil "valid-at-open-ms-~D" n) :ms fused)
+          (record (format nil "valid-at-open-unfused-ms-~D" n)
+                  :ms unfused))))
+    (record "valid-at-open-ratio"
+            :ratio (float-3 (/ (car last) (max (cdr last) 0.001))))))
+
 (defun bench-claim-writes ()
   "GH #499: (SCALE 20000) binary claims written in batches of 500, then
 the same claims closed as PV-SEED closes them -- the write and close

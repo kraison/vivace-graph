@@ -29,6 +29,9 @@ case "$1" in
   bench-valid-at-page)
     CALL="(graph-db/perf-test::run-perf-only \
 'graph-db/perf-test::bench-valid-at-page :scale :small)" ;;
+  bench-valid-at-open)
+    CALL="(graph-db/perf-test::run-perf-only \
+'graph-db/perf-test::bench-valid-at-open :scale :small)" ;;
   bench-claim-writes)
     CALL="(graph-db/perf-test::run-perf-only \
 'graph-db/perf-test::bench-claim-writes :scale :small)" ;;

@@ -1236,40 +1236,41 @@ TUPLE: the route's one node-resolution step, so a test can count it
 (GH #499, design §2)."
   (index-lookup graph class-name +claim-validity-index-slots+ tuple))
 
-(defun %validity-index-walk (graph class-name head start keep-p on-tuple)
-  "Walk GRAPH's CLAIM-VALIDITY prefixes under HEAD from START, calling
-ON-TUPLE on each tuple KEEP-P accepts.  A prefix walk has no :END, so the
-walk leaves when KEEP-P rejects a prefix, or when ON-TUPLE returns true;
-MAP-INDEX-PREFIXES holds no lock across the callback (GH #499, §2)."
-  (block walk
-    (map-index-prefixes
-     (lambda (tuple)
-       (unless (funcall keep-p tuple)
-         (return-from walk nil))
-       (when (funcall on-tuple tuple)
-         (return-from walk nil)))
-     graph class-name +claim-validity-index-slots+ :arity 5 :start start))
+(defun %validity-index-walk (graph class-name start end on-tuple)
+  "Call ON-TUPLE on each distinct CLAIM-VALIDITY tuple of GRAPH from
+START through END's last extension, in index order, until it returns
+true.  One range cursor, not a seek per tuple as MAP-INDEX-PREFIXES
+takes (GH #499).  No overlay: the route never runs in a transaction."
+  (let* ((*graph* graph)
+         (six (%index-for-read graph class-name
+                               +claim-validity-index-slots+))
+         (lo (and six (%index-key six start)))
+         (hi (and six (%index-key six end)))
+         (last nil))
+    (when (and lo hi)
+      (block walk
+        (ix-map six
+                (lambda (key id)
+                  (declare (ignore id))
+                  (unless (equal key last)
+                    (setf last key)
+                    (when (funcall on-tuple (%ix-prefix-out key 5))
+                      (return-from walk nil))))
+                :start lo :end hi))))
   nil)
 
 (defun %validity-walk-closed (graph class-name head at-key on-tuple)
   "GRAPH's CLAIM-VALIDITY tuples under HEAD (namespace, relation,
 currency) whose validity end is at or after AT-KEY, in index order
 (GH #499, design §2 step 1)."
-  (%validity-index-walk
-   graph class-name head (append head (list at-key))
-   (lambda (tuple) (equal (subseq tuple 0 3) head))
-   on-tuple))
+  (%validity-index-walk graph class-name (append head (list at-key))
+                        head on-tuple))
 
 (defun %validity-walk-open (graph class-name head on-tuple)
   "GRAPH's CLAIM-VALIDITY tuples under HEAD whose validity is open, in
 key order (GH #499, design §2 step 2)."
-  (%validity-index-walk
-   graph class-name head
-   (append head (list graph-db.spacetime::+validity-open+))
-   (lambda (tuple)
-     (and (equal (subseq tuple 0 3) head)
-          (equal (fourth tuple) graph-db.spacetime::+validity-open+)))
-   on-tuple))
+  (let ((open (append head (list graph-db.spacetime::+validity-open+))))
+    (%validity-index-walk graph class-name open open on-tuple)))
 
 (defun %validity-add (entries store tuple)
   "Record TUPLE, read from the store at index STORE, under its subject

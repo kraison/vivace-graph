@@ -186,6 +186,11 @@ Otherwise it answers by `claim-after/9`'s route plus the two filters.
   - The index releases an entry when a write applies (GH #345). So at
     an older epoch, a claim that a later commit closed has already lost
     its open entry, while it still resolves as open.
+- Every store in scope that carries the family has the index.
+- The **closed set** is within the cap. This is every current claim of
+  the namespace and relation whose validity end is at or after T, over
+  all stores in scope. The cap is 10,000 entries (calls, below), and
+  the route stops counting once it is past the cap.
 
 **Under a snapshot** (Kevin, 2026-11-24). Every guarded query
 compiles to `(select (:effects nil :snapshot t …))`
@@ -213,11 +218,6 @@ Node reads still resolve through the snapshot. `index-lookup`
 re-checks each node against its key (`%index-hit-p`), so a node a
 later commit changed drops out rather than being returned at the wrong
 version.
-- Every store in scope that carries the family has the index.
-- The **closed set** is within the cap. This is every current claim of
-  the namespace and relation whose validity end is at or after T, over
-  all stores in scope. The cap is 10,000 entries (calls, below), and
-  the route stops counting once it is past the cap.
 
 **The validity route, per page:**
 
@@ -235,6 +235,9 @@ per store.
    relation, current, open) prefix in index order. A key is skipped by
    `%key-after-p` on the entry's stored key, before its node is
    resolved, as #451 does. Resolve only the entries that are read.
+   Both steps read their ranges with one range cursor (`ix-map`), not
+   `map-index-prefixes`, which seeks once per distinct prefix
+   (2026-11-24, "Calls I made").
 3. **Merge** the two by key. Within a key, emit today's order: the own
    store's claims in id order, then each foreign store's in scope
    order. That is the order the subject-relation index gives today,
@@ -451,6 +454,16 @@ consumer's pin issue.
   Cost: one string comparison per open key before the bound, no inference
   and no node read. A seek is a later optimisation if the index's
   string collation is shown to agree with `>/2`.
+- **The open bucket is read whole, with one range cursor** (added
+  2026-11-24, after measuring). The first build walked it with
+  `map-index-prefixes`. That is one skip-list seek per open entry, so a
+  50-row page cost 1,478 ms at 30,000 open claims with no history,
+  against 47 ms for the unfused text. Reading it with one cursor (`ix-map`)
+  costs 73–83 ms there. The route still collects every open key after
+  the bound and sorts it before emitting. That is O(open), as today's
+  route reads every key of the namespace from the vocabulary. Cost: on
+  a relation with many open claims and no history, a page is about 1.7×
+  today's. A lazy merge that stops at the page's limit is #500.
 - **The functor's name and arity.** `claim-current-valid/10` names the
   two goals it fuses and carries #451's two key bounds plus T.
 - **Fall back inside any read-write transaction, and under a snapshot a
