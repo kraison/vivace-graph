@@ -150,6 +150,9 @@
                "(claim-current-valid ?p rt-claim \"host\" ?h \"runs\""
                " \"app\" \"web\" nil nil"
                " \"2026-06-01T00:00:00.000000000Z\")"))
+(defparameter *body-claim-current-valid-under-not*
+  (concatenate 'string *web-hosts-body*
+               " (not " *body-claim-current-valid* ")"))
 
 (test claim-after-is-not-a-rule-premise
   "GH #451: the reads and strata analyses recognise claim/7 by name; a
@@ -168,6 +171,16 @@ rule writes the three goals, which the compiler fuses."
            :head *web-hosts-head* :body *body-claim-current-valid*)
   (refuses "claim-valid-at" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body *body-claim-current-valid*))
+
+(test a-rule-may-not-write-claim-current-valid-nested
+  "GH #499: claim-current-valid/10 nested under NOT is refused with the
+same message."
+  (refuses "not a rule premise" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head*
+           :body *body-claim-current-valid-under-not*)
+  (refuses "claim-valid-at" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head*
+           :body *body-claim-current-valid-under-not*))
 
 (test a-rule-that-reads-its-own-relation-compiles-as-its-own-stratum
   "GH #333: recursion is a stratum, not a refusal; an unbound relation

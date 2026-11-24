@@ -511,8 +511,9 @@ NIL; a bound ?C and the empty fast paths read no store at all (spec
 §10, GH #332).  Solution order: docs/rules.md \"Solution order\".
 A > on the key right after this goal compiles to CLAIM-AFTER/9, which
 starts the namespace route at the bound (#451).  This goal followed at
-once by (CLAIM-CURRENT ?C) and (CLAIM-VALID-AT ?C T) compiles to
-CLAIM-CURRENT-VALID/10, the two filters kept (#499)."
+once by (CLAIM-CURRENT ?C) and (CLAIM-VALID-AT ?C T) may compile to
+CLAIM-CURRENT-VALID/10, the two filters kept, under the conditions in
+docs/rules.md \"The validity route\" (#499)."
   (%claim-goal ?c ?family ?sns ?skey ?rel ?ons ?okey nil nil cont))
 
 (def-global-prolog-functor claim-after/9
@@ -1190,8 +1191,9 @@ one arity per premise count."
 string or a timestamp); a claim with no extent makes no validity
 statement and never matches.  Shares CLAIMS-TOUCHING's predicate and
 probe shape, so the two cannot diverge (spec §11).  With a preceding
-CLAIM/7 and CLAIM-CURRENT/1 the compiler fuses the three into
-CLAIM-CURRENT-VALID/10 (#499)."
+CLAIM/7 and CLAIM-CURRENT/1 the three may compile to
+CLAIM-CURRENT-VALID/10 under the conditions in docs/rules.md \"The
+validity route\" (#499)."
   (let ((c (%claim-arg ?c))
         (at (%instant-arg ?at)))
     (when (and c at
@@ -1280,26 +1282,33 @@ key, for CLAIM-CURRENT-VALID/10's key-ordered merge (GH #499)."
 claims today (GH #499, design §2 step 3)."
   (key-vector< (id a) (id b)))
 
+(defun %snapshot-passed-p (graph)
+  "True when GRAPH has an entry in *READ-SNAPSHOTS* whose START-TX-ID is
+not (TM-CURRENT-EPOCH (TRANSACTION-MANAGER GRAPH)) (GH #499, design §2
+\"Under a snapshot\")."
+  (let ((tx (and *read-snapshots* (gethash graph *read-snapshots*))))
+    (and tx (not (= (start-tx-id tx)
+                    (tm-current-epoch (transaction-manager graph)))))))
+
 (defun %validity-route (family sns rel at skey-after emit)
   "The fused validity route for CLAIM-CURRENT-VALID/10 (GH #499,
 design §2): T when it answered, NIL when the caller must fall back to
 CLAIM-AFTER/9's route.  Called before any candidate is emitted, so a
 NIL never follows emitted rows.  It answers NIL unless the namespace SNS
 names a keyword, REL is bound, AT is an instant, no read-write
-transaction covers a store in scope, no store is read under a snapshot
-or an as-of epoch, and the closed set is within *VALIDITY-CLOSED-CAP*.
-Every candidate it resolves passes %VALIDITY-CANDIDATE-FILTER and the
-producer exclusion before EMIT; %DERIVED-ALL follows as in
-%NAMESPACE-ROUTE, filtered but not producer-excluded."
+transaction covers a store in scope, no store's snapshot or as-of epoch
+has been passed by a commit (design §2 \"Under a snapshot\"), and the
+closed set is within *VALIDITY-CLOSED-CAP*.  Every candidate it resolves
+passes %VALIDITY-CANDIDATE-FILTER and the producer exclusion before
+EMIT; %DERIVED-ALL follows as in %NAMESPACE-ROUTE, filtered but not
+producer-excluded."
   (let ((graphs (%scope-graphs)))
     (when (and sns rel at
                (not (loop for g in graphs
                           thereis (and *transaction*
                                        (%transaction-covers-graph-p
                                         *transaction* g))))
-               (not (loop for g in graphs
-                          thereis (and *read-snapshots*
-                                       (gethash g *read-snapshots*)))))
+               (notany #'%snapshot-passed-p graphs))
       (let* ((parent (graph-db.spacetime:claim-family-parent family))
              (at-key (graph-db.spacetime::%timestamp-key at))
              (accept (%validity-candidate-filter at))

@@ -353,8 +353,9 @@ when all of these hold at run time, and otherwise answers by
   the relation bound: the namespace is bound and names a keyword, the
   subject key is unbound;
 - `?at` is bound to an instant, read as `claim-valid-at/2` reads it;
-- no read-write transaction covers a store in scope, and no store is
-  read under a snapshot or an as-of epoch;
+- no read-write transaction covers a store in scope, and no store in
+  scope is read under a snapshot or an as-of epoch that a commit has
+  passed;
 - every store in scope that carries the family has the index;
 - the closed set -- every current claim of the namespace and relation
   whose validity end is at or after `T`, over the stores in scope -- is
@@ -371,13 +372,14 @@ the rewriters, so the three-goal text still explains as the vocabulary
 route; a hand-written `claim-current-valid/10` reports "validity index
 from the key bound, or claim-after's route; decided at run time".
 `profile-goals` runs under a snapshot, so `profile-text` measures the
-fallback. A rule body may not name `claim-current-valid`: `compile-rule`
-refuses it, and the rewrite fuses the three goals there as it does
-#451's comparison.
+route, unless a commit lands between its snapshot and the route. A rule
+body may not name `claim-current-valid`: `compile-rule` refuses it, and
+the rewrite fuses the three goals there as it does #451's comparison.
 
-In one accepted race a claim can close while a page is being read: its
+In one accepted race a claim can close while a page is being read: the
+route reads the index's newest state, with or without a snapshot, so its
 open entry is gone and its new entry was not in the closed set the page
-collected, so the page leaves it out. The route never returns a wrong
+collected, and the page leaves it out. The route never returns a wrong
 row, and a later read at a later `T` is right; "Paging" in
 `docs/guarded-query.md` says why that is accepted (design §5).
 
@@ -445,8 +447,8 @@ The validity route answers in `claim-after/9`'s order: the stores in
 scope, own store first, keys ascending, and within a key the own
 store's claims in id order then each foreign store's
 (`claim-current-valid/10`, #499). It reads a subset of the same rows in
-the same order, so paging is unchanged: the fused text pages exactly as
-the three goals do.
+the same order, so paging is unchanged except the accepted race: the
+fused text pages as the three goals do.
 
 ## Unknown names
 

@@ -373,11 +373,25 @@ as the three-goal text (GH #499, design §2)."
       (%same-validity-rows (lambda () (%validity-fused))
                            (lambda () (%validity-unfused))))))
 
+(defun %validity-write-in-another-thread (graph thunk)
+  "Run THUNK in a fresh thread with *GRAPH* bound to GRAPH, and wait: a
+write that commits while the calling thread holds a read snapshot
+(GH #499, design §2 \"Under a snapshot\")."
+  (let ((err nil))
+    (bt:join-thread
+     (bt:make-thread (lambda ()
+                       (let ((graph-db:*graph* graph))
+                         (handler-case (funcall thunk)
+                           (error (e) (setq err e)))))
+                     :name "validity-snapshot-writer"))
+    (when err (error err))))
+
 (test the-route-stays-off-under-each-fallback
   "The validity route resolves nothing under each fallback condition
-(GH #499, design §2): a free T, a snapshot, a read-write transaction, a
-closed set over the cap, and an :AS-OF read.  Without them it resolves
-some, so the zeros are not vacuous."
+(GH #499, design §2): a free T, a snapshot a commit has passed, a
+read-write transaction, a closed set over the cap, and an :AS-OF read
+below the latest epoch.  Without them it resolves some, so the zeros
+are not vacuous."
   (with-rules-graph (g)
     (seed-validity g)
     (let ((*validity-at* (validity-instant *validity-t0*)))
@@ -395,14 +409,17 @@ some, so the zeros are not vacuous."
                       (claim-current-valid ?c rtt-claim "vt" ?k "rel"
                                            ?ons ?ok nil nil ?free)
                       (claim-producer ?c ?p))))))
-        ;; A snapshot.
-        (is (= 0 (resolutions
-                  (lambda ()
-                    (select (:snapshot t) (?k ?ok ?p)
-                      (lisp ?at *validity-at*)
-                      (claim-current-valid ?c rtt-claim "vt" ?k "rel"
-                                           ?ons ?ok nil nil ?at)
-                      (claim-producer ?c ?p))))))
+        ;; A snapshot a commit has passed.
+        (graph-db:with-read-snapshot (g)
+          (%validity-write-in-another-thread
+           g (lambda ()
+               (with-transaction ((graph-db::transaction-manager g))
+                 (make-rtt-claim-binary
+                  :graph g :subject-namespace :vt :subject-key "zz-snap"
+                  :relation "rel" :object-namespace :vt-obj
+                  :object-key "x1" :producer "seed-a" :standing :observed
+                  :extent (interval (ts 2026 1 1) (ts 2026 12 31))))))
+          (is (= 0 (resolutions (lambda () (%validity-fused))))))
         ;; A read-write transaction.
         (is (= 0 (resolutions
                   (lambda ()
@@ -429,6 +446,59 @@ some, so the zeros are not vacuous."
                         (claim-current-valid ?c rtt-claim "vt" ?k "rel"
                                              ?ons ?ok nil nil ?at)
                         (claim-producer ?c ?p)))))))))))
+
+(test the-route-runs-under-a-snapshot-no-commit-has-passed
+  "A (:SNAPSHOT T) select and an (:AS-OF (LATEST-EPOCH G)) select each
+take the validity route when no commit has passed the snapshot, and
+answer what an unsnapshotted read answers (GH #499, design §2 \"Under a
+snapshot\")."
+  (with-rules-graph (g)
+    (seed-validity g)
+    (let* ((*validity-at* (validity-instant *validity-t0*))
+           (baseline (%validity-fused))
+           (epoch (graph-db:latest-epoch g)))
+      (let ((rows nil) (calls 0))
+        (counting-resolutions (resolved)
+          (setf rows
+                (select (:snapshot t) (?k ?ok ?p)
+                  (lisp ?at *validity-at*)
+                  (claim-current-valid ?c rtt-claim "vt" ?k "rel"
+                                       ?ons ?ok nil nil ?at)
+                  (claim-producer ?c ?p)))
+          (setf calls resolved))
+        (is (plusp calls))
+        (is (equal baseline rows)))
+      (let ((rows nil) (calls 0))
+        (counting-resolutions (resolved)
+          (setf rows
+                (select (:as-of epoch) (?k ?ok ?p)
+                  (lisp ?at *validity-at*)
+                  (claim-current-valid ?c rtt-claim "vt" ?k "rel"
+                                       ?ons ?ok nil nil ?at)
+                  (claim-producer ?c ?p)))
+          (setf calls resolved))
+        (is (plusp calls))
+        (is (equal baseline rows))))))
+
+(test a-snapshot-a-commit-passed-still-sees-the-claim
+  "Once another thread's commit closes an open claim after a snapshot
+began, the route falls back under that snapshot so the claim is still
+answered at its open version (GH #499, design §2 \"Under a snapshot\")."
+  (with-rules-graph (g)
+    (seed-validity g)
+    (let ((*validity-at* (validity-instant *validity-t0*)))
+      (graph-db:with-read-snapshot (g)
+        (let ((r0 (%validity-fused)))
+          (is (member "a1" (mapcar #'first r0) :test #'string=))
+          (%validity-write-in-another-thread
+           g (lambda ()
+               (with-transaction ((graph-db::transaction-manager g))
+                 (close-validity
+                  (first (claims-touching g 'rtt-claim :vt "a1"
+                                          :role :subject
+                                          :relation "rel"))
+                  (ts 2026 3 1)))))
+          (is (equal r0 (%validity-fused))))))))
 
 (test the-validity-route-skips-keys-before-the-bound
   "With ?SKEY-AFTER bound, the route skips the open keys at or before it
@@ -560,20 +630,25 @@ budget and resolves only its own rows (GH #499, design §3)."
 
 (test the-guard-path-is-fused-for-valid-at
   "The recommended valid-at text through RUN-GUARDED-PROLOG answers its
-page under the same budget, so the guard's compile fused it (GH #499,
-design §3)."
+page under the same budget and resolves only its own rows, so the
+guard's compile fused it and the route runs under its snapshot (GH #499,
+design §2, §3)."
   (with-rules-graph (g)
     (%seed-validity-history g)
-    (let ((graph-db::*query-default-max-inferences* 200))
-      (multiple-value-bind (columns rows)
+    (let ((graph-db::*query-default-max-inferences* 200)
+          (columns nil) (rows nil) (calls 0))
+      (counting-resolutions (resolved)
+        (multiple-value-setq (columns rows)
           (graph-db.query:run-guarded-prolog
            (format nil "(claim ?c rtt-claim \"vt\" ?k \"rel\" ?ons ?ok) ~
 (> ?k \"c999\") (claim-current ?c) (claim-valid-at ?c ~S)"
                    (validity-instant *validity-t0*))
-           g :limit 10)
-        (let ((k (position "k" columns :test #'string=)))
-          (is (= 10 (length rows)))
-          (is (equal "d000" (nth k (first rows)))))))))
+           g :limit 10))
+        (setf calls resolved))
+      (let ((k (position "k" columns :test #'string=)))
+        (is (= 10 (length rows)))
+        (is (equal "d000" (nth k (first rows))))
+        (is (<= 10 calls 12))))))
 
 (defun %vf-head (relation)
   "A VREACHES-shaped rtt-claim head over RELATION."
