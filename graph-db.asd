@@ -260,7 +260,8 @@ docs/rules.md; GH #304."
                (:file "schema-tests") (:file "compile-tests")
                (:file "run-tests") (:file "fixpoint-tests")
                (:file "scope-tests") (:file "forward-tests")
-               (:file "explain-tests") (:file "touched-tests"))
+               (:file "explain-tests") (:file "touched-tests")
+               (:file "validity-tests")) ; GH #499
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)
