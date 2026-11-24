@@ -1,8 +1,9 @@
 # A page of claims valid at an instant skips the claims that aren't
 
 **Issue:** kraison/vivace-graph#499. **Date:** 2026-11-24. **Status:**
-design for approval. Kevin chose approach 1 below (a validity index);
-the rest is my proposal.
+design for approval. Kevin chose approach 1 below (a validity index),
+accepted the race in §5 and chose where §6 measures. The rest is my
+proposal.
 
 ## Intent
 
@@ -304,13 +305,20 @@ So a claim whose validity closes during the page that would hold it may
 be missing from that page. The route never returns a wrong row, and a
 later read at a later T is right. Pages are already not atomic across
 their run: a claim written mid-read at a key before the bound is missed
-by every later page. I propose accepting this and documenting it under
-"Paging". The alternative, holding the claim class's read lock for a
-page, makes every writer wait on readers.
+by every later page. **Accepted (Kevin, 2026-11-24), documented under
+"Paging".** The alternatives were holding the claim class's read lock
+for a page, which makes every writer wait on readers, and re-checking
+before each key for claims closed since the collection, which narrows
+the race to closes written with a backdated end. The second costs code,
+and work on every key while a writer is busy.
 
 ### 6. Measured before the pin
 
-On a copy of the largest store a consumer runs, record:
+On the existing 2.1 GB copy of the largest consumer store, taken at an
+earlier pin (2026-11-03), record the figures below (Kevin, 2026-11-24).
+Copy it to scratch first, because opening a store writes to it. Scale
+the figures to the live store's 4.5 GB; the consumer's pin issue names
+the paths. Record:
 
 - how long the index build takes at its first open, and how much disk
   it uses;
@@ -396,9 +404,6 @@ consumer's pin issue.
   Cost: one string comparison per open key before the bound, no inference
   and no node read. A seek is a later optimisation if the index's
   string collation is shown to agree with `>/2`.
-- **The race in §5 is accepted and documented.** This is the one point
-  where answers can differ from today's: a claim closing during its own
-  page. It is the call to check first.
 - **The functor's name and arity.** `claim-current-valid/10` names the
   two goals it fuses and carries #451's two key bounds plus T.
 - **Fall back inside any read-write transaction and under any snapshot.**
