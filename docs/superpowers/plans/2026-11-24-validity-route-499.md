@@ -435,4 +435,20 @@ Spec §6. Run in the session: it needs the store copy and cl-llm on odm.
 
 ## Before case
 
-(Filled by Task 1, Step 7.)
+Recorded 2026-11-24 on odm (SBCL 2.6.6, perf generation 5), at commit
+3b0b1f4, the base engine with the benches, at normal scale. Another
+worker's SBCL build was running at the same time, so the seconds are
+noisy; the inference budgets are exact.
+
+| closed claims ahead | least budget, 50-row page | seconds |
+|---|---|---|
+| 0 | 164 | 0.004 |
+| 3,000 | 12,217 | 0.229 |
+| 30,000 | 120,554 | 2.35 |
+
+`valid-at-page-budget-ratio` is 735.1. The 30,000 row is over a
+100,000-inference budget. The 3,000 row matches the issue's own table,
+which was measured through a consumer's guarded queries.
+
+Writes: 20,000 claims at 545 a second; 20,000 validity closes at 471 a
+second.
