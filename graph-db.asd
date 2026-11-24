@@ -653,7 +653,8 @@ cl-temporal-extent."
                (:file "vocabulary-tests")              ; GH #350
                (:file "endpoint-edge-tests")             ; GH #369
                (:file "link-sweep-tests")               ; GH #372
-               (:file "touched-tests"))                 ; GH #392
+               (:file "touched-tests")                  ; GH #392
+               (:file "validity-index-tests"))          ; GH #499
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

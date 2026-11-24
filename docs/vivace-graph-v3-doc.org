@@ -6373,6 +6373,12 @@ both arities, retracted claims included, with the same ~:as-of~ /
 cost a walk of every endpoint; a service polling the newest stamp among
 240 such claims paid for 9,423 at each call.
 
+A family also declares ~claim-validity~, a composite index on
+~(subject-namespace relation transaction-extent-sexp extent-sexp
+subject-key)~ canonically keyed by whether the claim is current and where
+its validity ends, so a page of claims valid at an instant can skip the
+history that ended before it (vivace-graph#499).
+
 ~claim-touched-at~ (a claim) is the instant its transaction record last
 changed: the retraction when retracted, else the recording; ~NIL~ for a
 claim predating the axis, a ~reaped-claim~, or an extent with no

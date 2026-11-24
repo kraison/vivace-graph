@@ -11,6 +11,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **The `claim-validity` index** (#499): every claim family now declares
+  a composite index on `(subject-namespace relation
+  transaction-extent-sexp extent-sexp subject-key)`, canonically keyed
+  by whether the transaction period is open (current or retracted) and
+  where the validity extent ends, with an open validity sorting before
+  every closed end. A page of claims valid at an instant can then read
+  the open claims in key order and skip the history that ended before
+  it. The route that reads the index lands in a later change.
+
 ## [5.1.0] - 2026-11-18
 
 ### Added
