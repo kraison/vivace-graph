@@ -363,6 +363,8 @@ With the basics of creating and querying a graph covered, we will now dive deepe
 
 ** Chapter 3: The Storage Engine
 
+The pictures for this part are in =docs/architecture.md=: the layers as the system definition loads them, every file of a graph directory and what points where, the threads and locks, and the commit path. Each figure cites the source lines it was drawn from; where this manual's prose and those figures differ, the figures are newer.
+
 VivaceGraph is not a monolithic black box. It is a collection of carefully designed components that work together to provide a persistent, high-performance database. At the lowest level is the storage engine, which is responsible for how data is physically laid out on disk.
 
 The root of a VivaceGraph database is a directory you specify. Inside this directory, you will find several files and subdirectories, each with a specific purpose. For example, a graph created at ~"/var/tmp/my-app/"~ might look like this:

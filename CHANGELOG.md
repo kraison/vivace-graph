@@ -13,6 +13,8 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- `docs/architecture.md`: six hand-placed SVG architecture figures drawn from the code (the layers, the process and what it talks to, the graph directory on disk, the claim model, the threads and locks, the commit path), each with the source lines it rests on; `docs/architecture/figures.py` regenerates them (#502).
+
 - **The `claim-validity` index** (#499): every claim family now declares
   a composite index on `(subject-namespace relation
   transaction-extent-sexp extent-sexp subject-key)`, canonically keyed

@@ -25,6 +25,8 @@ it: [`examples/example-spacetime.lisp`](examples/example-spacetime.lisp)
 
 A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), offline-first peer replication, and temporal extents, provenance-carrying claims and geometry registration (the optional `graph-db/spacetime` add-on), plus an API reference.
 
+The architecture in six hand-placed figures, each citing the files it was drawn from, is [`docs/architecture.md`](docs/architecture.md): the layers, the process and its doors, the graph directory, the claim model, the threads and locks, and the commit path.
+
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
 ### Announcement, 2026-11-18 — VivaceGraph 5.1.0 (security fix, features and fixes)
